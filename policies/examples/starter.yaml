@@ -1,0 +1,58 @@
+version: 1
+policy_id: starter-local-v1
+mode: enforce
+
+defaults:
+  verdict: deny
+  reason: "Action denied by default (no matching allow rule)"
+
+limits:
+  - id: session-rate
+    scope: session
+    max_actions_per_minute: 60
+
+rules:
+  - id: fs-list-workspace
+    match:
+      tool: fs.list
+      verb: read
+      resource: "path:C:/work/**"
+    verdict: allow
+    reason: "Allow workspace directory listings"
+
+  - id: fs-read-workspace
+    match:
+      tool: fs.read
+      verb: read
+      resource: "path:C:/work/**"
+    verdict: allow
+    reason: "Allow workspace reads"
+
+  - id: fs-write-workspace-ask
+    match:
+      tool: fs.write
+      verb: write
+      resource: "path:C:/work/**"
+    verdict: ask
+    reason: "Workspace writes require human approval"
+
+  - id: fs-delete-ask
+    match:
+      tool: fs.delete
+      risk_any: [destructive, irreversible]
+    verdict: ask
+    reason: "Destructive file operations require human approval"
+
+  - id: block-untrusted-egress
+    match:
+      tool: "http.*"
+      taint: untrusted
+      risk_any: [external-egress]
+    verdict: deny
+    reason: "Untrusted content must not trigger outbound network calls"
+
+  - id: block-privilege-escalation
+    match:
+      risk_any: [privilege-escalation]
+    verdict: deny
+    reason: "Privilege-escalating or sensitive-path actions are blocked"

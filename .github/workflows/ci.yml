@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  fast-checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Lint with ruff
+        run: uv run ruff check core executors gateway sdk cli tests
+      - name: Type-check with mypy
+        run: uv run mypy
+      - name: Run fast test suite
+        run: uv run pytest -m "not slow"

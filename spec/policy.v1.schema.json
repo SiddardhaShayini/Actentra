@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://actentra.dev/spec/policy.v1.schema.json",
+  "title": "Actentra Policy v1",
+  "description": "Deterministic policy pack evaluated with deny-overrides.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "defaults", "rules"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "policy_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["enforce", "shadow"],
+      "default": "enforce"
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict"],
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": ["deny", "hold"]
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 512
+        }
+      }
+    },
+    "limits": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "scope", "max_actions_per_minute"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "scope": { "type": "string", "enum": ["session", "global"] },
+          "max_actions_per_minute": { "type": "integer", "minimum": 1, "maximum": 100000 }
+        }
+      }
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "match", "verdict"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "match": {
+            "type": "object",
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "tool": { "type": "string", "minLength": 1 },
+              "verb": {
+                "oneOf": [
+                  { "type": "string", "minLength": 1 },
+                  { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 }
+                ]
+              },
+              "resource": { "type": "string", "minLength": 1 },
+              "agent_id": { "type": "string", "minLength": 1 },
+              "taint": { "type": "string", "enum": ["trusted", "untrusted", "unknown"] },
+              "risk_any": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "minItems": 1
+              },
+              "risk_all": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "minItems": 1
+              }
+            }
+          },
+          "verdict": {
+            "type": "string",
+            "enum": ["allow", "allow_with_constraints", "ask", "deny", "hold"]
+          },
+          "constraints": {
+            "type": "object"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 512
+          }
+        }
+      }
+    }
+  }
+}

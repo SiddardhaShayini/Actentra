@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.Python
+
+# Environments
+.venv/
+venv/
+ENV/
+
+# Testing / Lint / Type checking
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+htmlcov/
+.coverage
+
+# Local runtime state / SQLite receipts
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.jsonl.bak
+.actentra/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

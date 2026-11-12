@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://actentra.dev/spec/receipt.v1.schema.json",
+  "title": "Actentra Receipt Record v1",
+  "description": "Tamper-evident hash-chained decision and outcome audit record.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "seq",
+    "record_type",
+    "crossing_id",
+    "session_id",
+    "canonical_hash",
+    "policy_version",
+    "ts",
+    "prev_hash",
+    "entry_hash"
+  ],
+  "properties": {
+    "seq": { "type": "integer", "minimum": 1 },
+    "record_type": { "type": "string", "enum": ["decision", "outcome"] },
+    "crossing_id": { "type": "string", "minLength": 8, "maxLength": 64 },
+    "session_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "canonical_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "policy_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "verdict": {
+      "type": ["string", "null"],
+      "enum": ["allow", "allow_with_constraints", "ask", "deny", "hold", null]
+    },
+    "rule_id": { "type": ["string", "null"], "maxLength": 128 },
+    "reason": { "type": ["string", "null"], "maxLength": 1000 },
+    "risk_tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "shadow": { "type": "boolean" },
+    "status": {
+      "type": ["string", "null"],
+      "enum": ["success", "failure", "unknown", null]
+    },
+    "result_hash": {
+      "type": ["string", "null"],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "error": { "type": ["string", "null"], "maxLength": 1000 },
+    "ts": { "type": "string", "format": "date-time" },
+    "prev_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "entry_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

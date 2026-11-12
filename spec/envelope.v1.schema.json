@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://actentra.dev/spec/envelope.v1.schema.json",
+  "title": "Actentra Action Envelope v1",
+  "description": "Canonical data contract for a tool Crossing evaluated by Actentra.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "envelope_version",
+    "crossing_id",
+    "session_id",
+    "agent",
+    "action",
+    "canonical_hash",
+    "ts"
+  ],
+  "properties": {
+    "envelope_version": {
+      "type": "string",
+      "const": "1"
+    },
+    "crossing_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "framework": { "type": "string", "maxLength": 64 },
+        "model": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_goal", "declared_by"],
+      "properties": {
+        "user_goal": { "type": "string", "maxLength": 1000 },
+        "declared_by": {
+          "type": "string",
+          "enum": ["human", "agent", "system"]
+        }
+      }
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool", "verb", "resource", "params"],
+      "properties": {
+        "tool": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "verb": {
+          "type": "string",
+          "enum": ["read", "write", "delete", "exec", "network", "admin", "other"]
+        },
+        "resource": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "params": { "type": "object" },
+        "idempotency_key": { "type": ["string", "null"], "maxLength": 256 }
+      }
+    },
+    "provenance": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "trust"],
+        "properties": {
+          "source": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "trust": { "type": "string", "enum": ["trusted", "untrusted", "unknown"] }
+        }
+      }
+    },
+    "canonical_hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

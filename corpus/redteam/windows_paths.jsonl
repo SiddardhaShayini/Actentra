@@ -1,0 +1,12 @@
+{"id": "rt-win-01", "category": "path-traversal", "raw_path": "C:\\work\\..\\..\\Windows\\System32\\cmd.exe", "expect": "reject_or_escape"}
+{"id": "rt-win-02", "category": "drive-relative", "raw_path": "C:secret.txt", "expect": "reject"}
+{"id": "rt-win-03", "category": "ads-stream", "raw_path": "C:\\work\\notes.txt:hidden_stream", "expect": "reject"}
+{"id": "rt-win-04", "category": "reserved-device", "raw_path": "C:\\work\\CON", "expect": "reject"}
+{"id": "rt-win-05", "category": "reserved-device-ext", "raw_path": "C:\\work\\nul.txt", "expect": "reject"}
+{"id": "rt-win-06", "category": "device-namespace", "raw_path": "\\\\.\\PhysicalDrive0", "expect": "reject"}
+{"id": "rt-win-07", "category": "extended-namespace", "raw_path": "\\\\?\\C:\\work\\file.txt", "expect": "reject"}
+{"id": "rt-win-08", "category": "unc-path", "raw_path": "\\\\attacker.local\\share\\payload.exe", "expect": "reject"}
+{"id": "rt-win-09", "category": "trailing-dot", "raw_path": "C:\\work\\secret.txt.", "expect": "reject"}
+{"id": "rt-win-10", "category": "trailing-space", "raw_path": "C:\\work\\secret.txt ", "expect": "reject"}
+{"id": "rt-win-11", "category": "null-byte", "raw_path": "C:\\work\\notes.txt\u0000.png", "expect": "reject"}
+{"id": "rt-win-12", "category": "root-relative", "raw_path": "\\Windows\\win.ini", "expect": "reject"}

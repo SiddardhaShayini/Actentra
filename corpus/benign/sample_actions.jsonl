@@ -1,0 +1,10 @@
+{"id": "ben-01", "tool": "fs.read", "verb": "read", "resource": "path:C:/work/README.md", "expected_verdict": "allow"}
+{"id": "ben-02", "tool": "fs.read", "verb": "read", "resource": "path:C:\\work\\src\\app.py", "expected_verdict": "allow"}
+{"id": "ben-03", "tool": "fs.list", "verb": "read", "resource": "path:C:/work/src", "expected_verdict": "allow"}
+{"id": "ben-04", "tool": "fs.read", "verb": "read", "resource": "path:C:/work/docs/design.md", "expected_verdict": "allow"}
+{"id": "ben-05", "tool": "fs.read", "verb": "read", "resource": "path:C:/work/tests/unit/test_main.py", "expected_verdict": "allow"}
+{"id": "ben-06", "tool": "fs.list", "verb": "read", "resource": "path:C:/work", "expected_verdict": "allow"}
+{"id": "ben-07", "tool": "fs.read", "verb": "read", "resource": "path:C:/work/data/metrics.json", "expected_verdict": "allow"}
+{"id": "ben-08", "tool": "fs.read", "verb": "read", "resource": "path:C:\\Work\\Notes\\todo.txt", "expected_verdict": "allow"}
+{"id": "ben-09", "tool": "fs.read", "verb": "read", "resource": "path:C:/work/sub/../README.md", "expected_verdict": "allow"}
+{"id": "ben-10", "tool": "fs.write", "verb": "write", "resource": "path:C:/work/output/report.md", "expected_verdict": "ask"}
