@@ -318,7 +318,9 @@ class PolicyEngine:
         """Deactivate kill switch."""
         self._frozen = False
 
-    def _check_rate_limits(self, envelope: ActionEnvelope) -> PolicyRule | None:
+    def _check_rate_limits(
+        self, envelope: ActionEnvelope, *, record: bool = True
+    ) -> PolicyRule | None:
         if not self._policy.limits:
             return None
         now = self._clock()
@@ -343,11 +345,18 @@ class PolicyEngine:
                         f"({limit.max_actions_per_minute}/min, scope={limit.scope})"
                     ),
                 )
-            q.append(now)
+            if record:
+                q.append(now)
         return None
 
-    def evaluate(self, envelope: ActionEnvelope) -> Decision:
-        """Evaluate an ActionEnvelope deterministically and return an explainable Decision."""
+    def evaluate(
+        self, envelope: ActionEnvelope, *, record_rate_limit: bool = True
+    ) -> Decision:
+        """Evaluate an ActionEnvelope deterministically and return an explainable Decision.
+
+        When record_rate_limit is False (such as in simulations or dry-run previews),
+        rate limit consumption is not recorded to avoid mutating real-action allowances.
+        """
         risk_tags = assess_risk(envelope)
 
         if self._frozen and envelope.action.verb != "read":
@@ -364,7 +373,7 @@ class PolicyEngine:
                 shadow=False,
             )
 
-        limit_hit = self._check_rate_limits(envelope)
+        limit_hit = self._check_rate_limits(envelope, record=record_rate_limit)
         if limit_hit is not None:
             return self._finalize_decision(
                 evaluated_verdict=limit_hit.verdict,

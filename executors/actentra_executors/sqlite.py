@@ -71,9 +71,141 @@ def _validate_single_statement(sql: str) -> str:
     return clean
 
 
+def _scan_cte_main_verb(sql: str) -> str:
+    """Extract and classify the main statement verb following a CTE (WITH ...).
+
+    Scans through CTE definitions to locate the primary statement verb (e.g. SELECT vs DELETE).
+    Defaults to 'other' if parsing fails or statement shape is unknown (fail closed).
+    """
+    i = 0
+    n = len(sql)
+
+    def skip_whitespace_and_comments() -> None:
+        nonlocal i
+        while i < n:
+            if sql[i].isspace():
+                i += 1
+            elif sql[i : i + 2] == "--":
+                i += 2
+                while i < n and sql[i] != "\n":
+                    i += 1
+            elif sql[i : i + 2] == "/*":
+                i += 2
+                while i < n and sql[i : i + 2] != "*/":
+                    i += 1
+                i += 2
+            else:
+                break
+
+    skip_whitespace_and_comments()
+    if not sql[i:].upper().startswith("WITH"):
+        return "other"
+    i += 4
+
+    skip_whitespace_and_comments()
+    if sql[i:].upper().startswith("RECURSIVE"):
+        i += 9
+
+    # Scan one or more CTE definitions: name [(...)] AS ( ... ) [, ...]
+    while i < n:
+        skip_whitespace_and_comments()
+        if i >= n:
+            return "other"
+
+        # Scan until AS keyword
+        found_as = False
+        while i < n:
+            skip_whitespace_and_comments()
+            if i >= n:
+                return "other"
+            if sql[i] in ("'", '"'):
+                quote = sql[i]
+                i += 1
+                while i < n and sql[i] != quote:
+                    if sql[i] == "\\" and i + 1 < n:
+                        i += 1
+                    i += 1
+                if i < n:
+                    i += 1
+                continue
+            if sql[i : i + 2].upper() == "AS" and (
+                i + 2 >= n or not (sql[i + 2].isalnum() or sql[i + 2] == "_")
+            ):
+                i += 2
+                found_as = True
+                break
+            i += 1
+
+        if not found_as:
+            return "other"
+
+        skip_whitespace_and_comments()
+        if i >= n or sql[i] != "(":
+            return "other"
+        i += 1
+
+        # Track paren depth to find closing ')'
+        depth = 1
+        while i < n and depth > 0:
+            if sql[i] in ("'", '"'):
+                quote = sql[i]
+                i += 1
+                while i < n and sql[i] != quote:
+                    if sql[i] == "\\" and i + 1 < n:
+                        i += 1
+                    i += 1
+                if i < n:
+                    i += 1
+                continue
+            if sql[i : i + 2] == "--":
+                i += 2
+                while i < n and sql[i] != "\n":
+                    i += 1
+                continue
+            if sql[i : i + 2] == "/*":
+                i += 2
+                while i < n and sql[i : i + 2] != "*/":
+                    i += 1
+                i += 2
+                continue
+            if sql[i] == "(":
+                depth += 1
+            elif sql[i] == ")":
+                depth -= 1
+            i += 1
+
+        if depth != 0:
+            return "other"
+
+        skip_whitespace_and_comments()
+        if i < n and sql[i] == ",":
+            i += 1
+            continue
+        break
+
+    skip_whitespace_and_comments()
+    if i >= n:
+        return "other"
+
+    token_match = re.match(r"^[A-Za-z_]+", sql[i:])
+    if not token_match:
+        return "other"
+
+    main_verb = token_match.group(0).upper()
+    if main_verb in ("SELECT", "EXPLAIN"):
+        return "read"
+    if main_verb in ("DELETE", "DROP", "TRUNCATE"):
+        return "delete"
+    if main_verb in ("INSERT", "UPDATE", "REPLACE", "CREATE", "ALTER"):
+        return "write"
+    return "other"
+
+
 def _infer_verb(sql: str) -> str:
     first = sql.lstrip().split(None, 1)[0].upper()
-    if first in ("SELECT", "EXPLAIN", "WITH"):
+    if first == "WITH":
+        return _scan_cte_main_verb(sql)
+    if first in ("SELECT", "EXPLAIN"):
         return "read"
     if first in ("DELETE", "DROP", "TRUNCATE"):
         return "delete"
@@ -137,6 +269,7 @@ class ScopedSQLiteExecutor:
         if effective_ro:
             uri = f"{self._db_path.as_uri()}?mode=ro"
             conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            conn.execute("PRAGMA query_only = ON;")
         else:
             conn = sqlite3.connect(self._db_path, timeout=5.0)
 

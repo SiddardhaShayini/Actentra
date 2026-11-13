@@ -181,3 +181,45 @@ Agents working on this project must maintain this file as the durable handoff:
     - `.venv\Scripts\ruff check core executors gateway sdk cli tests`: All checks passed!
     - `.venv\Scripts\mypy`: Success, 0 issues found in 28 source files (`strict = true`).
     - `.venv\Scripts\pytest -v`: 89 passed, 4 skipped in 6.79s (and 100% passed unsandboxed).
+
+### 2026-11-13 15:35 IST
+
+- Remediated all 10 security findings and operational recommendations from the Read-Only Code Review:
+  - Finding 1 (Critical):
+    - Re-evaluated approved crossings in `execute_approved_crossing` now strictly enforce `decision.verdict.permits_execution`, blocking execution if policy freezes or returns `DENY`/`HOLD`.
+    - Added atomic `claim_approval_for_execution` in `ReceiptStore` (`UPDATE ... WHERE status = 'approved' AND expires_at > ?`) executed before dispatch to eliminate race conditions and concurrent duplicate dispatch.
+    - Updated `cleanup_expired_approvals` to expire both `pending` and `approved` records whose TTL has elapsed.
+  - Finding 2 (High):
+    - Added `SSRFSafeRedirectHandler` in `ScopedHTTPExecutor` validating every redirect target URL against allowed schemes (`http`/`https`), host allowlists, and IP ranges (`_verify_destination_ip`), blocking SSRF redirection to loopback, private, or cloud metadata endpoints.
+  - Finding 3 (High):
+    - Enforced mandatory token authentication on non-loopback bindings in `ActentraHTTPServer`: attempts to bind to remote addresses without both `unsafe_allow_remote` and a non-empty `auth_token` fail closed immediately.
+  - Finding 4 (High):
+    - Added `escapeHtml()` sanitization across all dynamic card, table, parameter, and error interpolations in `console.html`.
+    - Added Content-Security-Policy (`default-src 'self'`), `X-Content-Type-Options: nosniff`, and `X-Frame-Options: DENY` headers in `_send_html`.
+    - Displayed safely rendered, scrollable action parameters in approval cards for informed operator decisions.
+  - Finding 5 (High):
+    - Implemented session taint tracking and propagation across gateway crossings in `submit_crossing` via `boundary.get_session_taint` and `boundary.set_session_taint`.
+  - Finding 6 (High):
+    - Added cumulative session budget recording in `_dispatch_and_record` via `self.boundary.engine.budget_tracker.record_usage(envelope)`, ensuring gateway execution paths accumulate actions, external calls, and write bytes against configured budgets.
+  - Finding 7 (Medium):
+    - Replaced naïve `WITH` classification in `_infer_verb` with a SQL scanner (`_scan_cte_main_verb`) that extracts the primary statement verb (`DELETE`, `UPDATE`, `INSERT`, etc.) following CTE blocks.
+    - Enforced database connection-level `PRAGMA query_only = ON;` in `ScopedSQLiteExecutor` when `read_only=True`.
+  - Finding 8 (Medium):
+    - Hardened `record_external_outcome` in `AppServices` to reject duplicate reports via `has_outcome_receipt`, verify that the corresponding decision receipt exists, and ensure the decision verdict permitted execution (`allow` or `allow_with_constraints`).
+  - Finding 9 (Medium):
+    - Clamped receipt query `limit` (`max(1, min(limit, 500))`) and `offset` (`max(0, offset)`) in both `http_service.py` and `ReceiptStore.query_records`.
+  - Finding 10 (Medium):
+    - Validated `0 <= length <= _MAX_BODY_BYTES` in `_read_json_body`, rejecting negative `Content-Length` headers.
+  - Side-effect-free simulations:
+    - Added `record_rate_limit: bool = True` to `PolicyEngine.evaluate()`, disabling rate-limit token consumption during `Boundary.dry_run()` and `AppServices.simulate_dry_run()`.
+  - Policy export completeness:
+    - Updated `get_policy_yaml()` to serialize `limits`, `budgets`, and full `match` fields (`agent_id`, `taint`, `risk_any`, `risk_all`, `default_reason`).
+  - Health check performance:
+    - Separated fast health checks ($O(1)$ record count and latest record hash) from full hash-chain verification (`full_verify=False` by default).
+  - Test suite fixes & regression tests:
+    - Fixed vacuous assertion in `test_app_services.py`.
+    - Created `tests/unit/test_security_review_remediations.py` containing 14 comprehensive tests verifying all 10 remediations. Total test count increased to 103 passed.
+  - Validation:
+    - `.venv\Scripts\ruff check core executors gateway sdk cli tests`: All checks passed!
+    - `.venv\Scripts\mypy`: Success, 0 issues found in 28 source files (`strict = true`).
+    - `.venv\Scripts\pytest -v`: 103 passed, 4 skipped (100% pass rate).

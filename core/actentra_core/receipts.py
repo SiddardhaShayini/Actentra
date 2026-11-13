@@ -431,6 +431,62 @@ class ReceiptStore:
             error=safe_error,
         )
 
+    def get_decision_receipt(self, crossing_id: str) -> ReceiptRecord | None:
+        """Fetch the decision receipt record for a crossing_id if one exists."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT seq, record_type, crossing_id, session_id, canonical_hash,
+                       policy_version, verdict, rule_id, reason, risk_tags_json,
+                       shadow, status, result_hash, error, ts, prev_hash, entry_hash
+                FROM receipts
+                WHERE crossing_id = ? AND record_type = 'decision'
+                ORDER BY seq DESC LIMIT 1;
+                """,
+                (crossing_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            risk_list = json.loads(str(row[9]))
+            return ReceiptRecord(
+                seq=int(row[0]),
+                record_type="decision",
+                crossing_id=str(row[2]),
+                session_id=str(row[3]),
+                canonical_hash=str(row[4]),
+                policy_version=str(row[5]),
+                verdict=str(row[6]) if row[6] is not None else None,
+                rule_id=str(row[7]) if row[7] is not None else None,
+                reason=str(row[8]) if row[8] is not None else None,
+                risk_tags=tuple(str(t) for t in risk_list),
+                shadow=bool(row[10]),
+                status=str(row[11]) if row[11] is not None else None,
+                result_hash=str(row[12]) if row[12] is not None else None,
+                error=str(row[13]) if row[13] is not None else None,
+                ts=str(row[14]),
+                prev_hash=str(row[15]),
+                entry_hash=str(row[16]),
+            )
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch decision receipt: {exc}") from exc
+        finally:
+            conn.close()
+
+    def has_outcome_receipt(self, crossing_id: str) -> bool:
+        """Return True if an outcome receipt already exists for crossing_id."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM receipts WHERE crossing_id = ? AND record_type = 'outcome' LIMIT 1;",
+                (crossing_id,),
+            ).fetchone()
+            return row is not None
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to check outcome receipt: {exc}") from exc
+        finally:
+            conn.close()
+
     def recover_pending_outcomes(self) -> list[ReceiptRecord]:
         """Mark interrupted execution decisions without outcome records as ``unknown``."""
         conn = self._connect()
@@ -514,6 +570,59 @@ class ReceiptStore:
             )
         return out
 
+    def get_latest_record(self) -> ReceiptRecord | None:
+        """Fetch the most recent receipt record without scanning entire log."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT seq, record_type, crossing_id, session_id, canonical_hash,
+                       policy_version, verdict, rule_id, reason, risk_tags_json,
+                       shadow, status, result_hash, error, ts, prev_hash, entry_hash
+                FROM receipts
+                ORDER BY seq DESC LIMIT 1;
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            risk_list = json.loads(str(row[9]))
+            rec_type: Literal["decision", "outcome"] = (
+                "decision" if row[1] == "decision" else "outcome"
+            )
+            return ReceiptRecord(
+                seq=int(row[0]),
+                record_type=rec_type,
+                crossing_id=str(row[2]),
+                session_id=str(row[3]),
+                canonical_hash=str(row[4]),
+                policy_version=str(row[5]),
+                verdict=str(row[6]) if row[6] is not None else None,
+                rule_id=str(row[7]) if row[7] is not None else None,
+                reason=str(row[8]) if row[8] is not None else None,
+                risk_tags=tuple(str(t) for t in risk_list),
+                shadow=bool(row[10]),
+                status=str(row[11]) if row[11] is not None else None,
+                result_hash=str(row[12]) if row[12] is not None else None,
+                error=str(row[13]) if row[13] is not None else None,
+                ts=str(row[14]),
+                prev_hash=str(row[15]),
+                entry_hash=str(row[16]),
+            )
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch latest record: {exc}") from exc
+        finally:
+            conn.close()
+
+    def record_count(self) -> int:
+        """Return total count of persisted receipt records."""
+        conn = self._connect()
+        try:
+            return int(conn.execute("SELECT COUNT(*) FROM receipts;").fetchone()[0])
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to count receipt records: {exc}") from exc
+        finally:
+            conn.close()
+
     def add_pending_approval(
         self,
         *,
@@ -576,14 +685,14 @@ class ReceiptStore:
         )
 
     def cleanup_expired_approvals(self) -> int:
-        """Mark pending approvals whose TTL has expired as 'expired'."""
+        """Mark pending or approved approvals whose TTL has expired as 'expired'."""
         now = time.time()
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
             cur = conn.execute(
                 "UPDATE pending_approvals SET status = 'expired', resolution_ts = ? "
-                "WHERE status = 'pending' AND expires_at <= ?;",
+                "WHERE status IN ('pending', 'approved') AND expires_at <= ?;",
                 (utc_now_iso(), now),
             )
             count = cur.rowcount
@@ -740,6 +849,32 @@ class ReceiptStore:
         finally:
             conn.close()
 
+    def claim_approval_for_execution(self, crossing_id: str) -> bool:
+        """Atomically transition an approved crossing to 'consumed' before execution dispatch.
+
+        Returns True if the approval was valid ('approved' and unexpired) and successfully claimed.
+        Returns False if already consumed, expired, rejected, or missing.
+        """
+        self.cleanup_expired_approvals()
+        now = time.time()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            cur = conn.execute(
+                "UPDATE pending_approvals SET status = 'consumed' "
+                "WHERE crossing_id = ? AND status = 'approved' AND expires_at > ?;",
+                (crossing_id, now),
+            )
+            claimed = cur.rowcount > 0
+            conn.execute("COMMIT;")
+            return claimed
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to claim approval for execution: {exc}") from exc
+        finally:
+            conn.close()
+
     def query_records(
         self,
         *,
@@ -753,6 +888,8 @@ class ReceiptStore:
         search: str | None = None,
     ) -> tuple[list[ReceiptRecord], int]:
         """Query bounded receipts with optional filters and total count."""
+        limit = max(1, min(limit, 500))
+        offset = max(0, offset)
         where_clauses: list[str] = []
         params: list[Any] = []
 

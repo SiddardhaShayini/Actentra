@@ -7,6 +7,7 @@ import re
 import socket
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 from urllib.error import HTTPError, URLError
 
@@ -82,6 +83,36 @@ def canonicalize_url(raw_url: str) -> str:
     return f"{scheme}://{hostname}{port_part}{clean_path}{query_part}"
 
 
+class SSRFSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Intercept and validate all HTTP redirects against SSRF and host policy (Finding 2)."""
+
+    def __init__(
+        self,
+        validator: Callable[[str], Any],
+        max_redirects: int = 5,
+    ) -> None:
+        super().__init__()
+        self._validator = validator
+        self._max_redirects = max_redirects
+        self._count = 0
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        self._count += 1
+        if self._count > self._max_redirects:
+            raise ExecutorError(f"HTTP redirect limit exceeded ({self._max_redirects})")
+        # Validate redirected destination before following
+        self._validator(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class ScopedHTTPExecutor:
     """SSRF-defended HTTP client executor bound by policy constraints."""
 
@@ -141,26 +172,36 @@ class ScopedHTTPExecutor:
                     f"Host {hostname!r} resolves to private IP {ip_str!r}; blocked by SSRF defense"
                 )
 
+    def _validate_url_target(
+        self, target_url: str, constraints: dict[str, Any], allow_private: bool
+    ) -> str:
+        """Validate destination URL against allowed schemes, host list, and private IP ranges."""
+        try:
+            canon = canonicalize_url(target_url)
+        except CanonicalizationError as exc:
+            raise ExecutorError(f"Invalid URL {target_url!r}: {exc}") from exc
+
+        parsed = urllib.parse.urlsplit(canon)
+        if parsed.scheme not in _ALLOWED_SCHEMES:
+            raise ExecutorError(f"Disallowed URL scheme {parsed.scheme!r}; only HTTP(S) permitted")
+
+        hostname = (parsed.hostname or "").lower()
+        if not hostname:
+            raise ExecutorError(f"URL missing valid hostname: {target_url!r}")
+
+        self._check_host_allowed(hostname, constraints)
+        self._verify_destination_ip(hostname, allow_private)
+        return canon
+
     def execute(self, envelope: ActionEnvelope, decision: Decision) -> dict[str, Any]:
         """Execute an authorized HTTP action according to constraints."""
         tool = envelope.action.tool
         if not tool.startswith(("http.", "net.http", "webhook.")):
             raise ExecutorError(f"Unsupported tool for ScopedHTTPExecutor: {tool!r}")
 
-        raw_resource = envelope.action.resource
-        try:
-            canon_url = canonicalize_url(raw_resource)
-        except CanonicalizationError as exc:
-            raise ExecutorError(f"Invalid URL: {exc}") from exc
-
-        parsed = urllib.parse.urlsplit(canon_url)
-        hostname = (parsed.hostname or "").lower()
-
         constraints = dict(decision.constraints)
-        self._check_host_allowed(hostname, constraints)
-
         allow_private = bool(constraints.get("allow_private_ips", self._allow_private_ips))
-        self._verify_destination_ip(hostname, allow_private)
+        canon_url = self._validate_url_target(envelope.action.resource, constraints, allow_private)
 
         params = envelope.action.params
         method = str(params.get("method", "GET")).upper().strip()
@@ -182,6 +223,10 @@ class ScopedHTTPExecutor:
 
         timeout = float(constraints.get("timeout_seconds", self._default_timeout))
         max_bytes = int(constraints.get("max_response_bytes", self._default_max_bytes))
+
+        # Configurable redirect policy with SSRF-safe validation (Finding 2)
+        allow_redirects = bool(constraints.get("allow_redirects", True))
+        max_redirects = int(constraints.get("max_redirects", 5)) if allow_redirects else 0
 
         # Prepare request headers
         raw_headers = params.get("headers") or {}
@@ -214,8 +259,17 @@ class ScopedHTTPExecutor:
             method=method,
         )
 
+        def redirect_validator(new_url: str) -> None:
+            self._validate_url_target(new_url, constraints, allow_private)
+
+        redirect_handler = SSRFSafeRedirectHandler(
+            validator=redirect_validator,
+            max_redirects=max_redirects,
+        )
+        opener = urllib.request.build_opener(redirect_handler)
+
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            with opener.open(req, timeout=timeout) as resp:  # noqa: S310
                 status_code = int(resp.status)
                 resp_headers = dict(resp.headers)
                 # Bounded read to prevent memory bombs

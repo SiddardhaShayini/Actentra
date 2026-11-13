@@ -22,7 +22,7 @@ from actentra_core.envelope import (
     compute_action_hash,
 )
 from actentra_core.policy import lint_policy, load_policy_yaml
-from actentra_core.receipts import verify_log
+from actentra_core.receipts import GENESIS_HASH, verify_log
 from actentra_core.verdict import Decision, Verdict
 from actentra_executors.fs import LocalFSExecutor
 from actentra_executors.http import ScopedHTTPExecutor
@@ -84,20 +84,30 @@ class AppServices:
 
     # --- 1. Health & Status ---
 
-    def get_health(self) -> dict[str, Any]:
+    def get_health(self, *, full_verify: bool = False) -> dict[str, Any]:
         """Return runtime health, policy state, and receipt store integrity."""
         db_path = self.boundary.receipt_store.db_path
-        vr = verify_log(db_path)
         pending_list = self.boundary.receipt_store.list_pending_approvals(status="pending")
+        if full_verify:
+            vr = verify_log(db_path)
+            total_records = vr.total_records
+            integrity_ok = vr.ok
+            last_hash = vr.last_hash
+        else:
+            latest = self.boundary.receipt_store.get_latest_record()
+            total_records = self.boundary.receipt_store.record_count()
+            integrity_ok = True
+            last_hash = latest.entry_hash if latest else GENESIS_HASH
+
         return {
             "status": "ok",
             "policy_id": self.boundary.engine.policy.policy_id,
             "policy_version": self.boundary.engine.policy.policy_version,
             "mode": self.boundary.engine.policy.mode,
             "frozen": self.boundary.engine.frozen,
-            "total_receipts": vr.total_records,
-            "integrity_ok": vr.ok,
-            "last_hash": vr.last_hash,
+            "total_receipts": total_records,
+            "integrity_ok": integrity_ok,
+            "last_hash": last_hash,
             "pending_approvals_count": len(pending_list),
             "registered_executors": self.registry.list_registered_tools(),
         }
@@ -111,11 +121,15 @@ class AppServices:
         execute: bool = False,
     ) -> dict[str, Any]:
         """Propose, canonicalize, evaluate, and conditionally execute an action."""
+        session_id = str(data.get("session_id", "default"))
         prov_items = [
             ProvenanceItem(source=p["source"], trust=p["trust"])
             for p in data.get("provenance", [])
             if isinstance(p, dict) and "source" in p and "trust" in p
         ]
+        # Propagate session taint across gateway crossings (Finding 5)
+        if not prov_items and self.boundary.get_session_taint(session_id) == "untrusted":
+            prov_items.append(ProvenanceItem(source="session", trust="untrusted"))
 
         try:
             envelope = build_envelope(
@@ -123,7 +137,7 @@ class AppServices:
                 verb=str(data.get("verb", "other")),
                 resource=str(data.get("resource", "")),
                 params=data.get("params") or {},
-                session_id=str(data.get("session_id", "default")),
+                session_id=session_id,
                 agent_id=str(data.get("agent_id", "http-client")),
                 provenance=prov_items,
                 user_goal=data.get("user_goal"),
@@ -137,6 +151,10 @@ class AppServices:
                 "canonical_hash": "sha256:" + ("0" * 64),
                 "risk_tags": [],
             }
+
+        # Update session taint tracker if this action is untrusted (Finding 5)
+        if envelope.max_taint == "untrusted":
+            self.boundary.set_session_taint("untrusted", session_id=envelope.session_id)
 
         decision = self.boundary.engine.evaluate(envelope)
 
@@ -238,6 +256,8 @@ class AppServices:
             status="success",
             result_hash=res_hash,
         )
+        # Update session cumulative budgets for gateway execution (Finding 6)
+        self.boundary.engine.budget_tracker.record_usage(envelope)
         return result
 
     # --- 3. Approvals Management ---
@@ -305,6 +325,11 @@ class AppServices:
 
         action_data = raw_env.get("action") or {}
         agent_data = raw_env.get("agent") or {}
+        prov_items = [
+            ProvenanceItem(source=item["source"], trust=item["trust"])
+            for item in raw_env.get("provenance", [])
+            if isinstance(item, dict) and "source" in item and "trust" in item
+        ]
         envelope = build_envelope(
             tool=str(action_data.get("tool", "")),
             verb=str(action_data.get("verb", "other")),
@@ -312,10 +337,35 @@ class AppServices:
             params=action_data.get("params") or {},
             session_id=str(raw_env.get("session_id", "default")),
             agent_id=str(agent_data.get("id", "http-client")),
+            provenance=prov_items,
+            user_goal=raw_env.get("user_goal"),
             crossing_id=crossing_id,
         )
 
         decision = self.boundary.engine.evaluate(envelope)
+        if decision.verdict == Verdict.ASK and self.boundary._has_valid_approval(envelope):
+            decision = Decision(
+                verdict=Verdict.ALLOW,
+                rule_id=f"{decision.rule_id}:approved",
+                reason=f"Human approved: {decision.reason}",
+                policy_version=decision.policy_version,
+                canonical_hash=decision.canonical_hash,
+                risk_tags=decision.risk_tags,
+                constraints=decision.constraints,
+                shadow=decision.shadow,
+                would_verdict=decision.would_verdict,
+            )
+        # Invariant: Re-evaluation must permit execution (Finding 1)
+        if not decision.verdict.permits_execution:
+            return {
+                "error": (
+                    f"Execution blocked: verdict={decision.verdict.value} "
+                    f"rule={decision.rule_id} reason={decision.reason}"
+                ),
+                "verdict": decision.verdict.value,
+                "crossing_id": crossing_id,
+            }
+
         executor = self.registry.get_executor(envelope.action.tool)
         if executor is None:
             return {
@@ -323,12 +373,22 @@ class AppServices:
                 "crossing_id": crossing_id,
             }
 
+        # Atomically claim approval before execution dispatch
+        # to prevent concurrent duplicates (Finding 1)
+        claimed = self.boundary.receipt_store.claim_approval_for_execution(crossing_id)
+        if not claimed:
+            return {
+                "error": (
+                    f"Crossing '{crossing_id}' could not be claimed for execution "
+                    "(already claimed, consumed, or expired)"
+                ),
+                "crossing_id": crossing_id,
+            }
+
         try:
             result = self._dispatch_and_record(envelope, decision, executor)
-            self.boundary.receipt_store.mark_approval_consumed(crossing_id)
             return {"status": "success", "result": result, "crossing_id": crossing_id}
         except Exception as exc:
-            self.boundary.receipt_store.mark_approval_consumed(crossing_id)
             return {"status": "failure", "error": type(exc).__name__, "crossing_id": crossing_id}
 
     def record_external_outcome(
@@ -340,6 +400,24 @@ class AppServices:
         error: str | None = None,
     ) -> dict[str, Any]:
         """Record outcome receipt for an externally executed crossing."""
+        # Finding 8: Prevent duplicate outcome reporting
+        if self.boundary.receipt_store.has_outcome_receipt(crossing_id):
+            return {"error": f"Outcome already recorded for crossing '{crossing_id}'"}
+
+        # Finding 8: Verify corresponding decision receipt exists
+        dec_rec = self.boundary.receipt_store.get_decision_receipt(crossing_id)
+        if dec_rec is None:
+            return {"error": f"No decision receipt found for crossing '{crossing_id}'"}
+
+        # Finding 8: Verify that the decision permitted execution
+        if dec_rec.verdict not in ("allow", "allow_with_constraints"):
+            return {
+                "error": (
+                    f"Cannot record execution outcome for non-allowed decision "
+                    f"(crossing_id={crossing_id}, verdict={dec_rec.verdict})"
+                )
+            }
+
         raw_env = self.boundary.receipt_store.get_envelope(crossing_id)
         if raw_env is None:
             return {"error": f"Crossing '{crossing_id}' not found in store"}
@@ -360,6 +438,34 @@ class AppServices:
     def get_policy_yaml(self) -> str:
         """Return the current active policy formatted as YAML."""
         pack = self.boundary.engine.policy
+        limits_list: list[dict[str, Any]] = [
+            {"id": lim.id, "scope": lim.scope, "max_actions_per_minute": lim.max_actions_per_minute}
+            for lim in pack.limits
+        ]
+        doc: dict[str, Any] = {
+            "version": pack.version,
+            "policy_id": pack.policy_id,
+            "mode": pack.mode,
+            "defaults": {
+                "verdict": pack.default_verdict.value,
+                "reason": pack.default_reason,
+            },
+        }
+        if limits_list:
+            doc["limits"] = limits_list
+        if pack.budgets is not None:
+            budgets_dict: dict[str, Any] = {}
+            if pack.budgets.max_actions is not None:
+                budgets_dict["max_actions"] = pack.budgets.max_actions
+            if pack.budgets.max_external_calls is not None:
+                budgets_dict["max_external_calls"] = pack.budgets.max_external_calls
+            if pack.budgets.max_write_bytes is not None:
+                budgets_dict["max_write_bytes"] = pack.budgets.max_write_bytes
+            if pack.budgets.on_exceeded != Verdict.ASK:
+                budgets_dict["on_exceeded"] = pack.budgets.on_exceeded.value
+            if budgets_dict:
+                doc["budgets"] = budgets_dict
+
         rules_list: list[dict[str, Any]] = []
         for r in pack.rules:
             match_dict: dict[str, Any] = {}
@@ -371,6 +477,15 @@ class AppServices:
                 )
             if r.match.resource:
                 match_dict["resource"] = r.match.resource
+            if r.match.agent_id:
+                match_dict["agent_id"] = r.match.agent_id
+            if r.match.taint:
+                match_dict["taint"] = r.match.taint
+            if r.match.risk_any:
+                match_dict["risk_any"] = list(r.match.risk_any)
+            if r.match.risk_all:
+                match_dict["risk_all"] = list(r.match.risk_all)
+
             item: dict[str, Any] = {
                 "id": r.id,
                 "match": match_dict,
@@ -382,13 +497,7 @@ class AppServices:
                 item["constraints"] = dict(r.constraints)
             rules_list.append(item)
 
-        doc = {
-            "version": pack.version,
-            "policy_id": pack.policy_id,
-            "mode": pack.mode,
-            "defaults": {"verdict": pack.default_verdict.value},
-            "rules": rules_list,
-        }
+        doc["rules"] = rules_list
         import yaml
 
         return yaml.dump(doc, sort_keys=False)

@@ -375,6 +375,16 @@ def read_workspace_note(path: str) -> str:
 </main>
 
 <script>
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 let currentReceiptsOffset = 0;
 const receiptsLimit = 20;
 let debounceTimer;
@@ -445,31 +455,45 @@ async function refreshApprovals() {
     }
     let html = '';
     for (const p of list) {
-      const riskTags = (p.risk_tags || []).map(t => `<span class="badge risk">${t}</span>`).join(' ') || '<span style="color:var(--text-muted)">none</span>';
+      const riskTags = (p.risk_tags || []).map(t => `<span class="badge risk">${escapeHtml(t)}</span>`).join(' ') || '<span style="color:var(--text-muted)">none</span>';
+      const safeParams = p.params && Object.keys(p.params).length > 0 ? JSON.stringify(p.params, null, 2) : 'none';
+      const safeCid = escapeHtml(p.crossing_id);
+      const safeTool = escapeHtml(p.tool);
+      const safeVerb = escapeHtml(p.verb);
+      const safeResource = escapeHtml(p.resource);
+      const safeReason = escapeHtml(p.reason);
+      const safeHash = escapeHtml(p.canonical_hash);
+      const safeExpires = escapeHtml(p.expires_in_seconds);
+      const encodedCid = encodeURIComponent(p.crossing_id);
+
       html += `
         <div class="card" style="border-left: 4px solid var(--yellow);">
           <div style="display:flex; justify-content:space-between; align-items:flex-start;">
             <div>
-              <div class="stat-label">Crossing ID: <code>${p.crossing_id}</code></div>
-              <h4 style="margin:0.25rem 0;">${p.tool} <span style="font-weight:normal; color:var(--text-muted);">(${p.verb})</span></h4>
-              <div><code>${p.resource}</code></div>
+              <div class="stat-label">Crossing ID: <code>${safeCid}</code></div>
+              <h4 style="margin:0.25rem 0;">${safeTool} <span style="font-weight:normal; color:var(--text-muted);">(${safeVerb})</span></h4>
+              <div><code>${safeResource}</code></div>
             </div>
-            <span class="badge" style="background:#78350f; color:#fde68a;">Expires in ${p.expires_in_seconds}s</span>
+            <span class="badge" style="background:#78350f; color:#fde68a;">Expires in ${safeExpires}s</span>
           </div>
-          <div style="margin:0.5rem 0; font-size:0.85rem;"><strong>Reason:</strong> ${p.reason}</div>
-          <div style="margin-bottom:0.75rem;"><strong>Risk Tags:</strong> ${riskTags}</div>
-          <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.75rem;">Hash: <code>${p.canonical_hash}</code></div>
+          <div style="margin:0.5rem 0; font-size:0.85rem;"><strong>Reason:</strong> ${safeReason}</div>
+          <div style="margin-bottom:0.5rem;"><strong>Risk Tags:</strong> ${riskTags}</div>
+          <div style="font-size:0.8rem; margin-bottom:0.5rem;">
+            <strong>Parameters:</strong>
+            <pre style="background:var(--bg-card); padding:0.4rem; border-radius:4px; max-height:120px; overflow:auto; margin:0.25rem 0;"><code>${escapeHtml(safeParams)}</code></pre>
+          </div>
+          <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.75rem;">Hash: <code>${safeHash}</code></div>
           <div style="display:flex; gap:0.5rem;">
-            <button class="btn btn-primary" onclick="resolveCrossing('${p.crossing_id}', true, true)">Approve & Execute</button>
-            <button class="btn btn-secondary" onclick="resolveCrossing('${p.crossing_id}', true, false)">Approve Only</button>
-            <button class="btn btn-danger" onclick="resolveCrossing('${p.crossing_id}', false, false)">Deny</button>
+            <button class="btn btn-primary" onclick="resolveCrossing('${encodedCid}', true, true)">Approve & Execute</button>
+            <button class="btn btn-secondary" onclick="resolveCrossing('${encodedCid}', true, false)">Approve Only</button>
+            <button class="btn btn-danger" onclick="resolveCrossing('${encodedCid}', false, false)">Deny</button>
           </div>
         </div>
       `;
     }
     container.innerHTML = html;
   } catch (e) {
-    container.innerHTML = '<div style="color:var(--red);">Failed to load approvals: ' + e + '</div>';
+    container.innerHTML = '<div style="color:var(--red);">Failed to load approvals: ' + escapeHtml(e) + '</div>';
   }
 }
 
@@ -501,7 +525,7 @@ async function loadPolicyView() {
     if (!lintData.warnings || lintData.warnings.length === 0) {
       lDiv.innerHTML = '<span class="badge live">CLEAN</span> No policy warnings detected.';
     } else {
-      lDiv.innerHTML = lintData.warnings.map(w => `<div style="color:var(--yellow); margin-bottom:0.25rem;">&bull; ${w.message}</div>`).join('');
+      lDiv.innerHTML = lintData.warnings.map(w => `<div style="color:var(--yellow); margin-bottom:0.25rem;">&bull; ${escapeHtml(w.message)}</div>`).join('');
     }
   } catch (e) {}
 }
@@ -532,17 +556,17 @@ async function runCanaryDiff() {
     });
     const data = await res.json();
     if (data.error) {
-      resDiv.innerHTML = '<span style="color:var(--red)">' + data.error + '</span>';
+      resDiv.innerHTML = '<span style="color:var(--red)">' + escapeHtml(data.error) + '</span>';
       return;
     }
     resDiv.innerHTML = `
       <div style="margin-bottom:0.5rem;">
-        Evaluated: <strong>${data.total_evaluated}</strong> | Identical: <strong>${data.identical_count}</strong> |
-        More Restrictive: <strong>${data.more_restrictive_count}</strong> |
-        Regressions: <strong style="color:${data.less_restrictive_count > 0 ? 'var(--red)' : 'var(--teal)'}">${data.less_restrictive_count}</strong>
+        Evaluated: <strong>${escapeHtml(data.total_evaluated)}</strong> | Identical: <strong>${escapeHtml(data.identical_count)}</strong> |
+        More Restrictive: <strong>${escapeHtml(data.more_restrictive_count)}</strong> |
+        Regressions: <strong style="color:${data.less_restrictive_count > 0 ? 'var(--red)' : 'var(--teal)'}">${escapeHtml(data.less_restrictive_count)}</strong>
       </div>
     `;
-  } catch (e) { resDiv.innerHTML = '<span style="color:var(--red)">' + e + '</span>'; }
+  } catch (e) { resDiv.innerHTML = '<span style="color:var(--red)">' + escapeHtml(e) + '</span>'; }
 }
 
 async function executeSimulation() {
@@ -565,17 +589,22 @@ async function executeSimulation() {
       body: JSON.stringify({ tool, verb, resource, params })
     });
     const data = await res.json();
-    const vClass = data.verdict ? data.verdict.toLowerCase() : 'hold';
+    const vClass = data.verdict ? escapeHtml(data.verdict.toLowerCase()) : 'hold';
+    const safeVerdict = data.verdict ? escapeHtml(data.verdict.toUpperCase()) : 'UNKNOWN';
+    const safeRule = escapeHtml(data.rule_id || '-');
+    const safeReason = escapeHtml(data.reason || '-');
+    const safeRisks = (data.risk_tags || []).map(t => escapeHtml(t)).join(', ') || 'none';
+    const safeHash = escapeHtml(data.canonical_hash || '-');
     resDiv.innerHTML = `
       <div class="card" style="border-left: 4px solid var(--teal);">
-        <h4>Simulation Verdict: <span class="badge ${vClass}">${data.verdict ? data.verdict.toUpperCase() : 'UNKNOWN'}</span></h4>
-        <div style="margin-top:0.5rem; font-size:0.85rem;"><strong>Rule ID:</strong> <code>${data.rule_id}</code></div>
-        <div style="font-size:0.85rem;"><strong>Reason:</strong> ${data.reason}</div>
-        <div style="font-size:0.85rem;"><strong>Risk Tags:</strong> ${data.risk_tags ? data.risk_tags.join(', ') : 'none'}</div>
-        <div style="font-size:0.85rem;"><strong>Hash:</strong> <code>${data.canonical_hash}</code></div>
+        <h4>Simulation Verdict: <span class="badge ${vClass}">${safeVerdict}</span></h4>
+        <div style="margin-top:0.5rem; font-size:0.85rem;"><strong>Rule ID:</strong> <code>${safeRule}</code></div>
+        <div style="font-size:0.85rem;"><strong>Reason:</strong> ${safeReason}</div>
+        <div style="font-size:0.85rem;"><strong>Risk Tags:</strong> ${safeRisks}</div>
+        <div style="font-size:0.85rem;"><strong>Hash:</strong> <code>${safeHash}</code></div>
       </div>
     `;
-  } catch (e) { resDiv.innerHTML = '<span style="color:var(--red)">' + e + '</span>'; }
+  } catch (e) { resDiv.innerHTML = '<span style="color:var(--red)">' + escapeHtml(e) + '</span>'; }
 }
 
 async function loadReceiptsPage(offset) {
@@ -600,17 +629,17 @@ async function loadReceiptsPage(offset) {
     }
     let rows = '';
     for (const r of records) {
-      const v = r.verdict ? `<span class="badge ${r.verdict.toLowerCase()}">${r.verdict.toUpperCase()}</span>` : '-';
-      const s = r.status ? `<span class="badge ${r.status === 'success' ? 'live' : 'deny'}">${r.status.toUpperCase()}</span>` : '-';
+      const v = r.verdict ? `<span class="badge ${escapeHtml(r.verdict.toLowerCase())}">${escapeHtml(r.verdict.toUpperCase())}</span>` : '-';
+      const s = r.status ? `<span class="badge ${r.status === 'success' ? 'live' : 'deny'}">${escapeHtml(r.status.toUpperCase())}</span>` : '-';
       rows += `
         <tr>
-          <td>#${r.seq}</td>
-          <td><code>${r.record_type}</code></td>
-          <td><code>${r.crossing_id}</code></td>
+          <td>#${escapeHtml(r.seq)}</td>
+          <td><code>${escapeHtml(r.record_type)}</code></td>
+          <td><code>${escapeHtml(r.crossing_id)}</code></td>
           <td>${v}</td>
           <td>${s}</td>
-          <td>${r.rule_id || '-'}</td>
-          <td><span style="font-size:0.75rem; color:var(--text-muted);">${r.ts}</span></td>
+          <td>${escapeHtml(r.rule_id || '-')}</td>
+          <td><span style="font-size:0.75rem; color:var(--text-muted);">${escapeHtml(r.ts)}</span></td>
         </tr>
       `;
     }
@@ -618,7 +647,7 @@ async function loadReceiptsPage(offset) {
     document.getElementById('receipts-pagination-info').innerText = `Records ${offset + 1}–${offset + records.length} of ${total}`;
     document.getElementById('btn-prev-page').disabled = offset <= 0;
     document.getElementById('btn-next-page').disabled = (offset + records.length) >= total;
-  } catch (e) { container.innerHTML = '<span style="color:var(--red)">' + e + '</span>'; }
+  } catch (e) { container.innerHTML = '<span style="color:var(--red)">' + escapeHtml(e) + '</span>'; }
 }
 
 function debouncedReceipts() {
@@ -645,8 +674,8 @@ async function loadOverviewFeed() {
     }
     let rows = '';
     for (const r of records.slice(-5).reverse()) {
-      const v = r.verdict ? `<span class="badge ${r.verdict.toLowerCase()}">${r.verdict.toUpperCase()}</span>` : `<span>${r.status || '-'}</span>`;
-      rows += `<tr><td>#${r.seq}</td><td><code>${r.record_type}</code></td><td><code>${r.crossing_id}</code></td><td>${v}</td><td>${r.rule_id || '-'}</td><td><span style="font-size:0.75rem; color:var(--text-muted);">${r.ts}</span></td></tr>`;
+      const v = r.verdict ? `<span class="badge ${escapeHtml(r.verdict.toLowerCase())}">${escapeHtml(r.verdict.toUpperCase())}</span>` : `<span>${escapeHtml(r.status || '-')}</span>`;
+      rows += `<tr><td>#${escapeHtml(r.seq)}</td><td><code>${escapeHtml(r.record_type)}</code></td><td><code>${escapeHtml(r.crossing_id)}</code></td><td>${v}</td><td>${escapeHtml(r.rule_id || '-')}</td><td><span style="font-size:0.75rem; color:var(--text-muted);">${escapeHtml(r.ts)}</span></td></tr>`;
     }
     feed.innerHTML = `<table><thead><tr><th>Seq</th><th>Type</th><th>Crossing</th><th>Verdict/Status</th><th>Rule</th><th>Time</th></tr></thead><tbody>${rows}</tbody></table>`;
   } catch (e) {}

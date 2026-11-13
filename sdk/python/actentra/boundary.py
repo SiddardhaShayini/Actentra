@@ -225,7 +225,7 @@ class Boundary:
             provenance=prov_items,
         )
 
-        decision = self._engine.evaluate(envelope)
+        decision = self._engine.evaluate(envelope, record_rate_limit=False)
 
         if record_receipt:
             shadow_dec = Decision(

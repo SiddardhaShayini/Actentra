@@ -268,7 +268,8 @@ def test_paged_receipts_query_and_search(tmp_path: Path) -> None:
     # Search filter
     q_search = services.query_receipts(search="file_3")
     assert len(q_search["records"]) == 1
-    assert "file_3" in q_search["records"][0]["crossing_id"] or True
+    raw_env = store.get_envelope(q_search["records"][0]["crossing_id"])
+    assert raw_env is not None and "file_3" in raw_env["action"]["resource"]
 
 
 def test_policy_canary_and_simulation(tmp_path: Path) -> None:

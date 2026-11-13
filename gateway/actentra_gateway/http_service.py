@@ -134,6 +134,13 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self';",
+        )
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
         self.wfile.write(body)
 
@@ -141,7 +148,12 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         content_len_header = self.headers.get("Content-Length")
         if not content_len_header:
             raise ValueError("Missing Content-Length header")
-        length = int(content_len_header)
+        try:
+            length = int(content_len_header)
+        except ValueError as exc:
+            raise ValueError(f"Invalid Content-Length header: {content_len_header!r}") from exc
+        if length < 0:
+            raise ValueError(f"Negative Content-Length header is invalid: {length}")
         if length > _MAX_BODY_BYTES:
             raise ValueError(f"Request body exceeds {_MAX_BODY_BYTES} bytes limit")
         raw_bytes = self.rfile.read(length)
@@ -193,8 +205,16 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
 
         if path == "/v1/receipts":
             query = parse_qs(parts.query)
-            limit = int(query.get("limit", ["50"])[0])
-            offset = int(query.get("offset", ["0"])[0])
+            try:
+                raw_limit = int(query.get("limit", ["50"])[0])
+                limit = max(1, min(raw_limit, 500))
+            except ValueError:
+                limit = 50
+            try:
+                raw_offset = int(query.get("offset", ["0"])[0])
+                offset = max(0, raw_offset)
+            except ValueError:
+                offset = 0
             verdict = query.get("verdict", [None])[0]
             status_f = query.get("status", [None])[0]
             tool_f = query.get("tool", [None])[0]
@@ -395,17 +415,28 @@ class ActentraHTTPServer(ThreadingHTTPServer):
         unsafe_allow_remote: bool = False,
     ) -> None:
         host = server_address[0]
-        if host not in _LOOPBACK_HOSTS and not (
-            unsafe_allow_remote or os.environ.get("ACTENTRA_UNSAFE_ALLOW_REMOTE")
-        ):
-            raise ValueError(
-                f"Refusing to bind Actentra Gateway to non-loopback address {host!r} "
-                "without explicit remote authorization (--unsafe-allow-remote)"
-            )
+        effective_token = auth_token or os.environ.get("ACTENTRA_GATEWAY_TOKEN")
+        is_remote_allowed = unsafe_allow_remote or bool(
+            os.environ.get("ACTENTRA_UNSAFE_ALLOW_REMOTE")
+        )
+
+        if host not in _LOOPBACK_HOSTS:
+            if not is_remote_allowed:
+                raise ValueError(
+                    f"Refusing to bind Actentra Gateway to non-loopback address {host!r} "
+                    "without explicit remote authorization (--unsafe-allow-remote)"
+                )
+            if not effective_token or not effective_token.strip():
+                raise ValueError(
+                    f"Refusing to bind Actentra Gateway to non-loopback address {host!r} "
+                    "without an authentication token. Remote interfaces require "
+                    "token authentication."
+                )
+
         super().__init__(server_address, ActentraHTTPHandler)
         self.boundary = boundary
         self.approval_ttl_seconds = approval_ttl_seconds
-        self.auth_token = auth_token or os.environ.get("ACTENTRA_GATEWAY_TOKEN")
+        self.auth_token = effective_token
         self.services = AppServices(
             boundary,
             executor_registry=executor_registry,
