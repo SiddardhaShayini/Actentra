@@ -143,3 +143,41 @@ Agents working on this project must maintain this file as the durable handoff:
   - `.venv\Scripts\ruff check core executors gateway sdk cli tests`: All checks passed!
   - `.venv\Scripts\mypy`: Success, 0 issues found in 27 source files (`strict = true`).
   - `.venv\Scripts\pytest -v`: 80 passed, 4 skipped in 6.03s.
+
+### 2026-11-13 12:45 IST
+
+- Built Actentra V2 — Unified Operator Application, Persistent Approvals, Action Lifecycle & Dispatched Execution per `PLAN_V2.md`:
+  - Architecture & Specification (`docs/lifecycle-contract.md`, `docs/product-status.md`):
+    - Authored the normative Action Lifecycle & Operational Contract defining states (`PROPOSED`, `EVALUATED`, `PENDING_APPROVAL`, `APPROVED`, `EXECUTING`, `COMPLETED`), TOCTOU binding (Invariant I3), decision/outcome receipt durability (Invariant I5), and local-only security posture.
+    - Authored Product Status & Feature Support Matrix labeling capabilities across Supported, Experimental, and Planned tiers.
+  - Persistent Approvals in SQLite WAL (`core/actentra_core/receipts.py`):
+    - Added `pending_approvals` table storing `crossing_id`, `session_id`, `canonical_hash`, `tool`, `verb`, `resource`, `risk_tags_json`, `reason`, `params_json`, `ts`, `expires_at`, `status`, and `resolution_ts`.
+    - Implemented `add_pending_approval`, `list_pending_approvals`, `get_pending_approval`, `resolve_pending_approval`, `mark_approval_consumed`, and `cleanup_expired_approvals`.
+    - Pending human approvals now survive gateway process restarts, crash recoveries, and power cycles.
+    - Modified `record_decision` to commit `action_envelopes` within the exact same atomic transaction as the decision receipt.
+  - Paginated Bounded Receipts & Search (`core/actentra_core/receipts.py`):
+    - Implemented `query_records(limit, offset, verdict, tool, status, session_id, record_type, search)` returning bounded records and exact `total_count`.
+  - Replay Fidelity Verification (`core/actentra_core/canary.py`):
+    - Enhanced `run_policy_canary` and `CanarySummary` with `missing_context_count` to explicitly report missing or corrupted replay context rather than guessing.
+  - Thread Safety (`sdk/python/actentra/boundary.py`):
+    - Protected mutable in-memory structures (`_approvals`, `_session_taints`) with `threading.Lock()` and wired `_has_valid_approval` to check and consume persistent SQLite approvals.
+  - Typed Application Services Layer (`gateway/actentra_gateway/services.py`):
+    - Implemented `AppServices` and `ExecutorRegistry` unifying CLI and Web UI.
+    - Provided built-in executor registration (`register_fs`, `register_sqlite`, `register_http`) and dispatch logic (`_dispatch_and_record`).
+    - Implemented `submit_crossing` with optional execution dispatch, `resolve_approval`, `execute_approved_crossing`, `record_external_outcome`, `query_receipts`, `verify_audit_log`, `export_audit_bundle`, `run_canary_on_candidate`, and `simulate_dry_run`.
+  - Hardened HTTP Service & Unified Web Console (`gateway/actentra_gateway/http_service.py`, `console.html`):
+    - Enforced strict loopback binding (`127.0.0.1`); non-loopback addresses fail closed unless `--unsafe-allow-remote` and Bearer token auth (`--token` / `ACTENTRA_GATEWAY_TOKEN`) are provided.
+    - Replaced wildcard `*` CORS with verified loopback origin reflection.
+    - Added REST endpoints for `/v1/crossings/{id}/execute`, `/v1/crossings/{id}/outcome`, `/v1/policy`, `/v1/policy/lint`, `/v1/policy/canary`, `/v1/simulate`, and `/v1/bundle/export`.
+    - Built the embedded offline Web Console (`console.html`) with 7 views: Overview, Approvals Inbox, Policies & Linter, Dry-Run Simulator, Receipts Explorer, Integrations, and Settings.
+  - CLI Enhancements (`cli/actentra_cli/main.py`):
+    - Added `actentra approvals list` and `actentra approvals resolve`.
+    - Added `actentra bundle export`.
+    - Extended `actentra serve` with `--token`, `--unsafe-allow-remote`, `--ttl`, and `--workspace`.
+  - Testing & Performance (`tests/unit/test_app_services.py`, `tests/perf/test_resource_budget.py`):
+    - Added 8 comprehensive integration tests covering persistent approval restart survival, TTL expiration, executor continuation, external outcome recording, paged queries, canary diffs, token auth, and audit bundle exports.
+    - Added `test_gateway_startup_and_memory_footprint` measuring gateway initialization latency and idle memory footprint.
+  - Validation:
+    - `.venv\Scripts\ruff check core executors gateway sdk cli tests`: All checks passed!
+    - `.venv\Scripts\mypy`: Success, 0 issues found in 28 source files (`strict = true`).
+    - `.venv\Scripts\pytest -v`: 89 passed, 4 skipped in 6.79s (and 100% passed unsandboxed).

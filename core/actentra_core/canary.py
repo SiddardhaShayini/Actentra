@@ -54,6 +54,7 @@ class CanarySummary:
     less_restrictive_count: int
     rule_changed_count: int
     diffs: tuple[CanaryDiffItem, ...]
+    missing_context_count: int = 0
 
     @property
     def has_regressions(self) -> bool:
@@ -69,6 +70,7 @@ class CanarySummary:
             "more_restrictive_count": self.more_restrictive_count,
             "less_restrictive_count": self.less_restrictive_count,
             "rule_changed_count": self.rule_changed_count,
+            "missing_context_count": self.missing_context_count,
             "has_regressions": self.has_regressions,
             "diffs": [d.to_dict() for d in self.diffs],
         }
@@ -104,12 +106,31 @@ def run_policy_canary(
     more_rest = 0
     less_rest = 0
     rule_changed = 0
+    missing_context = 0
 
     for rec in decisions:
         orig_verdict_str = (rec.verdict or "deny").lower()
         orig_rule = rec.rule_id or ""
 
-        env_dict = store.get_envelope(rec.crossing_id) or {}
+        env_dict = store.get_envelope(rec.crossing_id)
+        if env_dict is None:
+            missing_context += 1
+            diffs.append(
+                CanaryDiffItem(
+                    crossing_id=rec.crossing_id,
+                    session_id=rec.session_id,
+                    tool="unknown",
+                    verb="unknown",
+                    resource="unknown",
+                    original_verdict=orig_verdict_str,
+                    candidate_verdict="missing_context",
+                    original_rule=orig_rule,
+                    candidate_rule="none",
+                    delta_type="missing_context",
+                )
+            )
+            continue
+
         action_data = env_dict.get("action") or {}
         agent_data = env_dict.get("agent") or {}
 
@@ -129,7 +150,21 @@ def run_policy_canary(
                 agent_id=agent_id,
             )
         except Exception:  # noqa: S112
-            # Skip historical records that fail current envelope schema
+            missing_context += 1
+            diffs.append(
+                CanaryDiffItem(
+                    crossing_id=rec.crossing_id,
+                    session_id=rec.session_id,
+                    tool=tool or "invalid",
+                    verb=verb or "invalid",
+                    resource=resource or "invalid",
+                    original_verdict=orig_verdict_str,
+                    candidate_verdict="schema_error",
+                    original_rule=orig_rule,
+                    candidate_rule="none",
+                    delta_type="missing_context",
+                )
+            )
             continue
 
         cand_dec = engine.evaluate(envelope)
@@ -190,4 +225,5 @@ def run_policy_canary(
         less_restrictive_count=less_rest,
         rule_changed_count=rule_changed,
         diffs=tuple(diffs),
+        missing_context_count=missing_context,
     )

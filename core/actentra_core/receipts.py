@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -61,6 +62,45 @@ class ReceiptRecord:
             "ts": self.ts,
             "prev_hash": self.prev_hash,
             "entry_hash": self.entry_hash,
+        }
+
+
+PendingApprovalStatus = Literal["pending", "approved", "rejected", "expired", "consumed"]
+_VALID_PENDING_STATUSES = frozenset({"pending", "approved", "rejected", "expired", "consumed"})
+
+
+@dataclass(frozen=True, slots=True)
+class PendingApprovalRecord:
+    crossing_id: str
+    session_id: str
+    canonical_hash: str
+    tool: str
+    verb: str
+    resource: str
+    risk_tags: tuple[str, ...]
+    reason: str
+    params: dict[str, Any]
+    ts: str
+    expires_at: float
+    status: PendingApprovalStatus
+    resolution_ts: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "crossing_id": self.crossing_id,
+            "session_id": self.session_id,
+            "canonical_hash": self.canonical_hash,
+            "tool": self.tool,
+            "verb": self.verb,
+            "resource": self.resource,
+            "risk_tags": list(self.risk_tags),
+            "reason": self.reason,
+            "params": self.params,
+            "ts": self.ts,
+            "expires_at": self.expires_at,
+            "expires_in_seconds": max(0.0, round(self.expires_at - time.time(), 1)),
+            "status": self.status,
+            "resolution_ts": self.resolution_ts,
         }
 
 
@@ -171,6 +211,33 @@ class ReceiptStore:
                 );
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_approvals (
+                    crossing_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    canonical_hash TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    verb TEXT NOT NULL,
+                    resource TEXT NOT NULL,
+                    risk_tags_json TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    params_json TEXT NOT NULL,
+                    ts TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('pending', 'approved', 'rejected', 'expired', 'consumed')
+                    ),
+                    resolution_ts TEXT
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_approvals(status);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pending_expires ON pending_approvals(expires_at);"
+            )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to initialize receipt store: {exc}") from exc
         finally:
@@ -193,6 +260,7 @@ class ReceiptStore:
         result_hash: str | None,
         error: str | None,
         ts: str | None = None,
+        envelope: ActionEnvelope | None = None,
     ) -> ReceiptRecord:
         stamp = ts or utc_now_iso()
         risk_json = canonicalize_json(list(risk_tags))
@@ -256,6 +324,15 @@ class ReceiptStore:
                     entry_hash,
                 ),
             )
+            if envelope is not None:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO action_envelopes (
+                        crossing_id, envelope_json
+                    ) VALUES (?, ?);
+                    """,
+                    (envelope.crossing_id, canonicalize_json(envelope.to_dict())),
+                )
             conn.execute("COMMIT;")
         except sqlite3.Error as exc:
             with contextlib.suppress(sqlite3.Error):
@@ -287,8 +364,8 @@ class ReceiptStore:
     def record_decision(
         self, envelope: ActionEnvelope, decision: Decision
     ) -> ReceiptRecord:
-        """Persist an immutable decision record before any execution occurs (I5)."""
-        rec = self._append_record(
+        """Persist an immutable decision record and envelope atomically (I5)."""
+        return self._append_record(
             record_type="decision",
             crossing_id=envelope.crossing_id,
             session_id=envelope.session_id,
@@ -302,23 +379,8 @@ class ReceiptStore:
             status=None,
             result_hash=None,
             error=None,
+            envelope=envelope,
         )
-        conn = self._connect()
-        try:
-            sql_insert = (
-                "INSERT OR REPLACE INTO action_envelopes "
-                "(crossing_id, envelope_json) VALUES (?, ?);"
-            )
-            conn.execute(
-                sql_insert,
-                (envelope.crossing_id, canonicalize_json(envelope.to_dict())),
-            )
-            conn.execute("COMMIT;")
-        except sqlite3.Error:
-            pass
-        finally:
-            conn.close()
-        return rec
 
     def get_envelope(self, crossing_id: str) -> dict[str, Any] | None:
         """Retrieve stored envelope payload for a crossing if available."""
@@ -451,6 +513,322 @@ class ReceiptStore:
                 )
             )
         return out
+
+    def add_pending_approval(
+        self,
+        *,
+        envelope: ActionEnvelope,
+        decision: Decision,
+        ttl_seconds: float = 300.0,
+    ) -> PendingApprovalRecord:
+        """Persist a pending approval in SQLite WAL surviving process restarts."""
+        now = time.time()
+        expires_at = now + ttl_seconds
+        risk_json = canonicalize_json(list(decision.risk_tags))
+        params_json = canonicalize_json(envelope.action.params)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO pending_approvals (
+                    crossing_id, session_id, canonical_hash, tool, verb,
+                    resource, risk_tags_json, reason, params_json, ts,
+                    expires_at, status, resolution_ts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL);
+                """,
+                (
+                    envelope.crossing_id,
+                    envelope.session_id,
+                    envelope.canonical_hash,
+                    envelope.action.tool,
+                    envelope.action.verb,
+                    envelope.action.resource,
+                    risk_json,
+                    decision.reason[:1000],
+                    params_json,
+                    envelope.ts,
+                    expires_at,
+                ),
+            )
+            conn.execute("COMMIT;")
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to persist pending approval: {exc}") from exc
+        finally:
+            conn.close()
+
+        return PendingApprovalRecord(
+            crossing_id=envelope.crossing_id,
+            session_id=envelope.session_id,
+            canonical_hash=envelope.canonical_hash,
+            tool=envelope.action.tool,
+            verb=envelope.action.verb,
+            resource=envelope.action.resource,
+            risk_tags=decision.risk_tags,
+            reason=decision.reason[:1000],
+            params=dict(envelope.action.params),
+            ts=envelope.ts,
+            expires_at=expires_at,
+            status="pending",
+            resolution_ts=None,
+        )
+
+    def cleanup_expired_approvals(self) -> int:
+        """Mark pending approvals whose TTL has expired as 'expired'."""
+        now = time.time()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            cur = conn.execute(
+                "UPDATE pending_approvals SET status = 'expired', resolution_ts = ? "
+                "WHERE status = 'pending' AND expires_at <= ?;",
+                (utc_now_iso(), now),
+            )
+            count = cur.rowcount
+            conn.execute("COMMIT;")
+            return count
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to cleanup expired approvals: {exc}") from exc
+        finally:
+            conn.close()
+
+    def recover_pending_approvals(self) -> int:
+        """Recover pending approvals state upon service startup."""
+        return self.cleanup_expired_approvals()
+
+    def list_pending_approvals(
+        self,
+        *,
+        status: str | None = "pending",
+        limit: int = 100,
+    ) -> list[PendingApprovalRecord]:
+        """List pending approvals matching status, ordered by expiration."""
+        self.cleanup_expired_approvals()
+        conn = self._connect()
+        try:
+            if status is not None:
+                cur = conn.execute(
+                    "SELECT crossing_id, session_id, canonical_hash, tool, verb, "
+                    "resource, risk_tags_json, reason, params_json, ts, expires_at, "
+                    "status, resolution_ts FROM pending_approvals "
+                    "WHERE status = ? ORDER BY expires_at ASC LIMIT ?;",
+                    (status, limit),
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT crossing_id, session_id, canonical_hash, tool, verb, "
+                    "resource, risk_tags_json, reason, params_json, ts, expires_at, "
+                    "status, resolution_ts FROM pending_approvals "
+                    "ORDER BY ts DESC LIMIT ?;",
+                    (limit,),
+                )
+            rows = cur.fetchall()
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to list pending approvals: {exc}") from exc
+        finally:
+            conn.close()
+
+        out: list[PendingApprovalRecord] = []
+        for r in rows:
+            risk_list = json.loads(str(r[6]))
+            params_dict = json.loads(str(r[8]))
+            out.append(
+                PendingApprovalRecord(
+                    crossing_id=str(r[0]),
+                    session_id=str(r[1]),
+                    canonical_hash=str(r[2]),
+                    tool=str(r[3]),
+                    verb=str(r[4]),
+                    resource=str(r[5]),
+                    risk_tags=tuple(str(t) for t in risk_list),
+                    reason=str(r[7]),
+                    params=params_dict,
+                    ts=str(r[9]),
+                    expires_at=float(r[10]),
+                    status=str(r[11]),  # type: ignore[arg-type]
+                    resolution_ts=str(r[12]) if r[12] is not None else None,
+                )
+            )
+        return out
+
+    def get_pending_approval(self, crossing_id: str) -> PendingApprovalRecord | None:
+        """Fetch pending approval record by crossing_id."""
+        self.cleanup_expired_approvals()
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "SELECT crossing_id, session_id, canonical_hash, tool, verb, "
+                "resource, risk_tags_json, reason, params_json, ts, expires_at, "
+                "status, resolution_ts FROM pending_approvals "
+                "WHERE crossing_id = ?;",
+                (crossing_id,),
+            )
+            r = cur.fetchone()
+            if r is None:
+                return None
+            risk_list = json.loads(str(r[6]))
+            params_dict = json.loads(str(r[8]))
+            return PendingApprovalRecord(
+                crossing_id=str(r[0]),
+                session_id=str(r[1]),
+                canonical_hash=str(r[2]),
+                tool=str(r[3]),
+                verb=str(r[4]),
+                resource=str(r[5]),
+                risk_tags=tuple(str(t) for t in risk_list),
+                reason=str(r[7]),
+                params=params_dict,
+                ts=str(r[9]),
+                expires_at=float(r[10]),
+                status=str(r[11]),  # type: ignore[arg-type]
+                resolution_ts=str(r[12]) if r[12] is not None else None,
+            )
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to get pending approval: {exc}") from exc
+        finally:
+            conn.close()
+
+    def resolve_pending_approval(
+        self, crossing_id: str, *, approved: bool
+    ) -> PendingApprovalRecord | None:
+        """Resolve a pending approval to approved or rejected (single-use)."""
+        self.cleanup_expired_approvals()
+        new_status = "approved" if approved else "rejected"
+        now_iso = utc_now_iso()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            cur = conn.execute(
+                "UPDATE pending_approvals SET status = ?, resolution_ts = ? "
+                "WHERE crossing_id = ? AND status = 'pending';",
+                (new_status, now_iso, crossing_id),
+            )
+            if cur.rowcount == 0:
+                conn.execute("ROLLBACK;")
+                return None
+            conn.execute("COMMIT;")
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to resolve pending approval: {exc}") from exc
+        finally:
+            conn.close()
+
+        return self.get_pending_approval(crossing_id)
+
+    def mark_approval_consumed(self, crossing_id: str) -> bool:
+        """Mark an approved crossing as consumed after execution."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            cur = conn.execute(
+                "UPDATE pending_approvals SET status = 'consumed' "
+                "WHERE crossing_id = ? AND status = 'approved';",
+                (crossing_id,),
+            )
+            updated = cur.rowcount > 0
+            conn.execute("COMMIT;")
+            return updated
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to mark approval consumed: {exc}") from exc
+        finally:
+            conn.close()
+
+    def query_records(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        verdict: str | None = None,
+        tool: str | None = None,
+        status: str | None = None,
+        session_id: str | None = None,
+        record_type: str | None = None,
+        search: str | None = None,
+    ) -> tuple[list[ReceiptRecord], int]:
+        """Query bounded receipts with optional filters and total count."""
+        where_clauses: list[str] = []
+        params: list[Any] = []
+
+        if record_type:
+            where_clauses.append("r.record_type = ?")
+            params.append(record_type)
+        if verdict:
+            where_clauses.append("r.verdict = ?")
+            params.append(verdict)
+        if status:
+            where_clauses.append("r.status = ?")
+            params.append(status)
+        if session_id:
+            where_clauses.append("r.session_id = ?")
+            params.append(session_id)
+        if tool:
+            where_clauses.append("json_extract(a.envelope_json, '$.action.tool') = ?")
+            params.append(tool)
+        if search:
+            where_clauses.append(
+                "(r.crossing_id LIKE ? OR r.reason LIKE ? OR r.rule_id LIKE ? OR "
+                "json_extract(a.envelope_json, '$.action.tool') LIKE ? OR "
+                "json_extract(a.envelope_json, '$.action.resource') LIKE ?)"
+            )
+            term = f"%{search}%"
+            params.extend([term, term, term, term, term])
+
+        where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        from_sql = " FROM receipts r LEFT JOIN action_envelopes a ON r.crossing_id = a.crossing_id"
+
+        count_sql = f"SELECT COUNT(*) {from_sql}{where_sql};"
+        select_sql = (
+            f"SELECT r.seq, r.record_type, r.crossing_id, r.session_id, r.canonical_hash, "
+            f"r.policy_version, r.verdict, r.rule_id, r.reason, r.risk_tags_json, "
+            f"r.shadow, r.status, r.result_hash, r.error, r.ts, r.prev_hash, r.entry_hash "
+            f"{from_sql}{where_sql} ORDER BY r.seq DESC LIMIT ? OFFSET ?;"
+        )
+
+        conn = self._connect()
+        try:
+            total_count = int(conn.execute(count_sql, params).fetchone()[0])
+            select_params = list(params) + [limit, offset]
+            rows = conn.execute(select_sql, select_params).fetchall()
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to query receipts: {exc}") from exc
+        finally:
+            conn.close()
+
+        records: list[ReceiptRecord] = []
+        for row in rows:
+            risk_list = json.loads(str(row[9]))
+            rec_type: Literal["decision", "outcome"] = (
+                "decision" if row[1] == "decision" else "outcome"
+            )
+            records.append(
+                ReceiptRecord(
+                    seq=int(row[0]),
+                    record_type=rec_type,
+                    crossing_id=str(row[2]),
+                    session_id=str(row[3]),
+                    canonical_hash=str(row[4]),
+                    policy_version=str(row[5]),
+                    verdict=str(row[6]) if row[6] is not None else None,
+                    rule_id=str(row[7]) if row[7] is not None else None,
+                    reason=str(row[8]) if row[8] is not None else None,
+                    risk_tags=tuple(str(t) for t in risk_list),
+                    shadow=bool(row[10]),
+                    status=str(row[11]) if row[11] is not None else None,
+                    result_hash=str(row[12]) if row[12] is not None else None,
+                    error=str(row[13]) if row[13] is not None else None,
+                    ts=str(row[14]),
+                    prev_hash=str(row[15]),
+                    entry_hash=str(row[16]),
+                )
+            )
+        return records, total_count
 
 
 def verify_log(db_path: str | Path) -> VerificationResult:

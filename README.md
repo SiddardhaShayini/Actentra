@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/actentra-logo.svg" alt="Actentra" width="260" />
+  <img src="assets/actentra-logo-dark.svg" alt="Actentra" width="260" />
 </p>
 
 # Actentra
@@ -12,14 +12,18 @@
 
 ## Key Highlights
 
+- **Persistent Pending Approvals:** Human approval requests (`ASK`) are durably stored in SQLite WAL, surviving process restarts and power cycles with strict single-use hash binding and TTL expiration.
+- **Unified Action Lifecycle & Dispatched Execution:** Single continuous contract for Propose -> Evaluate -> Pre-Execution Receipt -> (if ASK: Persist -> Approve) -> Scoped Execution -> Post-Execution Outcome Receipt.
+- **Typed Application Services:** Modular `AppServices` and `ExecutorRegistry` unifying CLI, SDK, and Web UI.
+- **Unified Local Operator Console:** 7-tab embedded offline web application at `/ui` (Overview, Approvals Inbox, Policy Viewer & Linter, Dry-Run Simulator, Paginated Receipts Explorer, Integrations, Settings).
+- **Bounded Paged Receipts & Offline Audit Bundles:** Paged queries, keyword search, and one-click JSON/JSONL export bundles with integrity verification.
 - **Zero LLM in the Enforcement Path:** Policy evaluation is 100% deterministic, reproducible, and explainable in sub-millisecond time.
-- **Strictly Fail-Closed:** Unknown methods, syntax errors, or timeouts result in `DENY` or `HOLD`.
+- **Strictly Fail-Closed & Local-Only Posture:** Loopback binding by default (`127.0.0.1`), origin isolation rejecting untrusted cross-origin browser requests, compulsory token auth for remote binding.
 - **SSRF-Defended HTTP & Scoped Executors:** Built-in executors for Filesystem, SQLite, and HTTP with private IP / metadata blocking and parameter constraints.
 - **Dynamic Session Taint Tracking:** Automatically labels sessions tainted upon reading untrusted content (indirect prompt injection defense) and blocks untrusted network egress.
 - **Cumulative Session Budgets:** Enforces caps on total actions, write bytes, and external calls to prevent infinite loops and slow-drip exfiltration.
 - **Cryptographic Capability Warrants:** Scoped, expiring Ed25519-signed delegation tokens for subagents and distributed workers without ambient credentials.
-- **Local Web Approval Console & REST Gateway:** Zero-dependency HTTP server with an interactive web UI at `/ui` for human-in-the-loop approvals.
-- **Policy Canary Diff Engine:** Replays recorded agent traffic against proposed policies to detect regressions before deployment.
+- **Policy Canary Diff Engine:** Replays recorded agent traffic against proposed policies to detect regressions with verified replay fidelity.
 - **Standalone HTML Audit Reports:** Generates zero-external-CDN audit reports with SVG security badges and chronological timelines.
 - **Agent Framework Adapters:** First-class adapters for LangChain and OpenAI function calling.
 

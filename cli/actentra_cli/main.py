@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -40,6 +41,7 @@ from actentra_core.warrants import (
 from actentra_executors.fs import LocalFSExecutor, ScopedFSTools
 from actentra_gateway.http_service import serve_http
 from actentra_gateway.mcp_proxy import serve_stdio
+from actentra_gateway.services import AppServices, ExecutorRegistry
 
 app = typer.Typer(
     name="actentra",
@@ -52,6 +54,10 @@ checkpoint_app = typer.Typer(help="Sign and verify Ed25519 receipt checkpoints."
 app.add_typer(checkpoint_app, name="checkpoint")
 warrant_app = typer.Typer(help="Issue and verify cryptographic capability warrants.")
 app.add_typer(warrant_app, name="warrant")
+approvals_app = typer.Typer(help="Inspect and resolve persistent human approvals.")
+app.add_typer(approvals_app, name="approvals")
+bundle_app = typer.Typer(help="Export and manage offline audit bundles.")
+app.add_typer(bundle_app, name="bundle")
 
 _DEFAULT_STARTER_POLICY = """\
 version: 1
@@ -582,6 +588,23 @@ def serve_cmd(
     session_id: Annotated[
         str, typer.Option("--session", help="Session ID for crossings.")
     ] = "gateway-session",
+    auth_token: Annotated[
+        str | None, typer.Option("--token", help="Bearer token for API auth.")
+    ] = None,
+    unsafe_allow_remote: Annotated[
+        bool,
+        typer.Option(
+            "--unsafe-allow-remote",
+            help="Explicitly permit non-loopback network binding.",
+        ),
+    ] = False,
+    ttl: Annotated[
+        float, typer.Option("--ttl", help="Approval TTL in seconds.")
+    ] = 300.0,
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Mount local filesystem executor at path."),
+    ] = None,
 ) -> None:
     """Run the Actentra HTTP Gateway service and Operator Console."""
     try:
@@ -598,7 +621,97 @@ def serve_cmd(
         agent_id="http-gateway",
         framework="http",
     )
-    serve_http(boundary=boundary, host=host, port=port)
+    registry = ExecutorRegistry()
+    if workspace is not None:
+        registry.register_fs(workspace)
+
+    serve_http(
+        boundary=boundary,
+        host=host,
+        port=port,
+        executor_registry=registry,
+        approval_ttl_seconds=ttl,
+        auth_token=auth_token,
+        unsafe_allow_remote=unsafe_allow_remote,
+    )
+
+
+@approvals_app.command("list")
+def approvals_list_cmd(
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+    status: Annotated[
+        str,
+        typer.Option(
+            "--status",
+            help="Filter by status (pending, approved, rejected, expired, consumed, all).",
+        ),
+    ] = "pending",
+) -> None:
+    """List pending human approvals recorded in SQLite WAL."""
+    store = ReceiptStore(db_path)
+    status_filter = None if status == "all" else status
+    records = store.list_pending_approvals(status=status_filter)
+    if not records:
+        typer.echo(f"No approvals found matching status={status!r}")
+        return
+    for r in records:
+        exp_sec = max(0.0, round(r.expires_at - time.time(), 1))
+        typer.echo(
+            f"[{r.status.upper()}] id={r.crossing_id} tool={r.tool} ({r.verb}) "
+            f"res={r.resource} expires_in={exp_sec}s reason={r.reason}"
+        )
+
+
+@approvals_app.command("resolve")
+def approvals_resolve_cmd(
+    crossing_id: Annotated[str, typer.Argument(help="Crossing ID to resolve.")],
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+    deny: Annotated[
+        bool,
+        typer.Option("--deny", help="Deny/reject the crossing instead of approving."),
+    ] = False,
+) -> None:
+    """Resolve a pending human approval (approve or deny)."""
+    store = ReceiptStore(db_path)
+    approved = not deny
+    res = store.resolve_pending_approval(crossing_id, approved=approved)
+    if res is None:
+        typer.echo(
+            f"Pending crossing '{crossing_id}' not found, already resolved, or expired",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    action_label = "APPROVED" if approved else "REJECTED"
+    typer.echo(f"OK {action_label} crossing={crossing_id} hash={res.canonical_hash}")
+
+
+@bundle_app.command("export")
+def bundle_export_cmd(
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+    policy_path: Annotated[
+        Path | None, typer.Option("--policy", "-p", help="Path to active YAML policy file.")
+    ] = None,
+    out_path: Annotated[
+        Path, typer.Option("--out", "-o", help="Output JSON bundle file.")
+    ] = Path("audit-bundle.json"),
+) -> None:
+    """Export an offline audit bundle with policy, receipts, and verification metadata."""
+    if policy_path is not None:
+        pack = load_policy_file(policy_path)
+    else:
+        pack = load_policy_yaml(_DEFAULT_STARTER_POLICY)
+    store = ReceiptStore(db_path)
+    boundary = Boundary(policy=pack, receipt_store=store)
+    services = AppServices(boundary)
+    bundle = services.export_audit_bundle(out_path=out_path)
+    rec_count = bundle["integrity"]["total_records"]
+    typer.echo(f"Exported audit bundle ({rec_count} receipts) -> {out_path}")
 
 
 @checkpoint_app.command("keygen")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -96,6 +97,7 @@ class Boundary:
         self._approval_callback = approval_callback
         self._approval_ttl = approval_ttl_seconds
         self._secrets_broker = secrets_broker
+        self._lock = threading.Lock()
         self._approvals: dict[tuple[str, str], ApprovalGrant] = {}
         self._session_taints: dict[str, str] = {}
 
@@ -138,39 +140,55 @@ class Boundary:
         self._engine.unfreeze()
 
     def _has_valid_approval(self, envelope: ActionEnvelope) -> bool:
-        key = (envelope.session_id, envelope.canonical_hash)
-        grant = self._approvals.get(key)
-        if grant is None:
-            return False
-        if time.monotonic() >= grant.expires_at:
-            del self._approvals[key]
-            return False
-        # One-time use by default; pop on consumption.
-        del self._approvals[key]
-        return True
+        with self._lock:
+            key = (envelope.session_id, envelope.canonical_hash)
+            grant = self._approvals.get(key)
+            if grant is not None:
+                if time.monotonic() >= grant.expires_at:
+                    del self._approvals[key]
+                    return False
+                # One-time use by default; pop on consumption.
+                del self._approvals[key]
+                return True
+
+        # Check persistent SQLite pending approvals store
+        pending = self._store.get_pending_approval(envelope.crossing_id)
+        if (
+            pending is not None
+            and pending.status == "approved"
+            and pending.canonical_hash == envelope.canonical_hash
+            and pending.session_id == envelope.session_id
+            and time.time() < pending.expires_at
+        ):
+            self._store.mark_approval_consumed(envelope.crossing_id)
+            return True
+        return False
 
     def grant_approval(self, *, canonical_hash: str, session_id: str | None = None) -> None:
         """Pre-approve a specific canonical_hash for one session until TTL expiry."""
         sid = session_id or self._session_id
-        self._approvals[(sid, canonical_hash)] = ApprovalGrant(
-            canonical_hash=canonical_hash,
-            session_id=sid,
-            expires_at=time.monotonic() + self._approval_ttl,
-        )
+        with self._lock:
+            self._approvals[(sid, canonical_hash)] = ApprovalGrant(
+                canonical_hash=canonical_hash,
+                session_id=sid,
+                expires_at=time.monotonic() + self._approval_ttl,
+            )
 
     def get_session_taint(self, session_id: str | None = None) -> str | None:
         """Return the cumulative taint level for a session."""
         sid = session_id or self._session_id
-        return self._session_taints.get(sid)
+        with self._lock:
+            return self._session_taints.get(sid)
 
     def set_session_taint(self, taint: str, session_id: str | None = None) -> None:
         """Explicitly set or clear session-level taint."""
         sid = session_id or self._session_id
         clean = taint.strip().lower()
-        if clean in ("trusted", "clean", ""):
-            self._session_taints.pop(sid, None)
-        else:
-            self._session_taints[sid] = clean
+        with self._lock:
+            if clean in ("trusted", "clean", ""):
+                self._session_taints.pop(sid, None)
+            else:
+                self._session_taints[sid] = clean
 
     def dry_run(
         self,

@@ -39,6 +39,9 @@ include = [
     "actentra_cli*",
 ]
 
+[tool.setuptools.package-data]
+actentra_gateway = ["*.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["core", "executors", "gateway", "sdk/python", "cli"]
@@ -59,7 +62,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["S101", "S108", "S310"]
+"tests/**/*.py" = ["S101", "S104", "S105", "S106", "S108", "S310"]
 
 [tool.mypy]
 python_version = "3.12"

@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Actentra — Operator Console</title>
+<style>
+  :root {
+    --bg: #090d16;
+    --card: #111827;
+    --border: #1f2937;
+    --border-hover: #374151;
+    --text: #f3f4f6;
+    --text-muted: #9ca3af;
+    --teal: #13bfa6;
+    --teal-glow: rgba(19, 191, 166, 0.15);
+    --red: #ef4444;
+    --yellow: #f59e0b;
+    --blue: #3b82f6;
+    --indigo: #6366f1;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5;
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+  header {
+    background: #0d1322;
+    border-bottom: 1px solid var(--border);
+    padding: 0.85rem 2rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  .logo { display: flex; align-items: center; gap: 0.75rem; font-weight: 700; font-size: 1.2rem; }
+  .logo span { color: var(--teal); }
+  .nav-tabs {
+    display: flex;
+    gap: 0.5rem;
+    background: #0d1322;
+    padding: 0.5rem 2rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .nav-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    padding: 0.65rem 1rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all 0.15s ease;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .nav-btn:hover { color: var(--text); }
+  .nav-btn.active { color: var(--teal); border-bottom-color: var(--teal); }
+  .counter {
+    background: #78350f;
+    color: #fde68a;
+    font-size: 0.75rem;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+  }
+  main {
+    flex: 1;
+    max-width: 1200px;
+    width: 100%;
+    margin: 1.5rem auto;
+    padding: 0 1.5rem;
+  }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.25rem;
+    margin-bottom: 1.25rem;
+  }
+  .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
+  .stat-label { font-size: 0.75rem; text-transform: uppercase; color: var(--text-muted); }
+  .stat-val { font-size: 1.5rem; font-weight: 700; margin-top: 0.25rem; }
+  .badge {
+    display: inline-block;
+    padding: 0.2rem 0.6rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+  .badge.live { background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid #10b981; }
+  .badge.frozen { background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid #ef4444; }
+  .badge.risk { background: #312e81; color: #c7d2fe; margin-right: 0.25rem; }
+  .badge.allow { background: rgba(16, 185, 129, 0.15); color: #10b981; }
+  .badge.deny { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
+  .badge.ask { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
+  .badge.hold { background: rgba(107, 114, 128, 0.15); color: #9ca3af; }
+  code { font-family: ui-monospace, Menlo, Consolas, monospace; color: #93c5fd; font-size: 0.85rem; }
+  .btn {
+    padding: 0.5rem 1rem;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: all 0.15s ease;
+  }
+  .btn-primary { background: var(--teal); color: #090d16; }
+  .btn-primary:hover { opacity: 0.9; }
+  .btn-danger { background: #dc2626; color: #fff; }
+  .btn-secondary { background: #1f2937; color: var(--text); border-color: var(--border-hover); }
+  .btn-secondary:hover { background: #374151; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { padding: 0.75rem; border-bottom: 1px solid var(--border); text-align: left; }
+  th { color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; }
+  tr:hover td { background: #172033; }
+  input, select, textarea {
+    background: #090d16;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    width: 100%;
+    margin-top: 0.25rem;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: none;
+    border-color: var(--teal);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <span>Actentra</span> Operator Console
+  </div>
+  <div style="display:flex; align-items:center; gap:1rem;">
+    <span id="hdr-frozen-badge"></span>
+    <span id="hdr-integrity-badge"></span>
+    <button id="freeze-btn" class="btn btn-secondary" onclick="toggleFreeze()">Freeze</button>
+  </div>
+</header>
+
+<div class="nav-tabs">
+  <button class="nav-btn active" onclick="showTab('overview')">Overview</button>
+  <button class="nav-btn" onclick="showTab('approvals')">
+    Approvals <span class="counter" id="approval-counter">0</span>
+  </button>
+  <button class="nav-btn" onclick="showTab('policies')">Policies & Linter</button>
+  <button class="nav-btn" onclick="showTab('simulator')">Simulator</button>
+  <button class="nav-btn" onclick="showTab('receipts')">Receipts Explorer</button>
+  <button class="nav-btn" onclick="showTab('integrations')">Integrations</button>
+  <button class="nav-btn" onclick="showTab('settings')">Settings</button>
+</div>
+
+<main>
+  <!-- TAB 1: OVERVIEW -->
+  <section id="tab-overview" class="tab-pane active">
+    <div class="grid-4" style="margin-bottom:1.5rem;">
+      <div class="card">
+        <div class="stat-label">Active Policy Pack</div>
+        <div class="stat-val" id="ov-policy-id" style="font-size:1.1rem; color:var(--teal);">-</div>
+        <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.25rem;">
+          Mode: <code id="ov-policy-mode">-</code>
+        </div>
+      </div>
+      <div class="card">
+        <div class="stat-label">Durable Audit Receipts</div>
+        <div class="stat-val" id="ov-receipts-count">0</div>
+        <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.25rem;">SQLite WAL hash-chained</div>
+      </div>
+      <div class="card">
+        <div class="stat-label">Pending Approvals</div>
+        <div class="stat-val" id="ov-approvals-count" style="color:var(--yellow);">0</div>
+        <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.25rem;">Human-in-the-loop (ASK)</div>
+      </div>
+      <div class="card">
+        <div class="stat-label">Registered Executors</div>
+        <div class="stat-val" id="ov-executors-count">0</div>
+        <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.25rem;">Local dispatch tools</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+        <h3 style="font-size:1rem;">Recent Crossings Activity Feed</h3>
+        <button class="btn btn-secondary" onclick="exportAuditBundle()">Export Audit Bundle</button>
+      </div>
+      <div id="overview-recent-receipts">Loading recent activity...</div>
+    </div>
+  </section>
+
+  <!-- TAB 2: APPROVALS -->
+  <section id="tab-approvals" class="tab-pane">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+        <div>
+          <h3>Pending Human Approvals (ASK)</h3>
+          <p style="font-size:0.85rem; color:var(--text-muted);">
+            High-risk or unclassified agent tool calls awaiting operator authorization.
+          </p>
+        </div>
+        <button class="btn btn-secondary" onclick="refreshApprovals()">Refresh</button>
+      </div>
+      <div id="approvals-container">Loading approvals...</div>
+    </div>
+  </section>
+
+  <!-- TAB 3: POLICIES & LINTER -->
+  <section id="tab-policies" class="tab-pane">
+    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:1rem;">
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+          <h3>Active Policy YAML</h3>
+          <button class="btn btn-secondary" onclick="downloadPolicyYaml()">Download YAML</button>
+        </div>
+        <pre id="policy-yaml-code" style="background:#090d16; padding:1rem; border-radius:6px; font-size:0.8rem; overflow:auto; max-height:480px;">Loading...</pre>
+      </div>
+      <div>
+        <div class="card" style="margin-bottom:1rem;">
+          <h3 style="margin-bottom:0.5rem;">Policy Linter & Warnings</h3>
+          <div id="policy-lint-results" style="font-size:0.85rem;">Checking policy...</div>
+        </div>
+        <div class="card">
+          <h3 style="margin-bottom:0.5rem;">Canary Diff Simulation</h3>
+          <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:0.5rem;">
+            Test candidate policy against historical SQLite receipts to detect regressions.
+          </p>
+          <textarea id="canary-yaml-input" rows="8" placeholder="Paste candidate policy YAML here..."></textarea>
+          <button class="btn btn-primary" style="margin-top:0.75rem;" onclick="runCanaryDiff()">Run Canary Simulation</button>
+          <div id="canary-results" style="margin-top:1rem; font-size:0.85rem;"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 4: SIMULATOR -->
+  <section id="tab-simulator" class="tab-pane">
+    <div class="card" style="max-width:800px; margin:0 auto;">
+      <h3 style="margin-bottom:0.5rem;">Dry-Run Policy Simulator</h3>
+      <p style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.25rem;">
+        Evaluate hypothetical tool actions without execution or audit receipt side effects.
+      </p>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:1rem; margin-bottom:1rem;">
+        <div>
+          <label class="stat-label">Tool Name</label>
+          <input type="text" id="sim-tool" value="fs.read" placeholder="e.g. fs.read, sql.execute">
+        </div>
+        <div>
+          <label class="stat-label">Action Verb</label>
+          <select id="sim-verb">
+            <option value="read">read</option>
+            <option value="write">write</option>
+            <option value="delete">delete</option>
+            <option value="exec">exec</option>
+            <option value="network">network</option>
+            <option value="admin">admin</option>
+            <option value="other">other</option>
+          </select>
+        </div>
+      </div>
+      <div style="margin-bottom:1rem;">
+        <label class="stat-label">Resource Identifier</label>
+        <input type="text" id="sim-resource" value="path:C:/work/notes.txt" placeholder="e.g. path:C:/work/notes.txt, http://api.github.com">
+      </div>
+      <div style="margin-bottom:1rem;">
+        <label class="stat-label">Parameters (JSON)</label>
+        <textarea id="sim-params" rows="3">{"path": "notes.txt"}</textarea>
+      </div>
+      <button class="btn btn-primary" onclick="executeSimulation()">Simulate Action</button>
+      <div id="sim-result" style="margin-top:1.5rem;"></div>
+    </div>
+  </section>
+
+  <!-- TAB 5: RECEIPTS EXPLORER -->
+  <section id="tab-receipts" class="tab-pane">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem; flex-wrap:wrap; gap:0.5rem;">
+        <div style="display:flex; gap:0.5rem; align-items:center;">
+          <input type="text" id="receipts-search" placeholder="Search crossing, reason, tool..." style="width:240px; margin-top:0;" oninput="debouncedReceipts()">
+          <select id="receipts-verdict-filter" style="width:140px; margin-top:0;" onchange="loadReceiptsPage(0)">
+            <option value="">All Verdicts</option>
+            <option value="allow">ALLOW</option>
+            <option value="allow_with_constraints">CONSTRAINED</option>
+            <option value="deny">DENY</option>
+            <option value="ask">ASK</option>
+            <option value="hold">HOLD</option>
+          </select>
+        </div>
+        <div style="display:flex; gap:0.5rem;">
+          <button class="btn btn-secondary" onclick="exportAuditBundle()">Download JSONL</button>
+        </div>
+      </div>
+      <div id="receipts-table-container">Loading receipts...</div>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-top:1rem; font-size:0.85rem;">
+        <span id="receipts-pagination-info">Showing records</span>
+        <div style="display:flex; gap:0.5rem;">
+          <button id="btn-prev-page" class="btn btn-secondary" onclick="prevReceiptsPage()">Previous</button>
+          <button id="btn-next-page" class="btn btn-secondary" onclick="nextReceiptsPage()">Next</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 6: INTEGRATIONS -->
+  <section id="tab-integrations" class="tab-pane">
+    <div class="grid-4" style="margin-bottom:1.5rem;">
+      <div class="card">
+        <h4>Python SDK (@guard)</h4>
+        <p style="font-size:0.8rem; color:var(--text-muted); margin:0.5rem 0;">In-process fail-closed boundary decorator.</p>
+        <span class="badge live">Native SDK</span>
+      </div>
+      <div class="card">
+        <h4>MCP Stdio Proxy</h4>
+        <p style="font-size:0.8rem; color:var(--text-muted); margin:0.5rem 0;">Intercepts tools/call and pins tool hashes.</p>
+        <span class="badge live">CLI Proxy</span>
+      </div>
+      <div class="card">
+        <h4>Scoped Filesystem</h4>
+        <p style="font-size:0.8rem; color:var(--text-muted); margin:0.5rem 0;">Confined to workspace_root with reparse defense.</p>
+        <span class="badge live">Executor</span>
+      </div>
+      <div class="card">
+        <h4>Scoped SQLite & HTTP</h4>
+        <p style="font-size:0.8rem; color:var(--text-muted); margin:0.5rem 0;">SSRF-defended HTTP & single-query SQL.</p>
+        <span class="badge live">Executors</span>
+      </div>
+    </div>
+    <div class="card">
+      <h3 style="margin-bottom:0.75rem;">Quickstart Integration Snippet</h3>
+      <pre style="background:#090d16; padding:1rem; border-radius:6px; font-size:0.8rem; overflow:auto;">
+from actentra import Boundary, guard
+from actentra_core.policy import load_policy_file
+from actentra_core.receipts import ReceiptStore
+
+boundary = Boundary.from_files(
+    policy_path="policies/examples/starter.yaml",
+    receipts_db="receipts.db",
+    session_id="agent-session-1"
+)
+
+@guard(boundary, tool="fs.read", verb="read")
+def read_workspace_note(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
+      </pre>
+    </div>
+  </section>
+
+  <!-- TAB 7: SETTINGS -->
+  <section id="tab-settings" class="tab-pane">
+    <div class="card" style="max-width:700px; margin:0 auto;">
+      <h3 style="margin-bottom:1rem;">Runtime Security & Operational Posture</h3>
+      <table>
+        <tr><td><strong>Binding Posture</strong></td><td><code>Loopback Only (127.0.0.1)</code></td></tr>
+        <tr><td><strong>Browser Origin Guard</strong></td><td><code>Restricted to Loopback (No Wildcard CORS)</code></td></tr>
+        <tr><td><strong>Pending Approval Persistence</strong></td><td><code>SQLite WAL (Recovers across restarts)</code></td></tr>
+        <tr><td><strong>Receipt Storage Mode</strong></td><td><code>SQLite WAL (Write-Ahead Logging)</code></td></tr>
+        <tr><td><strong>Hash Algorithm</strong></td><td><code>SHA-256 (Canonical JSON RFC 8785)</code></td></tr>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+let currentReceiptsOffset = 0;
+const receiptsLimit = 20;
+let debounceTimer;
+let isCurrentlyFrozen = false;
+
+function showTab(tabId) {
+  document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('active'));
+  const target = document.getElementById('tab-' + tabId);
+  if (target) target.classList.add('active');
+  const btn = Array.from(document.querySelectorAll('.nav-btn')).find(b => b.getAttribute('onclick').includes(tabId));
+  if (btn) btn.classList.add('active');
+
+  if (tabId === 'approvals') refreshApprovals();
+  if (tabId === 'policies') loadPolicyView();
+  if (tabId === 'receipts') loadReceiptsPage(0);
+  if (tabId === 'overview') { loadHealth(); loadOverviewFeed(); }
+}
+
+async function loadHealth() {
+  try {
+    const res = await fetch('/health');
+    const h = await res.json();
+    isCurrentlyFrozen = h.frozen;
+
+    const fBadge = document.getElementById('hdr-frozen-badge');
+    fBadge.innerHTML = h.frozen
+      ? '<span class="badge frozen">SYSTEM FROZEN</span>'
+      : '<span class="badge live">SYSTEM ACTIVE</span>';
+
+    const iBadge = document.getElementById('hdr-integrity-badge');
+    const color = h.integrity_ok ? '#10b981' : '#ef4444';
+    const text = h.integrity_ok ? 'VERIFIED (OK)' : 'TAMPER DETECTED';
+    iBadge.innerHTML = `<span class="badge" style="background:${color}22; color:${color}; border:1px solid ${color}">${text}</span>`;
+
+    const fBtn = document.getElementById('freeze-btn');
+    fBtn.innerText = h.frozen ? 'Unfreeze System' : 'Emergency Freeze';
+
+    document.getElementById('ov-policy-id').innerText = h.policy_id;
+    document.getElementById('ov-policy-mode').innerText = h.mode;
+    document.getElementById('ov-receipts-count').innerText = h.total_receipts;
+    document.getElementById('ov-approvals-count').innerText = h.pending_approvals_count;
+    document.getElementById('ov-executors-count').innerText = (h.registered_executors || []).length;
+    document.getElementById('approval-counter').innerText = h.pending_approvals_count;
+  } catch (e) {}
+}
+
+async function toggleFreeze() {
+  const endpoint = isCurrentlyFrozen ? '/v1/unfreeze' : '/v1/freeze';
+  try {
+    const res = await fetch(endpoint, { method: 'POST' });
+    if (res.ok) {
+      loadHealth();
+    }
+  } catch (e) { alert('Freeze action failed: ' + e); }
+}
+
+async function refreshApprovals() {
+  const container = document.getElementById('approvals-container');
+  try {
+    const res = await fetch('/v1/crossings/pending');
+    const list = await res.json();
+    document.getElementById('approval-counter').innerText = list.length;
+    document.getElementById('ov-approvals-count').innerText = list.length;
+    if (list.length === 0) {
+      container.innerHTML = '<div style="color:var(--text-muted); padding:1rem 0;">No actions currently awaiting approval.</div>';
+      return;
+    }
+    let html = '';
+    for (const p of list) {
+      const riskTags = (p.risk_tags || []).map(t => `<span class="badge risk">${t}</span>`).join(' ') || '<span style="color:var(--text-muted)">none</span>';
+      html += `
+        <div class="card" style="border-left: 4px solid var(--yellow);">
+          <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+            <div>
+              <div class="stat-label">Crossing ID: <code>${p.crossing_id}</code></div>
+              <h4 style="margin:0.25rem 0;">${p.tool} <span style="font-weight:normal; color:var(--text-muted);">(${p.verb})</span></h4>
+              <div><code>${p.resource}</code></div>
+            </div>
+            <span class="badge" style="background:#78350f; color:#fde68a;">Expires in ${p.expires_in_seconds}s</span>
+          </div>
+          <div style="margin:0.5rem 0; font-size:0.85rem;"><strong>Reason:</strong> ${p.reason}</div>
+          <div style="margin-bottom:0.75rem;"><strong>Risk Tags:</strong> ${riskTags}</div>
+          <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.75rem;">Hash: <code>${p.canonical_hash}</code></div>
+          <div style="display:flex; gap:0.5rem;">
+            <button class="btn btn-primary" onclick="resolveCrossing('${p.crossing_id}', true, true)">Approve & Execute</button>
+            <button class="btn btn-secondary" onclick="resolveCrossing('${p.crossing_id}', true, false)">Approve Only</button>
+            <button class="btn btn-danger" onclick="resolveCrossing('${p.crossing_id}', false, false)">Deny</button>
+          </div>
+        </div>
+      `;
+    }
+    container.innerHTML = html;
+  } catch (e) {
+    container.innerHTML = '<div style="color:var(--red);">Failed to load approvals: ' + e + '</div>';
+  }
+}
+
+async function resolveCrossing(cid, approved, execute) {
+  try {
+    const res = await fetch(`/v1/crossings/${cid}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ approved: approved, execute: execute })
+    });
+    if (res.ok) {
+      refreshApprovals();
+      loadHealth();
+    } else {
+      alert('Failed to resolve crossing');
+    }
+  } catch (e) { alert('Error: ' + e); }
+}
+
+async function loadPolicyView() {
+  try {
+    const res = await fetch('/v1/policy');
+    const data = await res.json();
+    document.getElementById('policy-yaml-code').innerText = data.policy_yaml;
+
+    const lintRes = await fetch('/v1/policy/lint');
+    const lintData = await lintRes.json();
+    const lDiv = document.getElementById('policy-lint-results');
+    if (!lintData.warnings || lintData.warnings.length === 0) {
+      lDiv.innerHTML = '<span class="badge live">CLEAN</span> No policy warnings detected.';
+    } else {
+      lDiv.innerHTML = lintData.warnings.map(w => `<div style="color:var(--yellow); margin-bottom:0.25rem;">&bull; ${w.message}</div>`).join('');
+    }
+  } catch (e) {}
+}
+
+function downloadPolicyYaml() {
+  const code = document.getElementById('policy-yaml-code').innerText;
+  const blob = new Blob([code], { type: 'text/yaml' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'policy.yaml';
+  a.click();
+}
+
+async function runCanaryDiff() {
+  const candYaml = document.getElementById('canary-yaml-input').value;
+  const resDiv = document.getElementById('canary-results');
+  if (!candYaml.trim()) {
+    resDiv.innerHTML = '<span style="color:var(--yellow)">Please paste candidate YAML.</span>';
+    return;
+  }
+  resDiv.innerHTML = 'Running canary diff...';
+  try {
+    const res = await fetch('/v1/policy/canary', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ candidate_yaml: candYaml, limit: 100 })
+    });
+    const data = await res.json();
+    if (data.error) {
+      resDiv.innerHTML = '<span style="color:var(--red)">' + data.error + '</span>';
+      return;
+    }
+    resDiv.innerHTML = `
+      <div style="margin-bottom:0.5rem;">
+        Evaluated: <strong>${data.total_evaluated}</strong> | Identical: <strong>${data.identical_count}</strong> |
+        More Restrictive: <strong>${data.more_restrictive_count}</strong> |
+        Regressions: <strong style="color:${data.less_restrictive_count > 0 ? 'var(--red)' : 'var(--teal)'}">${data.less_restrictive_count}</strong>
+      </div>
+    `;
+  } catch (e) { resDiv.innerHTML = '<span style="color:var(--red)">' + e + '</span>'; }
+}
+
+async function executeSimulation() {
+  const tool = document.getElementById('sim-tool').value;
+  const verb = document.getElementById('sim-verb').value;
+  const resource = document.getElementById('sim-resource').value;
+  let params = {};
+  try {
+    params = JSON.parse(document.getElementById('sim-params').value);
+  } catch (e) {
+    alert('Invalid JSON params: ' + e);
+    return;
+  }
+  const resDiv = document.getElementById('sim-result');
+  resDiv.innerHTML = 'Simulating...';
+  try {
+    const res = await fetch('/v1/simulate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tool, verb, resource, params })
+    });
+    const data = await res.json();
+    const vClass = data.verdict ? data.verdict.toLowerCase() : 'hold';
+    resDiv.innerHTML = `
+      <div class="card" style="border-left: 4px solid var(--teal);">
+        <h4>Simulation Verdict: <span class="badge ${vClass}">${data.verdict ? data.verdict.toUpperCase() : 'UNKNOWN'}</span></h4>
+        <div style="margin-top:0.5rem; font-size:0.85rem;"><strong>Rule ID:</strong> <code>${data.rule_id}</code></div>
+        <div style="font-size:0.85rem;"><strong>Reason:</strong> ${data.reason}</div>
+        <div style="font-size:0.85rem;"><strong>Risk Tags:</strong> ${data.risk_tags ? data.risk_tags.join(', ') : 'none'}</div>
+        <div style="font-size:0.85rem;"><strong>Hash:</strong> <code>${data.canonical_hash}</code></div>
+      </div>
+    `;
+  } catch (e) { resDiv.innerHTML = '<span style="color:var(--red)">' + e + '</span>'; }
+}
+
+async function loadReceiptsPage(offset) {
+  currentReceiptsOffset = offset;
+  const search = document.getElementById('receipts-search').value;
+  const verdict = document.getElementById('receipts-verdict-filter').value;
+  const container = document.getElementById('receipts-table-container');
+  container.innerHTML = 'Loading receipts...';
+  try {
+    let url = `/v1/receipts?limit=${receiptsLimit}&offset=${offset}`;
+    if (search) url += `&search=${encodeURIComponent(search)}`;
+    if (verdict) url += `&verdict=${encodeURIComponent(verdict)}`;
+
+    const res = await fetch(url);
+    const data = await res.json();
+    const records = Array.isArray(data) ? data : (data.records || []);
+    const total = data.total_count !== undefined ? data.total_count : records.length;
+
+    if (records.length === 0) {
+      container.innerHTML = '<div style="color:var(--text-muted); padding:1rem 0;">No receipts found.</div>';
+      return;
+    }
+    let rows = '';
+    for (const r of records) {
+      const v = r.verdict ? `<span class="badge ${r.verdict.toLowerCase()}">${r.verdict.toUpperCase()}</span>` : '-';
+      const s = r.status ? `<span class="badge ${r.status === 'success' ? 'live' : 'deny'}">${r.status.toUpperCase()}</span>` : '-';
+      rows += `
+        <tr>
+          <td>#${r.seq}</td>
+          <td><code>${r.record_type}</code></td>
+          <td><code>${r.crossing_id}</code></td>
+          <td>${v}</td>
+          <td>${s}</td>
+          <td>${r.rule_id || '-'}</td>
+          <td><span style="font-size:0.75rem; color:var(--text-muted);">${r.ts}</span></td>
+        </tr>
+      `;
+    }
+    container.innerHTML = `<table><thead><tr><th>Seq</th><th>Type</th><th>Crossing</th><th>Verdict</th><th>Status</th><th>Rule</th><th>Timestamp</th></tr></thead><tbody>${rows}</tbody></table>`;
+    document.getElementById('receipts-pagination-info').innerText = `Records ${offset + 1}–${offset + records.length} of ${total}`;
+    document.getElementById('btn-prev-page').disabled = offset <= 0;
+    document.getElementById('btn-next-page').disabled = (offset + records.length) >= total;
+  } catch (e) { container.innerHTML = '<span style="color:var(--red)">' + e + '</span>'; }
+}
+
+function debouncedReceipts() {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => loadReceiptsPage(0), 250);
+}
+
+function prevReceiptsPage() {
+  if (currentReceiptsOffset >= receiptsLimit) loadReceiptsPage(currentReceiptsOffset - receiptsLimit);
+}
+
+function nextReceiptsPage() {
+  loadReceiptsPage(currentReceiptsOffset + receiptsLimit);
+}
+
+async function loadOverviewFeed() {
+  const feed = document.getElementById('overview-recent-receipts');
+  try {
+    const res = await fetch('/v1/receipts?limit=5');
+    const records = await res.json();
+    if (!records || records.length === 0) {
+      feed.innerHTML = '<div style="color:var(--text-muted);">No activity logged yet.</div>';
+      return;
+    }
+    let rows = '';
+    for (const r of records.slice(-5).reverse()) {
+      const v = r.verdict ? `<span class="badge ${r.verdict.toLowerCase()}">${r.verdict.toUpperCase()}</span>` : `<span>${r.status || '-'}</span>`;
+      rows += `<tr><td>#${r.seq}</td><td><code>${r.record_type}</code></td><td><code>${r.crossing_id}</code></td><td>${v}</td><td>${r.rule_id || '-'}</td><td><span style="font-size:0.75rem; color:var(--text-muted);">${r.ts}</span></td></tr>`;
+    }
+    feed.innerHTML = `<table><thead><tr><th>Seq</th><th>Type</th><th>Crossing</th><th>Verdict/Status</th><th>Rule</th><th>Time</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } catch (e) {}
+}
+
+async function exportAuditBundle() {
+  try {
+    const res = await fetch('/v1/bundle/export');
+    const bundle = await res.json();
+    const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `actentra-audit-bundle-${Date.now()}.json`;
+    a.click();
+  } catch (e) { alert('Export failed: ' + e); }
+}
+
+// Initial bootstrap
+loadHealth();
+loadOverviewFeed();
+setInterval(() => {
+  refreshApprovals();
+  loadHealth();
+}, 5000);
+</script>
+</body>
+</html>

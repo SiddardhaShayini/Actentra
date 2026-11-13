@@ -36,3 +36,24 @@ def test_kernel_rss_and_decision_latency_within_budget() -> None:
     assert p95_ms < 10.0, f"p95 latency {p95_ms:.2f} ms exceeded 10 ms budget"
     # Note: pytest itself loads extra test plugins; assert generous margin under 150 MB peak
     assert rss_mb < 150.0, f"Process RSS {rss_mb:.1f} MB exceeded 150 MB"
+
+
+def test_gateway_startup_and_memory_footprint(tmp_path: Path) -> None:
+    from actentra import Boundary
+    from actentra_core.receipts import ReceiptStore
+    from actentra_gateway.http_service import create_gateway_server
+
+    t0 = time.perf_counter()
+    policy = load_policy_file(REPO_ROOT / "policies" / "examples" / "starter.yaml")
+    store = ReceiptStore(tmp_path / "gateway_perf.db")
+    boundary = Boundary(policy=policy, receipt_store=store)
+    server = create_gateway_server(boundary, host="127.0.0.1", port=0)
+    startup_ms = (time.perf_counter() - t0) * 1000.0
+
+    try:
+        health = server.services.get_health()
+        assert health["status"] == "ok"
+        # Startup must be snappy (under 500 ms target)
+        assert startup_ms < 500.0, f"Gateway startup {startup_ms:.1f} ms exceeded 500 ms budget"
+    finally:
+        server.server_close()

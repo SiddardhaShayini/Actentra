@@ -1,24 +1,30 @@
-"""Lightweight, local-first HTTP service and Web Approval UI for Actentra."""
+"""Lightweight, local-first HTTP service and Unified Operator Console for Actentra.
+
+Provides versioned REST APIs for policy evaluation, persistent human approvals,
+execution continuation, canary diff simulations, and an embedded offline Web Console.
+"""
 
 from __future__ import annotations
 
-import html
 import json
+import os
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from actentra.boundary import Boundary
-from actentra_core.envelope import EnvelopeError, ProvenanceItem, build_envelope
-from actentra_core.receipts import verify_log
-from actentra_core.verdict import Decision, Verdict
+from actentra_gateway.services import AppServices, ExecutorRegistry
 
 _MAX_BODY_BYTES = 2 * 1024 * 1024  # 2 MiB bound on HTTP request body
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 
 
 class PendingCrossing:
+    """In-memory compatibility view for pending crossings."""
+
     __slots__ = (
         "crossing_id",
         "session_id",
@@ -67,27 +73,59 @@ class PendingCrossing:
             "risk_tags": list(self.risk_tags),
             "reason": self.reason,
             "ts": self.ts,
-            "expires_in_seconds": max(0.0, round(self.expires_at - time.monotonic(), 1)),
+            "expires_in_seconds": max(0.0, round(self.expires_at - time.time(), 1)),
         }
 
 
 class ActentraHTTPHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for Actentra REST API and Local Web Approval UI."""
+    """HTTP request handler for Actentra REST API and Unified Operator Console."""
 
     server: ActentraHTTPServer
 
     def log_message(self, format: str, *args: Any) -> None:
-        # Suppress default noisy access logs to keep terminal clean
+        # Suppress default noisy access logs to keep terminal output clean
         pass
+
+    def _check_auth(self) -> bool:
+        if not self.server.auth_token:
+            return True
+        auth_hdr = self.headers.get("Authorization", "")
+        expected = f"Bearer {self.server.auth_token}"
+        if auth_hdr != expected:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "Unauthorized: missing or invalid Bearer token"},
+            )
+            return False
+        return True
+
+    def _allowed_origin(self) -> str | None:
+        origin = self.headers.get("Origin")
+        if not origin:
+            return None
+        clean = origin.strip().lower()
+        if (
+            clean.startswith("http://127.0.0.1:")
+            or clean.startswith("http://localhost:")
+            or clean in ("http://127.0.0.1", "http://localhost")
+        ):
+            return origin
+        return None
 
     def _send_json(self, status: int, payload: dict[str, Any] | list[Any]) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        allowed_origin = self._allowed_origin()
+        if allowed_origin:
+            self.send_header("Access-Control-Allow-Origin", allowed_origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization, X-Actentra-Client",
+        )
         self.end_headers()
         self.wfile.write(body)
 
@@ -114,64 +152,110 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        allowed_origin = self._allowed_origin()
+        if allowed_origin:
+            self.send_header("Access-Control-Allow-Origin", allowed_origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization, X-Actentra-Client",
+        )
         self.end_headers()
 
     def do_GET(self) -> None:
+        if not self._check_auth():
+            return
+
         parts = urlsplit(self.path)
         path = parts.path.rstrip("/") or "/"
+        services = self.server.services
 
         if path == "/health":
-            self._send_json(
-                HTTPStatus.OK,
-                {
-                    "status": "ok",
-                    "policy_id": self.server.boundary.engine.policy.policy_id,
-                    "policy_version": self.server.boundary.engine.policy.policy_version,
-                    "mode": self.server.boundary.engine.policy.mode,
-                    "frozen": self.server.boundary.engine.frozen,
-                },
-            )
+            self._send_json(HTTPStatus.OK, services.get_health())
             return
 
         if path == "/v1/crossings/pending":
-            self.server.clean_expired_pending()
-            pending_list = [p.to_dict() for p in self.server.pending_crossings.values()]
-            self._send_json(HTTPStatus.OK, pending_list)
+            pending = services.list_pending_approvals(status="pending")
+            self._send_json(HTTPStatus.OK, pending)
+            return
+
+        if path.startswith("/v1/crossings/") and not path.endswith(
+            ("/approve", "/execute", "/outcome")
+        ):
+            cid = path[len("/v1/crossings/") :]
+            detail = services.get_pending_approval(cid)
+            if detail is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Crossing '{cid}' not found"})
+                return
+            self._send_json(HTTPStatus.OK, detail)
             return
 
         if path == "/v1/receipts":
             query = parse_qs(parts.query)
-            limit = int(query.get("limit", ["100"])[0])
-            records = self.server.boundary.receipt_store.iter_records()
-            recent = records[-limit:] if len(records) > limit else records
-            self._send_json(HTTPStatus.OK, [r.to_dict() for r in recent])
+            limit = int(query.get("limit", ["50"])[0])
+            offset = int(query.get("offset", ["0"])[0])
+            verdict = query.get("verdict", [None])[0]
+            status_f = query.get("status", [None])[0]
+            tool_f = query.get("tool", [None])[0]
+            session_f = query.get("session_id", [None])[0]
+            search_f = query.get("search", [None])[0]
+
+            resp = services.query_receipts(
+                limit=limit,
+                offset=offset,
+                verdict=verdict,
+                status=status_f,
+                tool=tool_f,
+                session_id=session_f,
+                search=search_f,
+            )
+            # Maintain backward compatibility: if simple query without offset/search, return list
+            if "offset" not in query and "search" not in query:
+                self._send_json(HTTPStatus.OK, resp["records"])
+            else:
+                self._send_json(HTTPStatus.OK, resp)
             return
 
         if path == "/v1/verify":
-            vr = verify_log(self.server.boundary.receipt_store.db_path)
-            self._send_json(
-                HTTPStatus.OK,
-                {
-                    "ok": vr.ok,
-                    "total_records": vr.total_records,
-                    "head_hash": vr.last_hash,
-                    "errors": list(vr.errors),
-                },
-            )
+            self._send_json(HTTPStatus.OK, services.verify_audit_log())
+            return
+
+        if path == "/v1/policy":
+            self._send_json(HTTPStatus.OK, {"policy_yaml": services.get_policy_yaml()})
+            return
+
+        if path == "/v1/policy/lint":
+            self._send_json(HTTPStatus.OK, {"warnings": services.lint_active_policy()})
+            return
+
+        if path == "/v1/bundle/export":
+            bundle = services.export_audit_bundle()
+            self._send_json(HTTPStatus.OK, bundle)
             return
 
         if path in ("/ui", "/"):
             self._send_html(HTTPStatus.OK, self._render_dashboard_html())
             return
 
-        self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Route '{path}' not found"})
 
     def do_POST(self) -> None:
+        if not self._check_auth():
+            return
+
         parts = urlsplit(self.path)
         path = parts.path.rstrip("/")
+        services = self.server.services
+
+        # Mutating requests require loopback origin if Origin is provided
+        origin = self.headers.get("Origin")
+        if origin and not self._allowed_origin():
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "Forbidden: cross-origin browser request rejected"},
+            )
+            return
 
         if path == "/v1/crossings":
             try:
@@ -180,42 +264,10 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid body: {exc}"})
                 return
 
-            prov_items = [
-                ProvenanceItem(source=p["source"], trust=p["trust"])
-                for p in data.get("provenance", [])
-                if isinstance(p, dict) and "source" in p and "trust" in p
-            ]
-
-            try:
-                envelope = build_envelope(
-                    tool=str(data.get("tool", "")),
-                    verb=str(data.get("verb", "other")),
-                    resource=str(data.get("resource", "")),
-                    params=data.get("params") or {},
-                    session_id=str(data.get("session_id", "default")),
-                    agent_id=str(data.get("agent_id", "http-client")),
-                    provenance=prov_items,
-                    user_goal=data.get("user_goal"),
-                    idempotency_key=data.get("idempotency_key"),
-                )
-            except EnvelopeError as exc:
-                self._send_json(
-                    HTTPStatus.BAD_REQUEST,
-                    {"error": f"Invalid ActionEnvelope: {exc}", "verdict": Verdict.HOLD.value},
-                )
-                return
-
-            decision = self.server.boundary.engine.evaluate(envelope)
-
-            # Record durable decision receipt (Invariant I5)
-            self.server.boundary.receipt_store.record_decision(envelope, decision)
-
-            if decision.verdict == Verdict.ASK:
-                self.server.add_pending(envelope, decision)
-
-            resp_data = decision.to_dict()
-            resp_data["crossing_id"] = envelope.crossing_id
-            self._send_json(HTTPStatus.OK, resp_data)
+            execute = bool(data.get("execute", False))
+            resp = services.submit_crossing(data, execute=execute)
+            status_code = HTTPStatus.OK if "error" not in resp else HTTPStatus.BAD_REQUEST
+            self._send_json(status_code, resp)
             return
 
         if path.startswith("/v1/crossings/") and path.endswith("/approve"):
@@ -226,27 +278,92 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 data = {}
 
             approved = bool(data.get("approved", True))
-            res = self.server.resolve_pending(crossing_id, approved=approved)
-            if res is None:
+            execute = bool(data.get("execute", False))
+            res = services.resolve_approval(crossing_id, approved=approved, execute=execute)
+            if "error" in res:
+                self._send_json(HTTPStatus.NOT_FOUND, res)
+                return
+            self._send_json(HTTPStatus.OK, res)
+            return
+
+        if path.startswith("/v1/crossings/") and path.endswith("/execute"):
+            crossing_id = path[len("/v1/crossings/") : -len("/execute")]
+            res = services.execute_approved_crossing(crossing_id)
+            status_code = HTTPStatus.OK if "error" not in res else HTTPStatus.BAD_REQUEST
+            self._send_json(status_code, res)
+            return
+
+        if path.startswith("/v1/crossings/") and path.endswith("/outcome"):
+            crossing_id = path[len("/v1/crossings/") : -len("/outcome")]
+            try:
+                data = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid body: {exc}"})
+                return
+
+            status_val = data.get("status", "unknown")
+            if status_val not in ("success", "failure", "unknown"):
                 self._send_json(
-                    HTTPStatus.NOT_FOUND,
-                    {"error": f"Pending crossing '{crossing_id}' not found or expired"},
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "status must be success, failure, or unknown"},
                 )
                 return
 
-            self._send_json(
-                HTTPStatus.OK,
-                {
-                    "crossing_id": crossing_id,
-                    "status": "approved" if approved else "rejected",
-                    "canonical_hash": res.canonical_hash,
-                },
+            res = services.record_external_outcome(
+                crossing_id,
+                status=status_val,
+                result_hash=data.get("result_hash"),
+                error=data.get("error"),
             )
+            self._send_json(HTTPStatus.OK, res)
+            return
+
+        if path == "/v1/policy/canary":
+            try:
+                data = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid body: {exc}"})
+                return
+
+            cand_yaml = str(data.get("candidate_yaml", ""))
+            limit = int(data.get("limit", 100))
+            try:
+                canary_res = services.run_canary_on_candidate(cand_yaml, limit=limit)
+                self._send_json(HTTPStatus.OK, canary_res)
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": f"Canary execution failed: {exc}"},
+                )
+            return
+
+        if path == "/v1/simulate":
+            try:
+                data = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid body: {exc}"})
+                return
+
+            try:
+                sim_res = services.simulate_dry_run(
+                    tool=str(data.get("tool", "")),
+                    verb=str(data.get("verb", "other")),
+                    resource=str(data.get("resource", "")),
+                    params=data.get("params"),
+                    session_id=str(data.get("session_id", "default")),
+                    provenance=data.get("provenance"),
+                )
+                self._send_json(HTTPStatus.OK, sim_res)
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Simulation failed: {exc}"})
             return
 
         if path == "/v1/freeze":
             self.server.boundary.freeze()
-            self._send_json(HTTPStatus.OK, {"frozen": True, "message": "Kill switch activated"})
+            self._send_json(
+                HTTPStatus.OK,
+                {"frozen": True, "message": "Kill switch activated: system frozen"},
+            )
             return
 
         if path == "/v1/unfreeze":
@@ -254,235 +371,101 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"frozen": False, "message": "System unfrozen"})
             return
 
-        self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Route '{path}' not found"})
 
     def _render_dashboard_html(self) -> str:
-        self.server.clean_expired_pending()
-        pending = list(self.server.pending_crossings.values())
-        b = self.server.boundary
-
-        vr = verify_log(b.receipt_store.db_path)
-        status_color = "#10b981" if vr.ok else "#ef4444"
-        status_text = "VERIFIED (OK)" if vr.ok else "TAMPER DETECTED"
-
-        pending_cards_html = []
-        for p in pending:
-            risk_badges = " ".join(
-                f"<span class='badge risk'>{html.escape(t)}</span>" for t in p.risk_tags
-            )
-            cid = html.escape(p.crossing_id)
-            tool_name = html.escape(p.tool)
-            verb_name = html.escape(p.verb)
-            res_name = html.escape(p.resource)
-            exp_secs = p.to_dict()["expires_in_seconds"]
-            reason_text = html.escape(p.reason)
-            badge_fallback = '<span style="color:#9ca3af">no risk tags</span>'
-            pending_cards_html.append(
-                f"""
-                <div class="card pending-card" id="card-{cid}">
-                    <div style="display:flex; justify-content:space-between;
-                                align-items:flex-start;">
-                        <div>
-                            <div class="stat-label">Crossing: <code>{cid}</code></div>
-                            <h3 style="margin-top:0.25rem;">
-                              {tool_name}
-                              <span style="font-weight:normal; color:#9ca3af">({verb_name})</span>
-                            </h3>
-                            <div style="margin-top:0.25rem;"><code>{res_name}</code></div>
-                        </div>
-                        <div>
-                            <span class="badge" style="background:#78350f; color:#fde68a;">
-                              EXPIRES IN {exp_secs}s
-                            </span>
-                        </div>
-                    </div>
-                    <div style="margin: 0.75rem 0; font-size: 0.85rem; color: #d1d5db;">
-                        <strong>Reason:</strong> {reason_text}
-                    </div>
-                    <div>{risk_badges or badge_fallback}</div>
-                    <div style="margin-top: 1rem; display: flex; gap: 0.75rem;">
-                        <button class="btn btn-approve"
-                                onclick="resolveCrossing('{cid}', true)">
-                          Approve Action
-                        </button>
-                        <button class="btn btn-deny"
-                                onclick="resolveCrossing('{cid}', false)">
-                          Deny
-                        </button>
-                    </div>
-                </div>
-                """
-            )
-
-        no_crossings = (
-            "<div style='color:#9ca3af; padding: 1.5rem 0;'>"
-            "No actions currently awaiting human approval.</div>"
-        )
-        cards_section = "\n".join(pending_cards_html) if pending_cards_html else no_crossings
-
-        return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Actentra Gateway — Operator Console</title>
-<style>
-  :root {{
-    --bg: #0b0f19;
-    --card-bg: #111827;
-    --border: #1f2937;
-    --text: #f3f4f6;
-    --teal: #13bfa6;
-    --red: #ef4444;
-  }}
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, sans-serif;
-    padding: 2rem;
-    line-height: 1.5;
-  }}
-  .container {{ max-width: 1000px; margin: 0 auto; }}
-  header {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 1rem;
-    margin-bottom: 2rem;
-  }}
-  .card {{
-    background: var(--card-bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 1.25rem;
-    margin-bottom: 1.5rem;
-  }}
-  .stat-label {{ font-size: 0.75rem; color: #9ca3af; text-transform: uppercase; }}
-  code {{ font-family: monospace; color: #93c5fd; font-size: 0.85rem; }}
-  .badge {{
-    display: inline-block;
-    padding: 0.15rem 0.5rem;
-    border-radius: 4px;
-    font-size: 0.75rem;
-    font-weight: 600;
-  }}
-  .badge.risk {{ background: #312e81; color: #c7d2fe; margin-right: 0.25rem; }}
-  .btn {{
-    padding: 0.5rem 1.25rem;
-    border-radius: 6px;
-    font-weight: 600;
-    cursor: pointer;
-    border: none;
-    font-size: 0.85rem;
-  }}
-  .btn-approve {{ background: var(--teal); color: #0b0f19; }}
-  .btn-deny {{ background: #374151; color: #f3f4f6; }}
-  .btn:hover {{ opacity: 0.9; }}
-</style>
-<script>
-async function resolveCrossing(cid, approved) {{
-    try {{
-        const resp = await fetch('/v1/crossings/' + cid + '/approve', {{
-            method: 'POST',
-            headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{ approved: approved }})
-        }});
-        if (resp.ok) {{
-            const el = document.getElementById('card-' + cid);
-            if (el) {{
-                el.style.opacity = '0.4';
-                const actionText = approved ? 'APPROVED' : 'DENIED';
-                el.innerHTML = '<strong>' + actionText + '</strong> — Crossing resolved.';
-            }}
-        }} else {{
-            alert('Failed to resolve crossing');
-        }}
-    }} catch (e) {{
-        alert('Error: ' + e);
-    }}
-}}
-</script>
-</head>
-<body>
-<div class="container">
-  <header>
-    <div>
-      <h2><span style="color:var(--teal)">Actentra</span> Operator Console</h2>
-      <div style="font-size:0.85rem; color:#9ca3af;">
-        Policy: <code>{html.escape(b.engine.policy.policy_id)}</code>
-        &bull; Mode: <code>{b.engine.policy.mode}</code>
-      </div>
-    </div>
-    <div>
-      <span class="badge"
-            style="background:{status_color}22; color:{status_color};
-                   border:1px solid {status_color}">
-        {status_text}
-      </span>
-    </div>
-  </header>
-
-  <section>
-    <h3 style="margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem;">
-      Pending Human Approvals (ASK)
-      <span class="badge" style="background:#78350f; color:#fde68a;">{len(pending)}</span>
-    </h3>
-    {cards_section}
-  </section>
-</div>
-</body>
-</html>
-"""
+        """Render the complete, self-contained Actentra Operator Console."""
+        console_path = Path(__file__).parent / "console.html"
+        if console_path.exists():
+            return console_path.read_text(encoding="utf-8")
+        return "<html><body><h2>Actentra Console HTML template missing</h2></body></html>"
 
 
 class ActentraHTTPServer(ThreadingHTTPServer):
-    """Threading HTTPServer for Actentra gateway."""
+    """Threading HTTPServer for Actentra gateway with persistence and scoped executors."""
 
     def __init__(
         self,
         server_address: tuple[str, int],
         boundary: Boundary,
         *,
+        executor_registry: ExecutorRegistry | None = None,
         approval_ttl_seconds: float = 300.0,
+        auth_token: str | None = None,
+        unsafe_allow_remote: bool = False,
     ) -> None:
+        host = server_address[0]
+        if host not in _LOOPBACK_HOSTS and not (
+            unsafe_allow_remote or os.environ.get("ACTENTRA_UNSAFE_ALLOW_REMOTE")
+        ):
+            raise ValueError(
+                f"Refusing to bind Actentra Gateway to non-loopback address {host!r} "
+                "without explicit remote authorization (--unsafe-allow-remote)"
+            )
         super().__init__(server_address, ActentraHTTPHandler)
         self.boundary = boundary
         self.approval_ttl_seconds = approval_ttl_seconds
-        self.pending_crossings: dict[str, PendingCrossing] = {}
+        self.auth_token = auth_token or os.environ.get("ACTENTRA_GATEWAY_TOKEN")
+        self.services = AppServices(
+            boundary,
+            executor_registry=executor_registry,
+            approval_ttl_seconds=approval_ttl_seconds,
+        )
 
-    def add_pending(self, envelope: Any, decision: Decision) -> None:
-        self.pending_crossings[envelope.crossing_id] = PendingCrossing(
-            crossing_id=envelope.crossing_id,
-            session_id=envelope.session_id,
-            canonical_hash=envelope.canonical_hash,
-            tool=envelope.action.tool,
-            verb=envelope.action.verb,
-            resource=envelope.action.resource,
-            risk_tags=decision.risk_tags,
-            reason=decision.reason,
-            ts=envelope.ts,
-            expires_at=time.monotonic() + self.approval_ttl_seconds,
+    def add_pending(self, envelope: Any, decision: Any) -> None:
+        """Add pending approval to persistent SQLite store."""
+        self.boundary.receipt_store.add_pending_approval(
+            envelope=envelope,
+            decision=decision,
+            ttl_seconds=self.approval_ttl_seconds,
         )
 
     def clean_expired_pending(self) -> None:
-        now = time.monotonic()
-        expired = [cid for cid, p in self.pending_crossings.items() if now >= p.expires_at]
-        for cid in expired:
-            del self.pending_crossings[cid]
+        """Clean expired approvals in persistent SQLite store."""
+        self.boundary.receipt_store.cleanup_expired_approvals()
 
     def resolve_pending(self, crossing_id: str, *, approved: bool) -> PendingCrossing | None:
-        self.clean_expired_pending()
-        p = self.pending_crossings.pop(crossing_id, None)
-        if p is None:
+        """Resolve pending approval in persistent store."""
+        res = self.boundary.receipt_store.resolve_pending_approval(crossing_id, approved=approved)
+        if res is None:
             return None
         if approved:
             self.boundary.grant_approval(
-                canonical_hash=p.canonical_hash,
-                session_id=p.session_id,
+                canonical_hash=res.canonical_hash,
+                session_id=res.session_id,
             )
-        return p
+        return PendingCrossing(
+            crossing_id=res.crossing_id,
+            session_id=res.session_id,
+            canonical_hash=res.canonical_hash,
+            tool=res.tool,
+            verb=res.verb,
+            resource=res.resource,
+            risk_tags=res.risk_tags,
+            reason=res.reason,
+            ts=res.ts,
+            expires_at=res.expires_at,
+        )
+
+    @property
+    def pending_crossings(self) -> dict[str, PendingCrossing]:
+        """In-memory dictionary compatibility view over persistent store."""
+        records = self.boundary.receipt_store.list_pending_approvals(status="pending")
+        return {
+            r.crossing_id: PendingCrossing(
+                crossing_id=r.crossing_id,
+                session_id=r.session_id,
+                canonical_hash=r.canonical_hash,
+                tool=r.tool,
+                verb=r.verb,
+                resource=r.resource,
+                risk_tags=r.risk_tags,
+                reason=r.reason,
+                ts=r.ts,
+                expires_at=r.expires_at,
+            )
+            for r in records
+        }
 
 
 def create_gateway_server(
@@ -490,10 +473,20 @@ def create_gateway_server(
     *,
     host: str = "127.0.0.1",
     port: int = 8080,
+    executor_registry: ExecutorRegistry | None = None,
     approval_ttl_seconds: float = 300.0,
+    auth_token: str | None = None,
+    unsafe_allow_remote: bool = False,
 ) -> ActentraHTTPServer:
     """Create a configured ActentraHTTPServer ready to serve."""
-    return ActentraHTTPServer((host, port), boundary, approval_ttl_seconds=approval_ttl_seconds)
+    return ActentraHTTPServer(
+        (host, port),
+        boundary,
+        executor_registry=executor_registry,
+        approval_ttl_seconds=approval_ttl_seconds,
+        auth_token=auth_token,
+        unsafe_allow_remote=unsafe_allow_remote,
+    )
 
 
 def serve_http(
@@ -501,14 +494,20 @@ def serve_http(
     *,
     host: str = "127.0.0.1",
     port: int = 8080,
+    executor_registry: ExecutorRegistry | None = None,
     approval_ttl_seconds: float = 300.0,
+    auth_token: str | None = None,
+    unsafe_allow_remote: bool = False,
 ) -> None:
     """Run the Actentra HTTP Gateway service synchronously."""
     server = create_gateway_server(
         boundary,
         host=host,
         port=port,
+        executor_registry=executor_registry,
         approval_ttl_seconds=approval_ttl_seconds,
+        auth_token=auth_token,
+        unsafe_allow_remote=unsafe_allow_remote,
     )
     print(f"Actentra Gateway serving on http://{host}:{port} (Console: http://{host}:{port}/ui)")
     try:
