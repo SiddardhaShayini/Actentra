@@ -28,8 +28,10 @@ from actentra_core.policy import (
     load_policy_yaml,
 )
 from actentra_core.receipts import ReceiptStore, export_jsonl, verify_log
+from actentra_core.reporting import build_audit_summary, render_html_report
 from actentra_core.verdict import Verdict
 from actentra_executors.fs import LocalFSExecutor, ScopedFSTools
+from actentra_gateway.http_service import serve_http
 from actentra_gateway.mcp_proxy import serve_stdio
 
 app = typer.Typer(
@@ -143,6 +145,43 @@ def export_log_cmd(
     """Export all receipt records to a JSONL file."""
     count = export_jsonl(db_path, out_path)
     typer.echo(f"Exported {count} receipt record(s) to {out_path}")
+
+
+@app.command("report")
+def report_cmd(
+    db_path: Annotated[Path, typer.Argument(help="Path to SQLite receipt database.")],
+    html_out: Annotated[
+        Path | None,
+        typer.Option("--html", "-o", help="Optional output path for HTML report."),
+    ] = None,
+) -> None:
+    """Generate an audit report and summary from an Actentra receipt database."""
+    if not db_path.exists():
+        typer.echo(f"Receipt database not found: {db_path}", err=True)
+        raise typer.Exit(code=1)
+
+    summary = build_audit_summary(db_path)
+    status_str = "OK" if summary.integrity_ok else "FAILED"
+    typer.echo(f"=== Actentra Audit Report: {db_path} ===")
+    typer.echo(
+        f"Integrity Status    : {status_str} "
+        f"({summary.total_records} records, head={summary.head_hash[:19]}...)"
+    )
+    typer.echo(f"Evaluated Crossings : {summary.decision_count}")
+    typer.echo(f"Verdicts            : {summary.verdict_counts}")
+    typer.echo(f"Outcomes            : {summary.outcome_counts}")
+    typer.echo(f"Top Risk Tags       : {summary.risk_tag_counts or 'None'}")
+
+    if not summary.integrity_ok:
+        typer.echo("Integrity Errors    :", err=True)
+        for err in summary.integrity_errors:
+            typer.echo(f"  - {err}", err=True)
+
+    if html_out is not None:
+        html_content = render_html_report(summary, title=f"Actentra Audit — {db_path.name}")
+        html_out.parent.mkdir(parents=True, exist_ok=True)
+        html_out.write_text(html_content, encoding="utf-8")
+        typer.echo(f"Generated standalone HTML report: {html_out}")
 
 
 @app.command()
@@ -404,6 +443,38 @@ def mcp_proxy_cmd(
     )
     rc = serve_stdio(boundary=boundary, server_cmd=server_cmd)
     raise typer.Exit(code=rc)
+
+
+@app.command("serve")
+def serve_cmd(
+    policy_path: Annotated[
+        Path, typer.Option("--policy", "-p", help="Path to YAML policy file.")
+    ],
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+    host: Annotated[str, typer.Option("--host", "-h", help="Bind host.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Bind port.")] = 8080,
+    session_id: Annotated[
+        str, typer.Option("--session", help="Session ID for crossings.")
+    ] = "gateway-session",
+) -> None:
+    """Run the Actentra HTTP Gateway service and Operator Console."""
+    try:
+        pack = load_policy_file(policy_path)
+    except PolicyValidationError as exc:
+        typer.echo(f"INVALID policy: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    store = ReceiptStore(db_path)
+    boundary = Boundary(
+        policy=pack,
+        receipt_store=store,
+        session_id=session_id,
+        agent_id="http-gateway",
+        framework="http",
+    )
+    serve_http(boundary=boundary, host=host, port=port)
 
 
 @checkpoint_app.command("keygen")

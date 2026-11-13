@@ -53,6 +53,12 @@ from actentra_core.receipts import (
     export_jsonl,
     verify_log,
 )
+from actentra_core.reporting import (
+    AuditSummary,
+    CrossingAuditItem,
+    build_audit_summary,
+    render_html_report,
+)
 from actentra_core.risk import assess_risk
 from actentra_core.verdict import Decision, Verdict
 
@@ -60,8 +66,10 @@ __all__ = [
     "ActionEnvelope",
     "ActionSpec",
     "AgentInfo",
+    "AuditSummary",
     "CanonicalizationError",
     "CheckpointError",
+    "CrossingAuditItem",
     "Decision",
     "EnvelopeError",
     "GENESIS_HASH",
@@ -81,6 +89,7 @@ __all__ = [
     "Verdict",
     "VerificationResult",
     "assess_risk",
+    "build_audit_summary",
     "build_envelope",
     "canonicalize_json",
     "canonicalize_resource",
@@ -98,6 +107,7 @@ __all__ = [
     "load_policy_yaml",
     "match_resource_pattern",
     "parse_policy_dict",
+    "render_html_report",
     "sign_checkpoint",
     "verify_checkpoint",
     "verify_log",

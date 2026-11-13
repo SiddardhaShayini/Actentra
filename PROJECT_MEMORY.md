@@ -98,4 +98,19 @@ Agents working on this project must maintain this file as the durable handoff:
   - `.venv\Scripts\ruff check core executors gateway sdk cli tests`: All checks passed.
   - `.venv\Scripts\mypy`: Success, 0 issues in 18 source files (`strict = true`).
   - `.venv\Scripts\pytest -v`: 62 passed, 2 skipped (OS-privileged symlink/junction creation) in 2.15s.
+
+### 2026-11-13 11:15 IST
+
+- Added Scoped HTTP Executor (SSRF-defended), HTML Audit Reporting, Agent Framework Adapters, and HTTP Gateway Service with Local Web Approval UI:
+  - Scoped HTTP Executor (`executors/actentra_executors/http.py`): `ScopedHTTPExecutor` and `ScopedHTTPTools` featuring strict URL canonicalization, DNS resolution + SSRF defense (rejects `169.254.169.254` cloud metadata, `127.0.0.0/8`, private `10/8`, `172.16/12`, `192.168/16`), allowed hosts wildcard matching (`api.github.com`, `*.domain.com`), HTTP method filtering, bounded response size (1 MiB by default to stop memory bombs), and broker header secret injection.
+  - Audit Reporting (`core/actentra_core/reporting.py`, `cli/actentra_cli/main.py`): `build_audit_summary` and `render_html_report` generating offline, zero-external-CDN HTML audit reports with SVG security badges, integrity verification status, verdict breakdown metrics, and a chronological receipt timeline. Added CLI command `actentra report <db_path> [--html out.html]`.
+  - Agent Adapters (`sdk/python/actentra/adapters/`):
+    - `function_calling.py`: `FunctionCallAdapter` supporting OpenAI-compatible and Anthropic-style function call dictionaries, automatic resource/verb inference, and execution through `Boundary`.
+    - `langchain.py`: `LangChainToolWrapper` and `wrap_langchain_tool` duck-typed wrapper supporting LangChain `.invoke()`, `.run()`, and direct `__call__()`.
+  - HTTP Gateway Service (`gateway/actentra_gateway/http_service.py`, `cli/actentra_cli/main.py`): zero-dependency `ThreadingHTTPServer` exposing REST API (`/health`, `/v1/crossings`, `/v1/crossings/pending`, `/v1/crossings/{id}/approve`, `/v1/receipts`, `/v1/verify`, `/v1/freeze`, `/v1/unfreeze`) and an embedded Operator Console web UI at `/ui` for human-in-the-loop approvals. Added CLI command `actentra serve --policy <path> [--port 8080]`.
+  - Tests: added `tests/unit/test_http_executor.py`, `tests/unit/test_reporting.py`, `tests/unit/test_adapters.py`, `tests/unit/test_http_service.py`. Handled Windows Sandbox socket isolation (`WinError 10013`) gracefully with test skip assertions for loopback connections.
+- Validation:
+  - `.venv\Scripts\ruff check core executors gateway sdk cli tests`: All checks passed!
+  - `.venv\Scripts\mypy`: Success, 0 issues found in 24 source files (`strict = true`).
+  - `.venv\Scripts\pytest -v`: 69 passed, 4 skipped in 9.70s (and 100% passed when run unsandboxed).
   - Kernel size (`core/actentra_core/*.py`): 2,041 lines (under 3,000-line budget).
