@@ -114,3 +114,17 @@ Agents working on this project must maintain this file as the durable handoff:
   - `.venv\Scripts\mypy`: Success, 0 issues found in 24 source files (`strict = true`).
   - `.venv\Scripts\pytest -v`: 69 passed, 4 skipped in 9.70s (and 100% passed when run unsandboxed).
   - Kernel size (`core/actentra_core/*.py`): 2,041 lines (under 3,000-line budget).
+
+### 2026-11-13 11:35 IST
+
+- Added Phase 3 Context-Aware Safety: Cumulative Session Budgets, Policy Canary Diff Engine, Dry-Run Simulation, and Session Taint Propagation:
+  - Cumulative Session Budgets (`core/actentra_core/budgets.py`, `policy.py`): `SessionBudgetConfig` and memory-bounded `SessionBudgetTracker` enforcing `max_actions`, `max_external_calls`, and `max_write_bytes` per session with customizable escalation (`ask` or `deny`), directly mitigating slow-drip exfiltration (T4) and runaway agent recursion loops (T5).
+  - Policy Canary Diff Engine (`core/actentra_core/canary.py`, `cli/actentra_cli/main.py`): `run_policy_canary` and `CanarySummary` replaying historical SQLite receipt logs against candidate policy packs to detect verdict shifts, identical outcomes, and permission regressions before production activation (`actentra policy canary <candidate_policy.yaml> <receipts.db>`).
+  - Dry-Run Simulation (`sdk/python/actentra/boundary.py`, `cli/actentra_cli/main.py`): `Boundary.dry_run()` and CLI command `actentra dry-run` to predict policy verdicts, risk tags, and constraints without side effects, supporting optional shadow receipts for auditing.
+  - Session Taint Propagation (`sdk/python/actentra/boundary.py`): dynamic session taint tracking that marks a session untrusted when reading untrusted inputs (indirect prompt injection defense) and automatically binds subsequent unannotated actions in that session to untrusted egress controls.
+  - Receipt Store Action Envelopes (`core/actentra_core/receipts.py`): added `action_envelopes` table to persist and retrieve full canonical envelopes for historical auditing and canary replay.
+  - Tests: added `tests/unit/test_budgets.py`, `tests/unit/test_canary.py`, `tests/unit/test_dry_run_and_taint.py`.
+- Validation:
+  - `.venv\Scripts\ruff check core executors gateway sdk cli tests`: All checks passed!
+  - `.venv\Scripts\mypy`: Success, 0 issues found in 26 source files (`strict = true`).
+  - `.venv\Scripts\pytest -v`: 76 passed, 4 skipped in 5.95s.

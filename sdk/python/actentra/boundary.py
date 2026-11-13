@@ -97,6 +97,7 @@ class Boundary:
         self._approval_ttl = approval_ttl_seconds
         self._secrets_broker = secrets_broker
         self._approvals: dict[tuple[str, str], ApprovalGrant] = {}
+        self._session_taints: dict[str, str] = {}
 
     @classmethod
     def from_files(
@@ -157,6 +158,73 @@ class Boundary:
             expires_at=time.monotonic() + self._approval_ttl,
         )
 
+    def get_session_taint(self, session_id: str | None = None) -> str | None:
+        """Return the cumulative taint level for a session."""
+        sid = session_id or self._session_id
+        return self._session_taints.get(sid)
+
+    def set_session_taint(self, taint: str, session_id: str | None = None) -> None:
+        """Explicitly set or clear session-level taint."""
+        sid = session_id or self._session_id
+        clean = taint.strip().lower()
+        if clean in ("trusted", "clean", ""):
+            self._session_taints.pop(sid, None)
+        else:
+            self._session_taints[sid] = clean
+
+    def dry_run(
+        self,
+        *,
+        tool: str,
+        verb: str,
+        resource: str,
+        params: dict[str, Any] | None = None,
+        user_goal: str | None = None,
+        declared_by: Literal["human", "agent", "system"] = "agent",
+        provenance: list[ProvenanceItem] | tuple[ProvenanceItem, ...] = (),
+        record_receipt: bool = False,
+    ) -> Decision:
+        """Simulate action evaluation without executing it.
+
+        Evaluates policy, risk tags, and session budgets. If record_receipt is True,
+        records a shadow decision receipt into the receipt store for auditing.
+        """
+        prov_items = list(provenance)
+        if not prov_items and self._session_taints.get(self._session_id) == "untrusted":
+            prov_items.append(ProvenanceItem(source="session", trust="untrusted"))
+
+        envelope = build_envelope(
+            tool=tool,
+            verb=verb,
+            resource=resource,
+            params=params,
+            session_id=self._session_id,
+            agent_id=self._agent_id,
+            framework=self._framework,
+            model=self._model,
+            user_goal=user_goal,
+            declared_by=declared_by,
+            provenance=prov_items,
+        )
+
+        decision = self._engine.evaluate(envelope)
+
+        if record_receipt:
+            shadow_dec = Decision(
+                verdict=decision.verdict,
+                rule_id=f"{decision.rule_id}:dry-run",
+                reason=f"[DRY-RUN] {decision.reason}",
+                policy_version=decision.policy_version,
+                canonical_hash=decision.canonical_hash,
+                risk_tags=decision.risk_tags,
+                constraints=decision.constraints,
+                shadow=True,
+                would_verdict=decision.verdict,
+            )
+            self._store.record_decision(envelope, shadow_dec)
+
+        return decision
+
     def execute(
         self,
         *,
@@ -171,6 +239,10 @@ class Boundary:
         idempotency_key: str | None = None,
     ) -> Any:
         """Evaluate an action, record a durable decision, enforce verdict, and record outcome."""
+        prov_items = list(provenance)
+        if not prov_items and self._session_taints.get(self._session_id) == "untrusted":
+            prov_items.append(ProvenanceItem(source="session", trust="untrusted"))
+
         try:
             envelope = build_envelope(
                 tool=tool,
@@ -183,7 +255,7 @@ class Boundary:
                 model=self._model,
                 user_goal=user_goal,
                 declared_by=declared_by,
-                provenance=provenance,
+                provenance=prov_items,
                 idempotency_key=idempotency_key,
             )
         except EnvelopeError as exc:
@@ -196,6 +268,10 @@ class Boundary:
                 canonical_hash="sha256:" + ("0" * 64),
             )
             raise ActionBlockedError(hold_decision, "INVALID") from exc
+
+        # Update session taint tracker if this action is untrusted
+        if envelope.max_taint == "untrusted":
+            self._session_taints[envelope.session_id] = "untrusted"
 
         decision = self._engine.evaluate(envelope)
 
@@ -295,6 +371,8 @@ class Boundary:
             status="success",
             result_hash=result_hash,
         )
+        # Update session cumulative budgets
+        self._engine.budget_tracker.record_usage(envelope)
         return result
 
     def guard(

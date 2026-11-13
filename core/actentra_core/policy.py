@@ -12,12 +12,19 @@ from typing import Any
 
 import yaml
 
-from actentra_core.canonicalize import CanonicalizationError, hash_canonical, match_resource_pattern
+from actentra_core.budgets import SessionBudgetConfig, SessionBudgetTracker
+from actentra_core.canonicalize import (
+    CanonicalizationError,
+    hash_canonical,
+    match_resource_pattern,
+)
 from actentra_core.envelope import ActionEnvelope
 from actentra_core.risk import assess_risk
 from actentra_core.verdict import VERDICT_PRECEDENCE, Decision, Verdict
 
-_TOP_LEVEL_KEYS = frozenset({"version", "policy_id", "mode", "defaults", "limits", "rules"})
+_TOP_LEVEL_KEYS = frozenset(
+    {"version", "policy_id", "mode", "defaults", "limits", "budgets", "rules"}
+)
 _DEFAULT_KEYS = frozenset({"verdict", "reason"})
 _LIMIT_KEYS = frozenset({"id", "scope", "max_actions_per_minute"})
 _RULE_KEYS = frozenset({"id", "match", "verdict", "constraints", "reason"})
@@ -96,6 +103,7 @@ class PolicyPack:
     limits: tuple[RateLimit, ...]
     rules: tuple[PolicyRule, ...]
     policy_hash: str
+    budgets: SessionBudgetConfig | None = None
 
     @property
     def policy_version(self) -> str:
@@ -240,6 +248,9 @@ def parse_policy_dict(raw: Any) -> PolicyPack:
             )
         )
 
+    budgets_raw = raw.get("budgets")
+    budgets = SessionBudgetConfig.from_dict(budgets_raw) if budgets_raw else None
+
     policy_hash = hash_canonical(raw)
     return PolicyPack(
         version=version,
@@ -250,6 +261,7 @@ def parse_policy_dict(raw: Any) -> PolicyPack:
         limits=tuple(limits),
         rules=tuple(rules),
         policy_hash=policy_hash,
+        budgets=budgets,
     )
 
 
@@ -284,10 +296,15 @@ class PolicyEngine:
         self._clock = clock or time.monotonic
         self._frozen = False
         self._buckets: dict[tuple[str, str], deque[float]] = {}
+        self._budget_tracker = SessionBudgetTracker(policy.budgets)
 
     @property
     def policy(self) -> PolicyPack:
         return self._policy
+
+    @property
+    def budget_tracker(self) -> SessionBudgetTracker:
+        return self._budget_tracker
 
     @property
     def frozen(self) -> bool:
@@ -356,6 +373,18 @@ class PolicyEngine:
                 constraints={},
                 envelope=envelope,
                 risk_tags=risk_tags,
+            )
+
+        budget_hit = self._budget_tracker.check_budget(envelope)
+        if budget_hit is not None:
+            combined_tags = tuple(sorted(set(risk_tags) | set(budget_hit.risk_tags)))
+            return self._finalize_decision(
+                evaluated_verdict=budget_hit.verdict,
+                rule_id=budget_hit.rule_id,
+                reason=budget_hit.reason,
+                constraints={},
+                envelope=envelope,
+                risk_tags=combined_tags,
             )
 
         winning_rule: PolicyRule | None = None

@@ -1,5 +1,7 @@
 """Actentra core deterministic authorization and receipt kernel."""
 
+from actentra_core.budgets import SessionBudgetConfig, SessionBudgetTracker
+from actentra_core.canary import CanaryDiffItem, CanarySummary, run_policy_canary
 from actentra_core.canonicalize import (
     CanonicalizationError,
     canonicalize_json,
@@ -67,6 +69,8 @@ __all__ = [
     "ActionSpec",
     "AgentInfo",
     "AuditSummary",
+    "CanaryDiffItem",
+    "CanarySummary",
     "CanonicalizationError",
     "CheckpointError",
     "CrossingAuditItem",
@@ -85,6 +89,8 @@ __all__ = [
     "ReceiptRecord",
     "ReceiptStore",
     "RuleMatch",
+    "SessionBudgetConfig",
+    "SessionBudgetTracker",
     "SignedCheckpoint",
     "Verdict",
     "VerificationResult",
@@ -108,6 +114,7 @@ __all__ = [
     "match_resource_pattern",
     "parse_policy_dict",
     "render_html_report",
+    "run_policy_canary",
     "sign_checkpoint",
     "verify_checkpoint",
     "verify_log",

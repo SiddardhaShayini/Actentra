@@ -163,6 +163,14 @@ class ReceiptStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_receipts_crossing ON receipts(crossing_id);"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS action_envelopes (
+                    crossing_id TEXT PRIMARY KEY,
+                    envelope_json TEXT NOT NULL
+                );
+                """
+            )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to initialize receipt store: {exc}") from exc
         finally:
@@ -280,7 +288,7 @@ class ReceiptStore:
         self, envelope: ActionEnvelope, decision: Decision
     ) -> ReceiptRecord:
         """Persist an immutable decision record before any execution occurs (I5)."""
-        return self._append_record(
+        rec = self._append_record(
             record_type="decision",
             crossing_id=envelope.crossing_id,
             session_id=envelope.session_id,
@@ -295,6 +303,40 @@ class ReceiptStore:
             result_hash=None,
             error=None,
         )
+        conn = self._connect()
+        try:
+            sql_insert = (
+                "INSERT OR REPLACE INTO action_envelopes "
+                "(crossing_id, envelope_json) VALUES (?, ?);"
+            )
+            conn.execute(
+                sql_insert,
+                (envelope.crossing_id, canonicalize_json(envelope.to_dict())),
+            )
+            conn.execute("COMMIT;")
+        except sqlite3.Error:
+            pass
+        finally:
+            conn.close()
+        return rec
+
+    def get_envelope(self, crossing_id: str) -> dict[str, Any] | None:
+        """Retrieve stored envelope payload for a crossing if available."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "SELECT envelope_json FROM action_envelopes WHERE crossing_id = ?;",
+                (crossing_id,),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                data = json.loads(row[0])
+                return data if isinstance(data, dict) else None
+            return None
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
 
     def record_outcome(
         self,

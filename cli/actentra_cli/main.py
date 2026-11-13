@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 
 from actentra import ActionBlockedError, Boundary
+from actentra_core.canary import run_policy_canary
 from actentra_core.checkpoints import (
     CheckpointError,
     generate_ed25519_keypair,
@@ -123,6 +124,63 @@ def policy_check(
         typer.echo(f"WARN: {warning}")
 
 
+@policy_app.command("canary")
+def policy_canary_cmd(
+    candidate_policy_path: Annotated[
+        Path, typer.Argument(help="Candidate policy YAML file to test.")
+    ],
+    receipts_db: Annotated[
+        Path, typer.Argument(help="Historical SQLite receipt database.")
+    ],
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", "-n", help="Limit number of decisions to replay."),
+    ] = None,
+    allow_regressions: Annotated[
+        bool,
+        typer.Option("--allow-regressions", help="Do not exit on permission regressions."),
+    ] = False,
+) -> None:
+    """Run Policy Canary: replay historical receipts against a candidate policy."""
+    try:
+        pack = load_policy_file(candidate_policy_path)
+    except PolicyValidationError as exc:
+        typer.echo(f"INVALID candidate policy: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if not receipts_db.exists():
+        typer.echo(f"Receipt database not found: {receipts_db}", err=True)
+        raise typer.Exit(code=1)
+
+    summary = run_policy_canary(pack, receipts_db, limit=limit)
+    typer.echo(f"=== Actentra Policy Canary: {pack.policy_id} ({pack.policy_version}) ===")
+    typer.echo(f"Total Evaluated     : {summary.total_evaluated}")
+    typer.echo(f"Identical Verdicts  : {summary.identical_count}")
+    typer.echo(f"More Restrictive    : {summary.more_restrictive_count}")
+    typer.echo(f"Less Restrictive    : {summary.less_restrictive_count} (Regressions)")
+    typer.echo(f"Rule Changed Only   : {summary.rule_changed_count}")
+
+    if summary.diffs:
+        typer.echo("\n--- Verdict Shifts ---")
+        for d in summary.diffs:
+            prefix = "[REGRESSION]" if d.delta_type == "less_restrictive" else "[SHIFT]"
+            typer.echo(
+                f"{prefix} crossing={d.crossing_id[:16]}... tool={d.tool} "
+                f"{d.original_verdict.upper()} -> {d.candidate_verdict.upper()} "
+                f"(cand_rule={d.candidate_rule})"
+            )
+
+    if summary.has_regressions and not allow_regressions:
+        typer.echo(
+            f"\nPOLICY CANARY FAILED: {summary.less_restrictive_count} permission regression(s) "
+            "detected (actions previously blocked would now be allowed).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo("\nPolicy canary evaluation completed successfully.")
+
+
 @app.command("verify-log")
 def verify_log_cmd(
     db_path: Annotated[Path, typer.Argument(help="Path to SQLite receipt database.")],
@@ -182,6 +240,64 @@ def report_cmd(
         html_out.parent.mkdir(parents=True, exist_ok=True)
         html_out.write_text(html_content, encoding="utf-8")
         typer.echo(f"Generated standalone HTML report: {html_out}")
+
+
+@app.command("dry-run")
+def dry_run_cmd(
+    policy_path: Annotated[
+        Path, typer.Option("--policy", "-p", help="Path to YAML policy file.")
+    ],
+    tool: Annotated[str, typer.Option("--tool", "-t", help="Tool identifier.")],
+    resource: Annotated[str, typer.Option("--resource", "-r", help="Canonical resource target.")],
+    verb: Annotated[str, typer.Option("--verb", "-v", help="Action verb.")] = "read",
+    params_json: Annotated[
+        str | None, typer.Option("--params", help="JSON-encoded parameters object.")
+    ] = None,
+    taint: Annotated[
+        str | None, typer.Option("--taint", help="Provenance taint (e.g. untrusted).")
+    ] = None,
+    session_id: Annotated[
+        str, typer.Option("--session", help="Session ID for evaluation.")
+    ] = "dry-run-session",
+) -> None:
+    """Simulate and predict an action's policy verdict without executing it."""
+    try:
+        pack = load_policy_file(policy_path)
+    except PolicyValidationError as exc:
+        typer.echo(f"INVALID policy: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    params = json.loads(params_json) if params_json else {}
+    trust_val: Literal["trusted", "untrusted", "unknown"] = (
+        "untrusted" if taint and taint.strip().lower() == "untrusted" else "trusted"
+    )
+    prov = [ProvenanceItem(source="cli", trust=trust_val)] if taint else []
+
+    with tempfile.TemporaryDirectory(prefix="actentra-dryrun-") as tmpdir:
+        temp_db = Path(tmpdir) / "dryrun.db"
+        boundary = Boundary(
+            policy=pack,
+            receipt_store=ReceiptStore(temp_db),
+            session_id=session_id,
+        )
+        dec = boundary.dry_run(
+            tool=tool,
+            verb=verb,
+            resource=resource,
+            params=params,
+            provenance=prov,
+            record_receipt=False,
+        )
+
+    typer.echo(f"=== Actentra Dry-Run Simulation: {tool} ({verb}) ===")
+    typer.echo(f"Predicted Verdict : {dec.verdict.value.upper()}")
+    typer.echo(f"Matched Rule      : {dec.rule_id}")
+    typer.echo(f"Reason            : {dec.reason}")
+    typer.echo(f"Risk Tags         : {dec.risk_tags or 'None'}")
+    if dec.constraints:
+        typer.echo(f"Constraints       : {dec.constraints}")
+    if not dec.verdict.permits_execution:
+        raise typer.Exit(code=2 if dec.verdict == Verdict.ASK else 1)
 
 
 @app.command()
