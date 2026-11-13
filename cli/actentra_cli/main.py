@@ -31,6 +31,12 @@ from actentra_core.policy import (
 from actentra_core.receipts import ReceiptStore, export_jsonl, verify_log
 from actentra_core.reporting import build_audit_summary, render_html_report
 from actentra_core.verdict import Verdict
+from actentra_core.warrants import (
+    Warrant,
+    WarrantError,
+    issue_warrant,
+    verify_warrant,
+)
 from actentra_executors.fs import LocalFSExecutor, ScopedFSTools
 from actentra_gateway.http_service import serve_http
 from actentra_gateway.mcp_proxy import serve_stdio
@@ -44,6 +50,8 @@ policy_app = typer.Typer(help="Validate and inspect policy packs.")
 app.add_typer(policy_app, name="policy")
 checkpoint_app = typer.Typer(help="Sign and verify Ed25519 receipt checkpoints.")
 app.add_typer(checkpoint_app, name="checkpoint")
+warrant_app = typer.Typer(help="Issue and verify cryptographic capability warrants.")
+app.add_typer(warrant_app, name="warrant")
 
 _DEFAULT_STARTER_POLICY = """\
 version: 1
@@ -659,6 +667,80 @@ def checkpoint_verify_cmd(
         typer.echo(f"VERIFICATION FAILED: {msg}", err=True)
         raise typer.Exit(code=1)
     typer.echo(f"OK checkpoint seq={cp.seq} key_id={cp.key_id} head={cp.head_hash}")
+
+
+@warrant_app.command("issue")
+def warrant_issue_cmd(
+    holder: Annotated[str, typer.Option("--holder", "-h", help="Agent or holder ID.")],
+    tools: Annotated[
+        str,
+        typer.Option(
+            "--tools", "-t", help="Comma-separated allowed tools (e.g. 'fs.read,sqlite.*')."
+        ),
+    ],
+    resources: Annotated[
+        str,
+        typer.Option("--resources", "-r", help="Comma-separated allowed resource patterns."),
+    ],
+    key_path: Annotated[Path, typer.Option("--key", "-k", help="Ed25519 issuer private key PEM.")],
+    issuer: Annotated[str, typer.Option("--issuer", help="Issuer ID.")] = "actentra-root",
+    ttl: Annotated[float, typer.Option("--ttl", help="Validity duration in seconds.")] = 3600.0,
+    max_uses: Annotated[
+        int | None, typer.Option("--max-uses", help="Maximum permitted uses.")
+    ] = None,
+    out_path: Annotated[
+        Path, typer.Option("--out", "-o", help="Output path for warrant JSON.")
+    ] = Path("warrant.json"),
+) -> None:
+    """Issue and sign an Ed25519 capability warrant for an agent or subagent."""
+    try:
+        priv_pem = key_path.read_bytes()
+        tool_list = [t.strip() for t in tools.split(",") if t.strip()]
+        res_list = [r.strip() for r in resources.split(",") if r.strip()]
+        warrant = issue_warrant(
+            holder=holder,
+            allowed_tools=tool_list,
+            allowed_resources=res_list,
+            privkey_pem=priv_pem,
+            issuer_id=issuer,
+            ttl_seconds=ttl,
+            max_uses=max_uses,
+        )
+        out_path.write_text(json.dumps(warrant.to_dict(), indent=2), encoding="utf-8")
+    except (OSError, WarrantError) as exc:
+        typer.echo(f"WARRANT ISSUE FAILED: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Issued warrant id={warrant.warrant_id} holder={holder} -> {out_path}")
+
+
+@warrant_app.command("verify")
+def warrant_verify_cmd(
+    warrant_path: Annotated[Path, typer.Argument(help="Path to warrant JSON file.")],
+    pubkey_path: Annotated[
+        Path, typer.Option("--pubkey", "-p", help="Ed25519 issuer public key PEM.")
+    ],
+    holder: Annotated[
+        str | None, typer.Option("--holder", help="Assert specific holder ID.")
+    ] = None,
+) -> None:
+    """Verify cryptographic signature and validity of a Warrant."""
+    try:
+        raw_data = json.loads(warrant_path.read_text(encoding="utf-8"))
+        warrant = Warrant.from_dict(raw_data)
+        pub_pem = pubkey_path.read_bytes()
+    except (OSError, KeyError, ValueError) as exc:
+        typer.echo(f"INVALID warrant file: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    ok, msg = verify_warrant(warrant, pub_pem, expected_holder=holder)
+    if not ok:
+        typer.echo(f"WARRANT REJECTED: {msg}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(
+        f"OK valid warrant id={warrant.warrant_id} holder={warrant.holder} "
+        f"expires={warrant.expires_at}"
+    )
 
 
 if __name__ == "__main__":

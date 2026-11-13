@@ -63,6 +63,14 @@ from actentra_core.reporting import (
 )
 from actentra_core.risk import assess_risk
 from actentra_core.verdict import Decision, Verdict
+from actentra_core.warrants import (
+    Warrant,
+    WarrantError,
+    WarrantRegistry,
+    is_action_permitted_by_warrant,
+    issue_warrant,
+    verify_warrant,
+)
 
 __all__ = [
     "ActionEnvelope",
@@ -94,6 +102,9 @@ __all__ = [
     "SignedCheckpoint",
     "Verdict",
     "VerificationResult",
+    "Warrant",
+    "WarrantError",
+    "WarrantRegistry",
     "assess_risk",
     "build_audit_summary",
     "build_envelope",
@@ -107,6 +118,8 @@ __all__ = [
     "generate_crossing_id",
     "generate_ed25519_keypair",
     "hash_canonical",
+    "is_action_permitted_by_warrant",
+    "issue_warrant",
     "lint_policy",
     "load_checkpoint",
     "load_policy_file",
@@ -118,6 +131,7 @@ __all__ = [
     "sign_checkpoint",
     "verify_checkpoint",
     "verify_log",
+    "verify_warrant",
     "windows_path_join_safe",
     "write_checkpoint",
 ]

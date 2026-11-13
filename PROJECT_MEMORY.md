@@ -128,3 +128,18 @@ Agents working on this project must maintain this file as the durable handoff:
   - `.venv\Scripts\ruff check core executors gateway sdk cli tests`: All checks passed!
   - `.venv\Scripts\mypy`: Success, 0 issues found in 26 source files (`strict = true`).
   - `.venv\Scripts\pytest -v`: 76 passed, 4 skipped in 5.95s.
+
+### 2026-11-13 11:45 IST
+
+- Added Phase 4 Cryptographic Capability Tokens (Warrants), Documentation Suite, and Windows Service Daemon:
+  - Warrants Engine (`core/actentra_core/warrants.py`, `cli/actentra_cli/main.py`): `Warrant`, `issue_warrant`, `verify_warrant`, `is_action_permitted_by_warrant`, and `WarrantRegistry` implementing Ed25519-signed capability delegation tokens with scoped tools, resource patterns, expiration, and use limits (`actentra warrant issue` / `actentra warrant verify`).
+  - Documentation Suite:
+    - `docs/quickstart.md`: Comprehensive 5-minute tutorial covering Python SDK `@guard`, adapters, CLI commands, dry-run, approval UI, and receipts verification.
+    - `docs/architecture.md`: Full multi-layer system architecture diagram and 7 core invariants.
+    - `README.md`: Modernized with complete feature matrices, quick checks, SDK examples, and architecture maps.
+  - Windows Service Daemon Runner (`scripts/windows/run_gateway.ps1`): Resilient background launcher with automated health probes and crash auto-recovery.
+  - Tests: added `tests/unit/test_warrants.py`.
+- Validation:
+  - `.venv\Scripts\ruff check core executors gateway sdk cli tests`: All checks passed!
+  - `.venv\Scripts\mypy`: Success, 0 issues found in 27 source files (`strict = true`).
+  - `.venv\Scripts\pytest -v`: 80 passed, 4 skipped in 6.03s.
