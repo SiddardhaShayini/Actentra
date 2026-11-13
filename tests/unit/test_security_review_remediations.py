@@ -148,8 +148,17 @@ def test_approved_crossing_atomic_claim_prevents_duplicate_dispatch(tmp_path: Pa
     assert mock_exec.call_count == 1  # Still 1, no duplicate side effect!
 
 
-def test_cleanup_expired_approvals_expires_approved_records(tmp_path: Path) -> None:
+def test_cleanup_expired_approvals_expires_approved_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Cleanup must expire records that were approved but whose TTL lapsed before execution."""
+    simulated_time = 1_700_000_000.0
+
+    def mock_time() -> float:
+        return simulated_time
+
+    monkeypatch.setattr(time, "time", mock_time)
+
     db_path = tmp_path / "f1_ttl.db"
     store = ReceiptStore(db_path)
     policy = load_policy_yaml(_base_policy_yaml())
@@ -162,14 +171,14 @@ def test_cleanup_expired_approvals_expires_approved_records(tmp_path: Path) -> N
     )
     dec = boundary.engine.evaluate(envelope)
 
-    # Add approval with tiny 0.05s TTL
-    store.add_pending_approval(envelope=envelope, decision=dec, ttl_seconds=0.05)
+    # Add approval with 10s TTL
+    store.add_pending_approval(envelope=envelope, decision=dec, ttl_seconds=10.0)
     resolved = store.resolve_pending_approval(envelope.crossing_id, approved=True)
     assert resolved is not None
     assert resolved.status == "approved"
 
-    # Wait for expiration
-    time.sleep(0.08)
+    # Advance simulated time past TTL
+    simulated_time += 15.0
 
     # Cleanup must transition approved -> expired
     cleaned = store.cleanup_expired_approvals()

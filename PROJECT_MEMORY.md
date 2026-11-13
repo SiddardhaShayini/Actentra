@@ -223,3 +223,10 @@ Agents working on this project must maintain this file as the durable handoff:
     - `.venv\Scripts\ruff check core executors gateway sdk cli tests`: All checks passed!
     - `.venv\Scripts\mypy`: Success, 0 issues found in 28 source files (`strict = true`).
     - `.venv\Scripts\pytest -v`: 103 passed, 4 skipped (100% pass rate).
+
+### 2026-11-13 15:48 IST
+
+- Fixed CI timing race in `test_cleanup_expired_approvals_expires_approved_records`:
+  - On busy GitHub Actions shared Windows runners, the initial wall-clock 0.05s TTL lapsed during `resolve_pending_approval`, causing an intermittent test failure (`assert 'expired' == 'approved'`).
+  - Replaced wall-clock `time.sleep` with a deterministic `monkeypatch` over `time.time()`, advancing simulated time explicitly.
+  - Validation: all 14 remediation tests and 103 total tests passed cleanly in under 5 seconds.
