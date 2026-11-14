@@ -23,13 +23,13 @@ Each capability in Actentra is explicitly labeled under one of three tiers:
 | **Scoped SQLite Executor** | **Supported** | `actentra_executors.sqlite` | Single-statement check, parameter binding, read-only mode, row limits. |
 | **Scoped HTTP Executor** | **Supported** | `actentra_executors.http` | SSRF defense (blocks RFC 1918 & 169.254.169.254), allowed hosts filter, size caps. |
 | **MCP Stdio Proxy** | **Supported** | `actentra_gateway.mcp_proxy` | Tool call interception, tool hash pinning to detect mid-session changes (CVE-2025-54136). |
-| **Cumulative Session Budgets** | **Supported** | `actentra_core.budgets` | Rate limits, call limits, write byte caps per session. |
-| **Policy Canary Diff Engine** | **Supported** | `actentra_core.canary` | Historical receipt replay against candidate policies to detect regressions. |
-| **Local HTTP Gateway & Approval UI** | **Supported** | `actentra_gateway.http_service` | Loopback-bound HTTP REST API and operator web console for approvals and audit. |
+| **Cumulative Session Budgets** | **Supported** | `actentra_core.budgets` | Rate limits, call limits, write byte caps per session; updated on internal and external execution. |
+| **Policy Canary Diff Engine** | **Supported** | `actentra_core.canary` | Historical receipt replay against candidate policies with temporal rate windows, provenance, and context integrity. |
+| **Local HTTP Gateway & Approval UI** | **Supported** | `actentra_gateway.http_service` | Loopback-bound REST API and operator web console with strictly typed fail-closed approvals and atomic outcome recording. |
 | **Persistent Pending Approvals** | **Supported** | `actentra_core.receipts` | SQLite-persisted pending approvals that survive gateway process restarts. |
 | **Signed Audit Checkpoints** | **Supported** | `actentra_core.checkpoints` | Ed25519 asymmetric signatures anchoring receipt log sequence and head hash. |
-| **DPAPI Secrets Broker** | **Supported** | `actentra.secrets` | Windows DPAPI native encryption for tool secrets; automatic redaction in errors. |
-| **Cryptographic Warrants (Capability Tokens)**| **Supported** | `actentra_core.warrants` | Ed25519-signed delegation tokens with expiration and scope verification. |
+| **DPAPI Secrets Broker** | **Experimental** | `actentra.secrets` | Windows DPAPI native encryption for tool secrets; automatic redaction in errors. Direct executor reference injection in progress. |
+| **Cryptographic Warrants (Capability Tokens)**| **Experimental** | `actentra_core.warrants` | Standalone Ed25519-signed delegation tokens with expiration and scope verification. End-to-end Boundary authorization binding in progress. |
 | **Agent Adapters (LangChain & Function Calling)** | **Supported** | `actentra.adapters` | Duck-typed tool wrappers and OpenAI/Anthropic call dictionary adapters. |
 | **Enterprise Remote Control Plane / SSO** | **Planned** | — | Non-goal for V2 local-first architecture. |
 | **Native Desktop Shell / Installer** | **Planned** | — | Deferred to post-beta based on user adoption. |

@@ -18,12 +18,12 @@
 - **Unified Local Operator Console:** 7-tab embedded offline web application at `/ui` (Overview, Approvals Inbox, Policy Viewer & Linter, Dry-Run Simulator, Paginated Receipts Explorer, Integrations, Settings).
 - **Bounded Paged Receipts & Offline Audit Bundles:** Paged queries, keyword search, and one-click JSON/JSONL export bundles with integrity verification.
 - **Zero LLM in the Enforcement Path:** Policy evaluation is 100% deterministic, reproducible, and explainable in sub-millisecond time.
-- **Strictly Fail-Closed & Local-Only Posture:** Loopback binding by default (`127.0.0.1`), origin isolation rejecting untrusted cross-origin browser requests, compulsory token auth for remote binding.
+- **Strictly Fail-Closed & Local-Only Posture:** Loopback binding by default (`127.0.0.1`), strictly typed fail-closed approval API, origin isolation rejecting untrusted cross-origin browser requests, compulsory token auth for remote binding.
 - **SSRF-Defended HTTP & Scoped Executors:** Built-in executors for Filesystem, SQLite, and HTTP with private IP / metadata blocking and parameter constraints.
 - **Dynamic Session Taint Tracking:** Automatically labels sessions tainted upon reading untrusted content (indirect prompt injection defense) and blocks untrusted network egress.
-- **Cumulative Session Budgets:** Enforces caps on total actions, write bytes, and external calls to prevent infinite loops and slow-drip exfiltration.
-- **Cryptographic Capability Warrants:** Scoped, expiring Ed25519-signed delegation tokens for subagents and distributed workers without ambient credentials.
-- **Policy Canary Diff Engine:** Replays recorded agent traffic against proposed policies to detect regressions with verified replay fidelity.
+- **Cumulative Session Budgets:** Enforces caps on total actions, write bytes, and external calls across both gateway and external executions to prevent infinite loops and slow-drip exfiltration.
+- **Cryptographic Capability Warrants (Experimental):** Scoped, expiring Ed25519-signed delegation tokens for subagents and distributed workers without ambient credentials.
+- **Policy Canary Diff Engine:** Replays recorded agent traffic against proposed policies to detect regressions with context integrity, provenance, and temporal window modeling.
 - **Standalone HTML Audit Reports:** Generates zero-external-CDN audit reports with SVG security badges and chronological timelines.
 - **Agent Framework Adapters:** First-class adapters for LangChain and OpenAI function calling.
 

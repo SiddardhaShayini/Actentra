@@ -368,7 +368,7 @@ def read_workspace_note(path: str) -> str:
         <tr><td><strong>Browser Origin Guard</strong></td><td><code>Restricted to Loopback (No Wildcard CORS)</code></td></tr>
         <tr><td><strong>Pending Approval Persistence</strong></td><td><code>SQLite WAL (Recovers across restarts)</code></td></tr>
         <tr><td><strong>Receipt Storage Mode</strong></td><td><code>SQLite WAL (Write-Ahead Logging)</code></td></tr>
-        <tr><td><strong>Hash Algorithm</strong></td><td><code>SHA-256 (Canonical JSON RFC 8785)</code></td></tr>
+        <tr><td><strong>Hash Algorithm</strong></td><td><code>SHA-256 (Deterministic UTF-8 Canonical JSON)</code></td></tr>
       </table>
     </div>
   </section>
@@ -508,7 +508,8 @@ async function resolveCrossing(cid, approved, execute) {
       refreshApprovals();
       loadHealth();
     } else {
-      alert('Failed to resolve crossing');
+      const errData = await res.json().catch(() => ({}));
+      alert('Failed to resolve crossing: ' + (errData.error || res.statusText || res.status));
     }
   } catch (e) { alert('Error: ' + e); }
 }

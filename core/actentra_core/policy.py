@@ -319,11 +319,15 @@ class PolicyEngine:
         self._frozen = False
 
     def _check_rate_limits(
-        self, envelope: ActionEnvelope, *, record: bool = True
+        self,
+        envelope: ActionEnvelope,
+        *,
+        record: bool = True,
+        timestamp: float | None = None,
     ) -> PolicyRule | None:
         if not self._policy.limits:
             return None
-        now = self._clock()
+        now = timestamp if timestamp is not None else self._clock()
         cutoff = now - 60.0
         for limit in self._policy.limits:
             scope_key = "global" if limit.scope == "global" else envelope.session_id
@@ -350,12 +354,18 @@ class PolicyEngine:
         return None
 
     def evaluate(
-        self, envelope: ActionEnvelope, *, record_rate_limit: bool = True
+        self,
+        envelope: ActionEnvelope,
+        *,
+        record_rate_limit: bool = True,
+        timestamp: float | None = None,
     ) -> Decision:
         """Evaluate an ActionEnvelope deterministically and return an explainable Decision.
 
         When record_rate_limit is False (such as in simulations or dry-run previews),
         rate limit consumption is not recorded to avoid mutating real-action allowances.
+        When timestamp is provided (such as in canary historical replays), the rate-limit
+        window evaluates against that specific point in time rather than current system clock.
         """
         risk_tags = assess_risk(envelope)
 
@@ -373,7 +383,9 @@ class PolicyEngine:
                 shadow=False,
             )
 
-        limit_hit = self._check_rate_limits(envelope, record=record_rate_limit)
+        limit_hit = self._check_rate_limits(
+            envelope, record=record_rate_limit, timestamp=timestamp
+        )
         if limit_hit is not None:
             return self._finalize_decision(
                 evaluated_verdict=limit_hit.verdict,

@@ -4,7 +4,7 @@
 
 Actentra is a planned lightweight, local-first execution boundary for AI agents. It mediates consequential tool actions through deterministic policy checks, optional human approval, constrained execution, and tamper-evident audit records. Enforcement must not depend on an LLM. The current plan prioritizes an in-process Python SDK and a narrowly scoped MVP before adding a daemon, HTTP API, or more connectors.
 
-The project is at **Phase 0**. Its chosen project name is **Actentra**; this is not a claim of trademark, domain, or package-name clearance. See [PLAN.md](./PLAN.md) for the architecture, threat model, roadmap, resource targets, and remaining decisions.
+The project has evolved into a functional local-first authorization engine and operator console prototype (V3 Foundation & Core). See [PLAN_V3.md](./PLAN_V3.md) for the strategic engineering roadmap and current backlog, [docs/product-status.md](./docs/product-status.md) for the authoritative capability matrix, and [PLAN.md](./PLAN.md) for architectural foundations.
 
 ## Required context for agents
 
@@ -230,3 +230,40 @@ Agents working on this project must maintain this file as the durable handoff:
   - On busy GitHub Actions shared Windows runners, the initial wall-clock 0.05s TTL lapsed during `resolve_pending_approval`, causing an intermittent test failure (`assert 'expired' == 'approved'`).
   - Replaced wall-clock `time.sleep` with a deterministic `monkeypatch` over `time.time()`, advancing simulated time explicitly.
   - Validation: all 14 remediation tests and 103 total tests passed cleanly in under 5 seconds.
+
+### 2026-11-14 19:10 IST
+
+- Implemented V3 Foundation and Core Product enhancements following `PLAN_V3.md`:
+  - **P0 — Strict Approval API & Endpoint Hardening (`http_service.py`):**
+    - Enforced mandatory, strictly typed JSON boolean validation for `approved` in `/v1/crossings/<id>/approve`. Rejects empty `{}` payloads, missing fields, malformed JSON, strings (`"true"`), and integers (`1`) with HTTP 400 Bad Request.
+    - Enforced boolean type validation on `execute` parameter.
+    - Hardened `/v1/crossings/<id>/outcome` to validate `status` in `('success', 'failure', 'unknown')`, return HTTP 409 Conflict for duplicate reports, and HTTP 404 for missing crossings.
+  - **P1 — Atomic Outcome Recording & Caller-Reported Evidence (`receipts.py`, `services.py`):**
+    - Added partial unique index `idx_receipts_unique_outcome ON receipts(crossing_id) WHERE record_type = 'outcome'` in SQLite schema.
+    - Inside `ReceiptStore._append_record`, atomic check within `BEGIN IMMEDIATE;` transaction and unique constraint eliminates race conditions on duplicate outcome reporting.
+    - External outcomes are labeled with `reason="caller-reported"` (stored in SQLite and cryptographically hashed into `entry_hash`), and responses return `"reported_by": "caller"`.
+    - Successful external outcome reports now increment the cumulative session budget counters in `SessionBudgetTracker`.
+  - **P1 — Action Envelope Context Integrity (`receipts.py`, `services.py`):**
+    - Added integrity verification in `ReceiptStore.get_envelope(crossing_id, verify_integrity=True)`, recomputing the action hash from stored envelope JSON and checking against `canonical_hash`.
+    - Added `verify_envelopes: bool = False` option to `verify_log()`, verifying that all decision receipts have matching, un-tampered action envelopes in `action_envelopes`. Integrated into `AppServices.get_health(full_verify=True)` and `verify_audit_log(verify_envelopes=True)`.
+  - **P1 — Dry-Run Session & Taint Propagation (`boundary.py`, `services.py`):**
+    - Updated `Boundary.dry_run()` and `AppServices.simulate_dry_run()` to accept `session_id` and `agent_id`.
+    - Evaluates dry-run actions against the requested session's taint, ensuring untrusted sessions trigger taint-matching rules during simulation while remaining completely side-effect-free.
+  - **P1 — Faithful Policy Canary Replay (`canary.py`, `policy.py`):**
+    - Reconstructed complete `ActionEnvelope` context in `run_policy_canary`: restored `provenance`, `intent`, `framework`, `model`, `idempotency_key`, and `ts`.
+    - Verified envelope action hash matches the decision receipt's `canonical_hash`.
+    - Added historical timestamp rate-limit evaluation (`PolicyEngine.evaluate(..., timestamp=hist_time)`), preventing false rate-limit spikes from rapid sequential replay.
+    - Tracked cumulative session budget during canary replay.
+    - Added `fidelity_warnings` to `CanarySummary` when context is missing or unverifiable.
+  - **P2 — Operator Web Console Updates (`console.html`):**
+    - Corrected RFC 8785 claim: replaced label with `SHA-256 (Deterministic UTF-8 Canonical JSON)`.
+    - Surfaced specific server error responses in `resolveCrossing`.
+  - **P1 — Documentation Alignment (`docs/product-status.md`, `PLAN.md`, `README.md`):**
+    - Updated `docs/product-status.md` feature matrix: labeled DPAPI Secrets Broker and Warrants as **Experimental** to accurately reflect current integration depth; updated notes for canary and local gateway.
+    - Updated status line in `PLAN.md` referencing `PLAN_V3.md`.
+    - Updated `README.md` feature highlights.
+  - **Validation & Test Suite:**
+    - Added 8 new unit/integration tests across `test_http_service.py`, `test_security_review_remediations.py`, `test_dry_run_and_taint.py`, and `test_canary.py`.
+    - Total tests: 111 passed, 3 skipped, 0 failures.
+    - Ruff: All checks passed.
+    - Mypy: Success (0 errors in 28 source files).

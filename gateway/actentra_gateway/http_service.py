@@ -284,7 +284,14 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid body: {exc}"})
                 return
 
-            execute = bool(data.get("execute", False))
+            raw_execute = data.get("execute", False)
+            if not isinstance(raw_execute, bool):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "Field 'execute' must be a JSON boolean if provided"},
+                )
+                return
+            execute = raw_execute
             resp = services.submit_crossing(data, execute=execute)
             status_code = HTTPStatus.OK if "error" not in resp else HTTPStatus.BAD_REQUEST
             self._send_json(status_code, resp)
@@ -294,11 +301,34 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             crossing_id = path[len("/v1/crossings/") : -len("/approve")]
             try:
                 data = self._read_json_body()
-            except Exception:
-                data = {}
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid body: {exc}"})
+                return
 
-            approved = bool(data.get("approved", True))
-            execute = bool(data.get("execute", False))
+            if "approved" not in data:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "Missing required field 'approved'"},
+                )
+                return
+
+            approved = data["approved"]
+            if not isinstance(approved, bool):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "Field 'approved' must be a JSON boolean (true or false)"},
+                )
+                return
+
+            raw_execute = data.get("execute", False)
+            if not isinstance(raw_execute, bool):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "Field 'execute' must be a JSON boolean if provided"},
+                )
+                return
+            execute = raw_execute
+
             res = services.resolve_approval(crossing_id, approved=approved, execute=execute)
             if "error" in res:
                 self._send_json(HTTPStatus.NOT_FOUND, res)
@@ -321,11 +351,18 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid body: {exc}"})
                 return
 
-            status_val = data.get("status", "unknown")
+            if "status" not in data:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "Missing required field 'status'"},
+                )
+                return
+
+            status_val = data.get("status")
             if status_val not in ("success", "failure", "unknown"):
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
-                    {"error": "status must be success, failure, or unknown"},
+                    {"error": "Field 'status' must be one of: 'success', 'failure', 'unknown'"},
                 )
                 return
 
@@ -335,6 +372,17 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 result_hash=data.get("result_hash"),
                 error=data.get("error"),
             )
+            if "error" in res:
+                err_msg = str(res.get("error", "")).lower()
+                if "already recorded" in err_msg:
+                    status_code = HTTPStatus.CONFLICT
+                elif "not found" in err_msg:
+                    status_code = HTTPStatus.NOT_FOUND
+                else:
+                    status_code = HTTPStatus.BAD_REQUEST
+                self._send_json(status_code, res)
+                return
+
             self._send_json(HTTPStatus.OK, res)
             return
 

@@ -18,6 +18,7 @@ Covers:
 from __future__ import annotations
 
 import io
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,7 @@ import pytest
 from actentra.boundary import Boundary
 from actentra_core.envelope import build_envelope
 from actentra_core.policy import load_policy_yaml
-from actentra_core.receipts import ReceiptStore
+from actentra_core.receipts import ReceiptStore, verify_log
 from actentra_executors.fs import ExecutorError
 from actentra_executors.http import ScopedHTTPExecutor, SSRFSafeRedirectHandler
 from actentra_executors.sqlite import ScopedSQLiteExecutor, _infer_verb
@@ -495,11 +496,154 @@ def test_external_outcome_prevents_duplicate_and_verifies_decision(tmp_path: Pat
     # First outcome report succeeds
     r_ok = services.record_external_outcome(allow_cid, status="success")
     assert r_ok.get("status") == "recorded"
+    assert r_ok.get("reported_by") == "caller"
 
     # Duplicate outcome report is rejected
     r_dup = services.record_external_outcome(allow_cid, status="success")
     assert "error" in r_dup
     assert "Outcome already recorded" in r_dup["error"]
+
+    # Verify stored outcome record has reason="caller-reported"
+    records = store.iter_records()
+    outcome_recs = [r for r in records if r.record_type == "outcome" and r.crossing_id == allow_cid]
+    assert len(outcome_recs) == 1
+    assert outcome_recs[0].reason == "caller-reported"
+
+
+def test_concurrent_external_outcome_reports_yields_at_most_one(tmp_path: Path) -> None:
+    """Concurrent external outcome submissions yield exactly one recorded outcome."""
+    db_path = tmp_path / "f8_concurrent.db"
+    store = ReceiptStore(db_path)
+    policy = load_policy_yaml(_base_policy_yaml())
+    boundary = Boundary(policy=policy, receipt_store=store, session_id="sess-concurrent")
+    services = AppServices(boundary)
+
+    crossing = services.submit_crossing(
+        {"tool": "dummy.run", "verb": "read", "resource": "res-concurrent"}
+    )
+    cid = crossing["crossing_id"]
+    assert crossing["verdict"] == "allow"
+
+    results: list[dict[str, Any]] = []
+    errors: list[Exception] = []
+
+    def _worker() -> None:
+        try:
+            res = services.record_external_outcome(cid, status="success")
+            results.append(res)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_worker) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    successes = [r for r in results if r.get("status") == "recorded"]
+    failures = [r for r in results if "error" in r]
+    assert len(successes) == 1
+    assert len(failures) == 9
+    for f in failures:
+        assert "Outcome already recorded" in f["error"]
+
+    # Verify store has exactly 1 outcome record
+    outcomes = [
+        r for r in store.iter_records()
+        if r.record_type == "outcome" and r.crossing_id == cid
+    ]
+    assert len(outcomes) == 1
+
+
+def test_external_outcome_updates_cumulative_session_budget(tmp_path: Path) -> None:
+    """External execution outcome reporting consumes session cumulative budget."""
+    db_path = tmp_path / "f8_budget.db"
+    store = ReceiptStore(db_path)
+    policy = load_policy_yaml(_base_policy_yaml())
+    boundary = Boundary(policy=policy, receipt_store=store, session_id="sess-ext-budget")
+    services = AppServices(boundary)
+
+    # Initial usage
+    stats0 = boundary.engine.budget_tracker.get_session_stats("sess-ext-budget")
+    assert stats0["actions_count"] == 0
+
+    # 1. Propose and allow action 1
+    sub1 = services.submit_crossing(
+        {"tool": "dummy.run", "verb": "read", "resource": "res1", "session_id": "sess-ext-budget"}
+    )
+    cid1 = sub1["crossing_id"]
+    assert sub1["verdict"] == "allow"
+
+    # Outcome reported as success -> budget increments
+    services.record_external_outcome(cid1, status="success")
+    stats1 = boundary.engine.budget_tracker.get_session_stats("sess-ext-budget")
+    assert stats1["actions_count"] == 1
+
+    # 2. Propose and allow action 2
+    sub2 = services.submit_crossing(
+        {"tool": "dummy.run", "verb": "read", "resource": "res2", "session_id": "sess-ext-budget"}
+    )
+    cid2 = sub2["crossing_id"]
+    assert sub2["verdict"] == "allow"
+    services.record_external_outcome(cid2, status="success")
+    stats2 = boundary.engine.budget_tracker.get_session_stats("sess-ext-budget")
+    assert stats2["actions_count"] == 2
+
+    # 3. Third action exceeds max_actions (budget is 2) -> blocked by budget!
+    sub3 = services.submit_crossing(
+        {"tool": "dummy.run", "verb": "read", "resource": "res3", "session_id": "sess-ext-budget"}
+    )
+    assert sub3["verdict"] == "deny"
+    assert "budget:max-actions-exceeded" in sub3["rule_id"]
+
+
+def test_stored_envelope_context_integrity_verification(tmp_path: Path) -> None:
+    """Tampering with stored action envelope is detected during verification and retrieval."""
+    db_path = tmp_path / "f8_envelope_integrity.db"
+    store = ReceiptStore(db_path)
+    policy = load_policy_yaml(_base_policy_yaml())
+    boundary = Boundary(policy=policy, receipt_store=store, session_id="sess-integrity")
+    services = AppServices(boundary)
+
+    sub = services.submit_crossing(
+        {"tool": "dummy.run", "verb": "read", "resource": "res-intact"}
+    )
+    cid = sub["crossing_id"]
+
+    # Retrieval of untampered envelope succeeds
+    env_clean = store.get_envelope(cid, verify_integrity=True)
+    assert env_clean is not None
+    assert env_clean["action"]["resource"] == "res-intact"
+
+    # Full log verification with envelope verification passes
+    vr_clean = verify_log(db_path, verify_envelopes=True)
+    assert vr_clean.ok is True
+    assert len(vr_clean.errors) == 0
+
+    # Tamper with the envelope in SQLite (change resource)
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    cur = conn.execute("SELECT envelope_json FROM action_envelopes WHERE crossing_id = ?;", (cid,))
+    raw_json = cur.fetchone()[0]
+    import json
+    data = json.loads(raw_json)
+    data["action"]["resource"] = "res-TAMPERED"
+    conn.execute(
+        "UPDATE action_envelopes SET envelope_json = ? WHERE crossing_id = ?;",
+        (json.dumps(data), cid),
+    )
+    conn.commit()
+    conn.close()
+
+    # get_envelope with verify_integrity=True detects hash mismatch and returns None
+    env_tampered = store.get_envelope(cid, verify_integrity=True)
+    assert env_tampered is None
+
+    # verify_log with verify_envelopes=True detects the altered context
+    vr_tampered = verify_log(db_path, verify_envelopes=True)
+    assert vr_tampered.ok is False
+    assert any("envelope action hash mismatch" in err for err in vr_tampered.errors)
 
 
 # --- Finding 9: Bounded Receipt Queries ---

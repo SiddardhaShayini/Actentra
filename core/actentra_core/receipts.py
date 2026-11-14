@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from actentra_core.canonicalize import canonicalize_json, hash_canonical
-from actentra_core.envelope import ActionEnvelope, utc_now_iso
+from actentra_core.envelope import (
+    ActionEnvelope,
+    ActionSpec,
+    compute_action_hash,
+    utc_now_iso,
+)
 from actentra_core.verdict import Decision
 
 GENESIS_HASH = "sha256:" + ("0" * 64)
@@ -205,6 +210,13 @@ class ReceiptStore:
             )
             conn.execute(
                 """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_unique_outcome
+                ON receipts(crossing_id)
+                WHERE record_type = 'outcome';
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS action_envelopes (
                     crossing_id TEXT PRIMARY KEY,
                     envelope_json TEXT NOT NULL
@@ -267,6 +279,15 @@ class ReceiptStore:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
+            if record_type == "outcome":
+                existing = conn.execute(
+                    "SELECT seq FROM receipts "
+                    "WHERE crossing_id = ? AND record_type = 'outcome' LIMIT 1;",
+                    (crossing_id,),
+                ).fetchone()
+                if existing is not None:
+                    raise ReceiptError(f"Outcome already recorded for crossing '{crossing_id}'")
+
             row = conn.execute(
                 "SELECT seq, entry_hash FROM receipts ORDER BY seq DESC LIMIT 1;"
             ).fetchone()
@@ -337,7 +358,15 @@ class ReceiptStore:
         except sqlite3.Error as exc:
             with contextlib.suppress(sqlite3.Error):
                 conn.execute("ROLLBACK;")
+            if "UNIQUE constraint failed" in str(exc) and record_type == "outcome":
+                raise ReceiptError(
+                    f"Outcome already recorded for crossing '{crossing_id}'"
+                ) from exc
             raise ReceiptError(f"Failed to commit receipt record: {exc}") from exc
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise
         finally:
             conn.close()
 
@@ -379,11 +408,18 @@ class ReceiptStore:
             status=None,
             result_hash=None,
             error=None,
+            ts=envelope.ts,
             envelope=envelope,
         )
 
-    def get_envelope(self, crossing_id: str) -> dict[str, Any] | None:
-        """Retrieve stored envelope payload for a crossing if available."""
+    def get_envelope(
+        self, crossing_id: str, *, verify_integrity: bool = True
+    ) -> dict[str, Any] | None:
+        """Retrieve stored envelope payload for a crossing if available.
+
+        If verify_integrity is True, checks that the stored action payload's
+        recomputed canonical hash matches the recorded canonical_hash.
+        """
         conn = self._connect()
         try:
             cur = conn.execute(
@@ -393,7 +429,28 @@ class ReceiptStore:
             row = cur.fetchone()
             if row and row[0]:
                 data = json.loads(row[0])
-                return data if isinstance(data, dict) else None
+                if not isinstance(data, dict):
+                    return None
+                if verify_integrity and "canonical_hash" in data:
+                    action_data = data.get("action")
+                    agent_data = data.get("agent")
+                    if isinstance(action_data, dict) and isinstance(agent_data, dict):
+                        act_spec = ActionSpec(
+                            tool=str(action_data.get("tool", "")),
+                            verb=str(action_data.get("verb", "other")),
+                            resource=str(action_data.get("resource", "")),
+                            params=action_data.get("params") or {},
+                            idempotency_key=action_data.get("idempotency_key"),
+                        )
+                        computed = compute_action_hash(
+                            envelope_version=str(data.get("envelope_version", "1")),
+                            session_id=str(data.get("session_id", "")),
+                            agent_id=str(agent_data.get("id", "")),
+                            action=act_spec,
+                        )
+                        if computed != data["canonical_hash"]:
+                            return None
+                return data
             return None
         except sqlite3.Error:
             return None
@@ -410,11 +467,13 @@ class ReceiptStore:
         status: OutcomeStatus,
         result_hash: str | None = None,
         error: str | None = None,
+        reason: str | None = None,
     ) -> ReceiptRecord:
         """Append an immutable post-execution outcome record (success, failure, or unknown)."""
         if status not in _VALID_OUTCOMES:
             raise ReceiptError(f"Invalid outcome status: {status!r}")
         safe_error = error[:1000] if error is not None else None
+        safe_reason = reason[:1000] if reason is not None else None
         return self._append_record(
             record_type="outcome",
             crossing_id=crossing_id,
@@ -423,7 +482,7 @@ class ReceiptStore:
             policy_version=policy_version,
             verdict=None,
             rule_id=None,
-            reason=None,
+            reason=safe_reason,
             risk_tags=(),
             shadow=False,
             status=status,
@@ -968,8 +1027,14 @@ class ReceiptStore:
         return records, total_count
 
 
-def verify_log(db_path: str | Path) -> VerificationResult:
-    """Verify hash-chain integrity, sequence continuity, and record digests."""
+def verify_log(
+    db_path: str | Path, *, verify_envelopes: bool = False
+) -> VerificationResult:
+    """Verify hash-chain integrity, sequence continuity, and record digests.
+
+    If verify_envelopes is True, additionally verifies that stored action envelopes
+    exist for each decision receipt and their recomputed action hash matches the decision.
+    """
     path = Path(db_path)
     if not path.exists():
         return VerificationResult(
@@ -995,38 +1060,93 @@ def verify_log(db_path: str | Path) -> VerificationResult:
     expected_seq = 1
     last_hash = GENESIS_HASH
 
-    for rec in records:
-        if rec.seq != expected_seq:
-            errors.append(f"seq {rec.seq}: expected sequence number {expected_seq}")
-        if rec.prev_hash != expected_prev:
-            errors.append(
-                f"seq {rec.seq}: prev_hash mismatch (expected {expected_prev}, got {rec.prev_hash})"
+    conn: sqlite3.Connection | None = None
+    if verify_envelopes:
+        try:
+            conn = store._connect()
+        except sqlite3.Error:
+            conn = None
+
+    try:
+        for rec in records:
+            if rec.seq != expected_seq:
+                errors.append(f"seq {rec.seq}: expected sequence number {expected_seq}")
+            if rec.prev_hash != expected_prev:
+                errors.append(
+                    f"seq {rec.seq}: prev_hash mismatch "
+                    f"(expected {expected_prev}, got {rec.prev_hash})"
+                )
+            computed = _compute_entry_hash(
+                seq=rec.seq,
+                record_type=rec.record_type,
+                crossing_id=rec.crossing_id,
+                session_id=rec.session_id,
+                canonical_hash=rec.canonical_hash,
+                policy_version=rec.policy_version,
+                verdict=rec.verdict,
+                rule_id=rec.rule_id,
+                reason=rec.reason,
+                risk_tags=rec.risk_tags,
+                shadow=rec.shadow,
+                status=rec.status,
+                result_hash=rec.result_hash,
+                error=rec.error,
+                ts=rec.ts,
+                prev_hash=rec.prev_hash,
             )
-        computed = _compute_entry_hash(
-            seq=rec.seq,
-            record_type=rec.record_type,
-            crossing_id=rec.crossing_id,
-            session_id=rec.session_id,
-            canonical_hash=rec.canonical_hash,
-            policy_version=rec.policy_version,
-            verdict=rec.verdict,
-            rule_id=rec.rule_id,
-            reason=rec.reason,
-            risk_tags=rec.risk_tags,
-            shadow=rec.shadow,
-            status=rec.status,
-            result_hash=rec.result_hash,
-            error=rec.error,
-            ts=rec.ts,
-            prev_hash=rec.prev_hash,
-        )
-        if computed != rec.entry_hash:
-            errors.append(
-                f"seq {rec.seq}: entry_hash mismatch (computed {computed}, stored {rec.entry_hash})"
-            )
-        expected_prev = rec.entry_hash
-        last_hash = rec.entry_hash
-        expected_seq += 1
+            if computed != rec.entry_hash:
+                errors.append(
+                    f"seq {rec.seq}: entry_hash mismatch "
+                    f"(computed {computed}, stored {rec.entry_hash})"
+                )
+
+            if verify_envelopes and rec.record_type == "decision" and conn is not None:
+                cur = conn.execute(
+                    "SELECT envelope_json FROM action_envelopes WHERE crossing_id = ?;",
+                    (rec.crossing_id,),
+                )
+                env_row = cur.fetchone()
+                if env_row is None or not env_row[0]:
+                    errors.append(
+                        f"seq {rec.seq} (crossing {rec.crossing_id}): "
+                        "missing stored action envelope"
+                    )
+                else:
+                    try:
+                        env_data = json.loads(env_row[0])
+                        action_data = env_data.get("action") or {}
+                        agent_data = env_data.get("agent") or {}
+                        act_spec = ActionSpec(
+                            tool=str(action_data.get("tool", "")),
+                            verb=str(action_data.get("verb", "other")),
+                            resource=str(action_data.get("resource", "")),
+                            params=action_data.get("params") or {},
+                            idempotency_key=action_data.get("idempotency_key"),
+                        )
+                        computed_act_hash = compute_action_hash(
+                            envelope_version=str(env_data.get("envelope_version", "1")),
+                            session_id=str(env_data.get("session_id", "")),
+                            agent_id=str(agent_data.get("id", "")),
+                            action=act_spec,
+                        )
+                        if computed_act_hash != rec.canonical_hash:
+                            errors.append(
+                                f"seq {rec.seq} (crossing {rec.crossing_id}): "
+                                "envelope action hash mismatch "
+                                f"(computed {computed_act_hash}, receipt {rec.canonical_hash})"
+                            )
+                    except Exception as exc:
+                        errors.append(
+                            f"seq {rec.seq} (crossing {rec.crossing_id}): "
+                            f"envelope verification error: {exc}"
+                        )
+
+            expected_prev = rec.entry_hash
+            last_hash = rec.entry_hash
+            expected_seq += 1
+    finally:
+        if conn is not None:
+            conn.close()
 
     return VerificationResult(
         ok=len(errors) == 0,

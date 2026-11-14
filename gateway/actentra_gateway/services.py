@@ -6,6 +6,7 @@ canary simulations, and audit reporting for both the CLI and Local Web UI.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from collections.abc import Callable
@@ -89,7 +90,7 @@ class AppServices:
         db_path = self.boundary.receipt_store.db_path
         pending_list = self.boundary.receipt_store.list_pending_approvals(status="pending")
         if full_verify:
-            vr = verify_log(db_path)
+            vr = verify_log(db_path, verify_envelopes=True)
             total_records = vr.total_records
             integrity_ok = vr.ok
             last_hash = vr.last_hash
@@ -121,14 +122,25 @@ class AppServices:
         execute: bool = False,
     ) -> dict[str, Any]:
         """Propose, canonicalize, evaluate, and conditionally execute an action."""
-        session_id = str(data.get("session_id", "default"))
+        session_id = str(data.get("session_id", "default")).strip() or "default"
+        if len(session_id) > 128:
+            return {
+                "verdict": Verdict.HOLD.value,
+                "error": "session_id exceeds maximum length of 128 characters",
+                "rule_id": "kernel:session-id-too-long",
+                "canonical_hash": "sha256:" + ("0" * 64),
+                "risk_tags": [],
+            }
         prov_items = [
             ProvenanceItem(source=p["source"], trust=p["trust"])
             for p in data.get("provenance", [])
             if isinstance(p, dict) and "source" in p and "trust" in p
         ]
-        # Propagate session taint across gateway crossings (Finding 5)
-        if not prov_items and self.boundary.get_session_taint(session_id) == "untrusted":
+        # Propagate session taint across gateway crossings
+        # (cannot be bypassed by declared provenance)
+        if self.boundary.get_session_taint(session_id) == "untrusted" and not any(
+            p.trust == "untrusted" for p in prov_items
+        ):
             prov_items.append(ProvenanceItem(source="session", trust="untrusted"))
 
         try:
@@ -400,16 +412,12 @@ class AppServices:
         error: str | None = None,
     ) -> dict[str, Any]:
         """Record outcome receipt for an externally executed crossing."""
-        # Finding 8: Prevent duplicate outcome reporting
-        if self.boundary.receipt_store.has_outcome_receipt(crossing_id):
-            return {"error": f"Outcome already recorded for crossing '{crossing_id}'"}
-
-        # Finding 8: Verify corresponding decision receipt exists
+        # Check corresponding decision receipt exists
         dec_rec = self.boundary.receipt_store.get_decision_receipt(crossing_id)
         if dec_rec is None:
-            return {"error": f"No decision receipt found for crossing '{crossing_id}'"}
+            return {"error": f"Decision receipt not found for crossing '{crossing_id}'"}
 
-        # Finding 8: Verify that the decision permitted execution
+        # Verify that the decision permitted execution
         if dec_rec.verdict not in ("allow", "allow_with_constraints"):
             return {
                 "error": (
@@ -422,16 +430,48 @@ class AppServices:
         if raw_env is None:
             return {"error": f"Crossing '{crossing_id}' not found in store"}
 
-        rec = self.boundary.receipt_store.record_outcome(
-            crossing_id=crossing_id,
-            session_id=raw_env["session_id"],
-            canonical_hash=raw_env["canonical_hash"],
-            policy_version=self.boundary.engine.policy.policy_version,
-            status=status,
-            result_hash=result_hash,
-            error=error,
-        )
-        return {"status": "recorded", "outcome_seq": rec.seq, "entry_hash": rec.entry_hash}
+        try:
+            rec = self.boundary.receipt_store.record_outcome(
+                crossing_id=crossing_id,
+                session_id=raw_env["session_id"],
+                canonical_hash=raw_env["canonical_hash"],
+                policy_version=self.boundary.engine.policy.policy_version,
+                status=status,
+                result_hash=result_hash,
+                error=error,
+                reason="caller-reported",
+            )
+        except Exception as exc:
+            return {"error": str(exc)}
+
+        # Update session cumulative budgets for successful external execution
+        if status == "success":
+            action_data = raw_env.get("action") or {}
+            agent_data = raw_env.get("agent") or {}
+            prov_items = [
+                ProvenanceItem(source=item["source"], trust=item["trust"])
+                for item in raw_env.get("provenance", [])
+                if isinstance(item, dict) and "source" in item and "trust" in item
+            ]
+            with contextlib.suppress(Exception):
+                env = build_envelope(
+                    tool=str(action_data.get("tool", "")),
+                    verb=str(action_data.get("verb", "other")),
+                    resource=str(action_data.get("resource", "")),
+                    params=action_data.get("params") or {},
+                    session_id=str(raw_env.get("session_id", "default")),
+                    agent_id=str(agent_data.get("id", "http-client")),
+                    provenance=prov_items,
+                    crossing_id=crossing_id,
+                )
+                self.boundary.engine.budget_tracker.record_usage(env)
+
+        return {
+            "status": "recorded",
+            "outcome_seq": rec.seq,
+            "entry_hash": rec.entry_hash,
+            "reported_by": "caller",
+        }
 
     # --- 4. Policy, Linting, & Canary ---
 
@@ -537,6 +577,7 @@ class AppServices:
             verb=verb,
             resource=resource,
             params=params or {},
+            session_id=session_id,
             provenance=prov_items,
             record_receipt=False,
         )
@@ -574,9 +615,9 @@ class AppServices:
             "offset": offset,
         }
 
-    def verify_audit_log(self) -> dict[str, Any]:
-        """Verify receipt log hash-chain integrity."""
-        vr = verify_log(self.boundary.receipt_store.db_path)
+    def verify_audit_log(self, *, verify_envelopes: bool = True) -> dict[str, Any]:
+        """Verify receipt log hash-chain and envelope integrity."""
+        vr = verify_log(self.boundary.receipt_store.db_path, verify_envelopes=verify_envelopes)
         return {
             "ok": vr.ok,
             "total_records": vr.total_records,

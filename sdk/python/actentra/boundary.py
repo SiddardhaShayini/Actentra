@@ -197,6 +197,8 @@ class Boundary:
         verb: str,
         resource: str,
         params: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        agent_id: str | None = None,
         user_goal: str | None = None,
         declared_by: Literal["human", "agent", "system"] = "agent",
         provenance: list[ProvenanceItem] | tuple[ProvenanceItem, ...] = (),
@@ -207,8 +209,12 @@ class Boundary:
         Evaluates policy, risk tags, and session budgets. If record_receipt is True,
         records a shadow decision receipt into the receipt store for auditing.
         """
+        effective_session = session_id or self._session_id
+        effective_agent = agent_id or self._agent_id
         prov_items = list(provenance)
-        if not prov_items and self._session_taints.get(self._session_id) == "untrusted":
+        if self.get_session_taint(effective_session) == "untrusted" and not any(
+            p.trust == "untrusted" for p in prov_items
+        ):
             prov_items.append(ProvenanceItem(source="session", trust="untrusted"))
 
         envelope = build_envelope(
@@ -216,8 +222,8 @@ class Boundary:
             verb=verb,
             resource=resource,
             params=params,
-            session_id=self._session_id,
-            agent_id=self._agent_id,
+            session_id=effective_session,
+            agent_id=effective_agent,
             framework=self._framework,
             model=self._model,
             user_goal=user_goal,
@@ -258,7 +264,9 @@ class Boundary:
     ) -> Any:
         """Evaluate an action, record a durable decision, enforce verdict, and record outcome."""
         prov_items = list(provenance)
-        if not prov_items and self._session_taints.get(self._session_id) == "untrusted":
+        if self.get_session_taint(self._session_id) == "untrusted" and not any(
+            p.trust == "untrusted" for p in prov_items
+        ):
             prov_items.append(ProvenanceItem(source="session", trust="untrusted"))
 
         try:

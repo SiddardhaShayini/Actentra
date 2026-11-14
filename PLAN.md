@@ -2,7 +2,7 @@
 
 ### Vision & Master Plan v2
 
-**Status:** Phase 0 · **Build target:** Windows 11, Intel i5, 8 GB RAM, CPU-only · **Motto:** *Intelligence proposes. Actentra decides.*
+**Status:** V3 Operational Prototype (Evolved beyond Phase 0; see PLAN_V3.md for the normative strategic engineering roadmap) · **Build target:** Windows 11, Intel i5, 8 GB RAM, CPU-only · **Motto:** *Intelligence proposes. Actentra decides.*
 
 ---
 

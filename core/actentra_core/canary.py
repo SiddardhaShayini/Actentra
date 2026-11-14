@@ -7,10 +7,11 @@ verdict shifts, permission regressions, and escalated approvals before deploymen
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from actentra_core.envelope import build_envelope
+from actentra_core.envelope import ProvenanceItem, build_envelope
 from actentra_core.policy import PolicyEngine, PolicyPack
 from actentra_core.receipts import ReceiptStore
 from actentra_core.verdict import VERDICT_PRECEDENCE, Verdict
@@ -55,6 +56,7 @@ class CanarySummary:
     rule_changed_count: int
     diffs: tuple[CanaryDiffItem, ...]
     missing_context_count: int = 0
+    fidelity_warnings: tuple[str, ...] = ()
 
     @property
     def has_regressions(self) -> bool:
@@ -71,6 +73,7 @@ class CanarySummary:
             "less_restrictive_count": self.less_restrictive_count,
             "rule_changed_count": self.rule_changed_count,
             "missing_context_count": self.missing_context_count,
+            "fidelity_warnings": list(self.fidelity_warnings),
             "has_regressions": self.has_regressions,
             "diffs": [d.to_dict() for d in self.diffs],
         }
@@ -133,12 +136,29 @@ def run_policy_canary(
 
         action_data = env_dict.get("action") or {}
         agent_data = env_dict.get("agent") or {}
+        intent_data = env_dict.get("intent") or {}
 
         tool = str(action_data.get("tool", ""))
         verb = str(action_data.get("verb", "other"))
         resource = str(action_data.get("resource", ""))
         params = action_data.get("params") or {}
         agent_id = str(agent_data.get("id", "canary-agent"))
+        framework = str(agent_data.get("framework", "custom"))
+        model = str(agent_data.get("model", "unknown"))
+        idempotency_key = action_data.get("idempotency_key")
+        user_goal = intent_data.get("user_goal")
+        raw_declared_by = intent_data.get("declared_by", "agent")
+        declared_by: Literal["human", "agent", "system"] = (
+            raw_declared_by
+            if raw_declared_by in ("human", "agent", "system")
+            else "agent"
+        )
+
+        prov_items = [
+            ProvenanceItem(source=item["source"], trust=item["trust"])
+            for item in env_dict.get("provenance", [])
+            if isinstance(item, dict) and "source" in item and "trust" in item
+        ]
 
         try:
             envelope = build_envelope(
@@ -148,6 +168,14 @@ def run_policy_canary(
                 params=params,
                 session_id=rec.session_id,
                 agent_id=agent_id,
+                framework=framework,
+                model=model,
+                user_goal=user_goal,
+                declared_by=declared_by,
+                provenance=prov_items,
+                idempotency_key=idempotency_key,
+                crossing_id=rec.crossing_id,
+                ts=env_dict.get("ts", rec.ts),
             )
         except Exception:  # noqa: S112
             missing_context += 1
@@ -167,7 +195,37 @@ def run_policy_canary(
             )
             continue
 
-        cand_dec = engine.evaluate(envelope)
+        # Verify envelope action hash matches the decision receipt's canonical_hash
+        if envelope.canonical_hash != rec.canonical_hash:
+            missing_context += 1
+            diffs.append(
+                CanaryDiffItem(
+                    crossing_id=rec.crossing_id,
+                    session_id=rec.session_id,
+                    tool=tool,
+                    verb=verb,
+                    resource=resource,
+                    original_verdict=orig_verdict_str,
+                    candidate_verdict="integrity_mismatch",
+                    original_rule=orig_rule,
+                    candidate_rule="none",
+                    delta_type="missing_context",
+                )
+            )
+            continue
+
+        hist_time: float | None = None
+        try:
+            ts_raw = env_dict.get("ts") or rec.ts
+            ts_iso = str(ts_raw).replace("Z", "+00:00")
+            hist_time = datetime.fromisoformat(ts_iso).timestamp()
+        except Exception:
+            hist_time = None
+
+        cand_dec = engine.evaluate(envelope, record_rate_limit=True, timestamp=hist_time)
+        if cand_dec.verdict.permits_execution:
+            engine.budget_tracker.record_usage(envelope)
+
         cand_verdict_str = cand_dec.verdict.value
 
         try:
@@ -216,6 +274,13 @@ def run_policy_canary(
                 )
             )
 
+    warnings: list[str] = []
+    if missing_context > 0:
+        warnings.append(
+            f"{missing_context} historical decision(s) had missing or "
+            "unverifiable envelope context; canary evaluation is advisory."
+        )
+
     return CanarySummary(
         candidate_policy_id=candidate_policy.policy_id,
         candidate_policy_version=candidate_policy.policy_version,
@@ -226,4 +291,5 @@ def run_policy_canary(
         rule_changed_count=rule_changed,
         diffs=tuple(diffs),
         missing_context_count=missing_context,
+        fidelity_warnings=tuple(warnings),
     )
