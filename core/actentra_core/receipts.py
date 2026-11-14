@@ -6,6 +6,7 @@ import contextlib
 import json
 import sqlite3
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -582,52 +583,162 @@ class ReceiptStore:
             recovered.append(rec)
         return recovered
 
-    def iter_records(self) -> list[ReceiptRecord]:
-        """Return all stored receipt records in sequence order."""
+    def iter_records_stream(
+        self,
+        *,
+        chunk_size: int = 500,
+        start_seq: int = 1,
+        reverse: bool = False,
+    ) -> Iterator[ReceiptRecord]:
+        """Yield stored receipt records in bounded chunks without loading the entire DB."""
+        effective_chunk = max(1, chunk_size)
         conn = self._connect()
         try:
-            rows = conn.execute(
+            cursor = conn.cursor()
+            if reverse:
+                cursor.execute(
+                    """
+                    SELECT seq, record_type, crossing_id, session_id, canonical_hash,
+                           policy_version, verdict, rule_id, reason, risk_tags_json,
+                           shadow, status, result_hash, error, ts, prev_hash, entry_hash
+                    FROM receipts
+                    WHERE seq <= ?
+                    ORDER BY seq DESC;
+                    """,
+                    (start_seq if start_seq > 1 else 999999999999,),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT seq, record_type, crossing_id, session_id, canonical_hash,
+                           policy_version, verdict, rule_id, reason, risk_tags_json,
+                           shadow, status, result_hash, error, ts, prev_hash, entry_hash
+                    FROM receipts
+                    WHERE seq >= ?
+                    ORDER BY seq ASC;
+                    """,
+                    (start_seq,),
+                )
+
+            while True:
+                rows = cursor.fetchmany(effective_chunk)
+                if not rows:
+                    break
+                for row in rows:
+                    risk_list = json.loads(str(row[9]))
+                    rec_type: Literal["decision", "outcome"] = (
+                        "decision" if row[1] == "decision" else "outcome"
+                    )
+                    yield ReceiptRecord(
+                        seq=int(row[0]),
+                        record_type=rec_type,
+                        crossing_id=str(row[2]),
+                        session_id=str(row[3]),
+                        canonical_hash=str(row[4]),
+                        policy_version=str(row[5]),
+                        verdict=str(row[6]) if row[6] is not None else None,
+                        rule_id=str(row[7]) if row[7] is not None else None,
+                        reason=str(row[8]) if row[8] is not None else None,
+                        risk_tags=tuple(str(t) for t in risk_list),
+                        shadow=bool(row[10]),
+                        status=str(row[11]) if row[11] is not None else None,
+                        result_hash=str(row[12]) if row[12] is not None else None,
+                        error=str(row[13]) if row[13] is not None else None,
+                        ts=str(row[14]),
+                        prev_hash=str(row[15]),
+                        entry_hash=str(row[16]),
+                    )
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to stream receipt records: {exc}") from exc
+        finally:
+            conn.close()
+
+    def iter_records(self) -> list[ReceiptRecord]:
+        """Return all stored receipt records in sequence order."""
+        return list(self.iter_records_stream())
+
+    def archive_records(
+        self,
+        *,
+        before_seq: int,
+        archive_db_path: str | Path,
+        delete_from_source: bool = False,
+    ) -> int:
+        """Archive records older than before_seq to a target archive SQLite database.
+
+        Preserves action envelopes, receipts, and hash chain.
+        Returns the number of receipt records archived.
+        """
+        if before_seq <= 1:
+            return 0
+
+        archive_store = ReceiptStore(archive_db_path)
+        source_conn = self._connect()
+        archive_conn = archive_store._connect()
+
+        try:
+            # Read rows to archive
+            rows = source_conn.execute(
                 """
                 SELECT seq, record_type, crossing_id, session_id, canonical_hash,
                        policy_version, verdict, rule_id, reason, risk_tags_json,
                        shadow, status, result_hash, error, ts, prev_hash, entry_hash
                 FROM receipts
+                WHERE seq < ?
                 ORDER BY seq ASC;
-                """
+                """,
+                (before_seq,),
             ).fetchall()
-        except sqlite3.Error as exc:
-            raise ReceiptError(f"Failed to read receipt records: {exc}") from exc
-        finally:
-            conn.close()
 
-        out: list[ReceiptRecord] = []
-        for row in rows:
-            risk_list = json.loads(str(row[9]))
-            rec_type: Literal["decision", "outcome"] = (
-                "decision" if row[1] == "decision" else "outcome"
-            )
-            out.append(
-                ReceiptRecord(
-                    seq=int(row[0]),
-                    record_type=rec_type,
-                    crossing_id=str(row[2]),
-                    session_id=str(row[3]),
-                    canonical_hash=str(row[4]),
-                    policy_version=str(row[5]),
-                    verdict=str(row[6]) if row[6] is not None else None,
-                    rule_id=str(row[7]) if row[7] is not None else None,
-                    reason=str(row[8]) if row[8] is not None else None,
-                    risk_tags=tuple(str(t) for t in risk_list),
-                    shadow=bool(row[10]),
-                    status=str(row[11]) if row[11] is not None else None,
-                    result_hash=str(row[12]) if row[12] is not None else None,
-                    error=str(row[13]) if row[13] is not None else None,
-                    ts=str(row[14]),
-                    prev_hash=str(row[15]),
-                    entry_hash=str(row[16]),
+            if not rows:
+                return 0
+
+            crossing_ids = list({str(r[2]) for r in rows})
+            placeholders = ",".join("?" for _ in crossing_ids)
+
+            envelope_rows = source_conn.execute(
+                f"""
+                SELECT crossing_id, envelope_json
+                FROM action_envelopes
+                WHERE crossing_id IN ({placeholders});
+                """,  # noqa: S608
+                crossing_ids,
+            ).fetchall()
+
+            with archive_conn:
+                archive_conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO action_envelopes
+                        (crossing_id, envelope_json)
+                    VALUES (?, ?);
+                    """,
+                    envelope_rows,
                 )
-            )
-        return out
+                archive_conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO receipts
+                        (seq, record_type, crossing_id, session_id, canonical_hash,
+                         policy_version, verdict, rule_id, reason, risk_tags_json,
+                         shadow, status, result_hash, error, ts, prev_hash, entry_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    rows,
+                )
+
+            if delete_from_source:
+                with source_conn:
+                    source_conn.execute("DELETE FROM receipts WHERE seq < ?;", (before_seq,))
+                    source_conn.execute(
+                        f"DELETE FROM action_envelopes WHERE crossing_id IN ({placeholders});",  # noqa: S608
+                        crossing_ids,
+                    )
+
+            return len(rows)
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Archival failed: {exc}") from exc
+        finally:
+            source_conn.close()
+            archive_conn.close()
 
     def get_latest_record(self) -> ReceiptRecord | None:
         """Fetch the most recent receipt record without scanning entire log."""
@@ -1028,9 +1139,12 @@ class ReceiptStore:
 
 
 def verify_log(
-    db_path: str | Path, *, verify_envelopes: bool = False
+    db_path: str | Path,
+    *,
+    verify_envelopes: bool = False,
+    chunk_size: int = 500,
 ) -> VerificationResult:
-    """Verify hash-chain integrity, sequence continuity, and record digests.
+    """Verify hash-chain integrity, sequence continuity, and digests in bounded streaming memory.
 
     If verify_envelopes is True, additionally verifies that stored action envelopes
     exist for each decision receipt and their recomputed action hash matches the decision.
@@ -1044,21 +1158,21 @@ def verify_log(
             errors=(f"Receipt database not found: {path}",),
         )
 
+    errors: list[str] = []
+    expected_prev = GENESIS_HASH
+    expected_seq = 1
+    last_hash = GENESIS_HASH
+    total_records = 0
+
     try:
         store = ReceiptStore(path)
-        records = store.iter_records()
-    except (ReceiptError, sqlite3.Error, json.JSONDecodeError) as exc:
+    except Exception as exc:
         return VerificationResult(
             ok=False,
             total_records=0,
             last_hash=GENESIS_HASH,
             errors=(f"Unable to read receipt database: {exc}",),
         )
-
-    errors: list[str] = []
-    expected_prev = GENESIS_HASH
-    expected_seq = 1
-    last_hash = GENESIS_HASH
 
     conn: sqlite3.Connection | None = None
     if verify_envelopes:
@@ -1068,7 +1182,8 @@ def verify_log(
             conn = None
 
     try:
-        for rec in records:
+        for rec in store.iter_records_stream(chunk_size=chunk_size):
+            total_records += 1
             if rec.seq != expected_seq:
                 errors.append(f"seq {rec.seq}: expected sequence number {expected_seq}")
             if rec.prev_hash != expected_prev:
@@ -1144,25 +1259,33 @@ def verify_log(
             expected_prev = rec.entry_hash
             last_hash = rec.entry_hash
             expected_seq += 1
+    except (ReceiptError, sqlite3.Error, json.JSONDecodeError) as exc:
+        errors.append(f"Unable to read receipt database: {exc}")
     finally:
         if conn is not None:
             conn.close()
 
     return VerificationResult(
         ok=len(errors) == 0,
-        total_records=len(records),
+        total_records=total_records,
         last_hash=last_hash,
         errors=tuple(errors),
     )
 
 
-def export_jsonl(db_path: str | Path, out_path: str | Path) -> int:
-    """Export all receipt records to a JSONL file. Returns record count."""
+def export_jsonl(
+    db_path: str | Path,
+    out_path: str | Path,
+    *,
+    chunk_size: int = 500,
+) -> int:
+    """Export all receipt records to a JSONL file in bounded streaming chunks."""
     store = ReceiptStore(db_path)
-    records = store.iter_records()
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
     with out.open("w", encoding="utf-8", newline="\n") as fh:
-        for rec in records:
+        for rec in store.iter_records_stream(chunk_size=chunk_size):
             fh.write(json.dumps(rec.to_dict(), ensure_ascii=False) + "\n")
-    return len(records)
+            count += 1
+    return count

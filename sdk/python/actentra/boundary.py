@@ -22,6 +22,13 @@ from actentra_core.envelope import (
 from actentra_core.policy import PolicyEngine, PolicyPack, load_policy_file
 from actentra_core.receipts import ReceiptError, ReceiptStore
 from actentra_core.verdict import Decision, Verdict
+from actentra_core.warrants import (
+    Warrant,
+    WarrantError,
+    WarrantRegistry,
+    is_action_permitted_by_warrant,
+    verify_warrant,
+)
 
 F = TypeVar("F", bound=Callable[..., Any])
 ApprovalCallback = Callable[[ActionEnvelope, Decision], bool]
@@ -87,6 +94,8 @@ class Boundary:
         approval_callback: ApprovalCallback | None = None,
         approval_ttl_seconds: float = 300.0,
         secrets_broker: SecretsBroker | None = None,
+        warrant_public_key: bytes | None = None,
+        warrant_registry: WarrantRegistry | None = None,
     ) -> None:
         self._engine = PolicyEngine(policy)
         self._store = receipt_store
@@ -97,6 +106,8 @@ class Boundary:
         self._approval_callback = approval_callback
         self._approval_ttl = approval_ttl_seconds
         self._secrets_broker = secrets_broker
+        self._warrant_public_key = warrant_public_key
+        self._warrant_registry = warrant_registry
         self._lock = threading.Lock()
         self._approvals: dict[tuple[str, str], ApprovalGrant] = {}
         self._session_taints: dict[str, str] = {}
@@ -110,6 +121,9 @@ class Boundary:
         session_id: str = "default",
         agent_id: str = "default-agent",
         approval_callback: ApprovalCallback | None = None,
+        secrets_broker: SecretsBroker | None = None,
+        warrant_public_key: bytes | None = None,
+        warrant_registry: WarrantRegistry | None = None,
     ) -> Boundary:
         policy = load_policy_file(policy_path)
         store = ReceiptStore(receipts_db)
@@ -119,6 +133,9 @@ class Boundary:
             session_id=session_id,
             agent_id=agent_id,
             approval_callback=approval_callback,
+            secrets_broker=secrets_broker,
+            warrant_public_key=warrant_public_key,
+            warrant_registry=warrant_registry,
         )
 
     @property
@@ -132,6 +149,96 @@ class Boundary:
     @property
     def secrets_broker(self) -> SecretsBroker | None:
         return self._secrets_broker
+
+    @property
+    def warrant_public_key(self) -> bytes | None:
+        return self._warrant_public_key
+
+    @property
+    def warrant_registry(self) -> WarrantRegistry | None:
+        return self._warrant_registry
+
+    def _check_warrant(
+        self,
+        warrant: Warrant | dict[str, Any] | None,
+        *,
+        tool: str,
+        resource: str,
+        effective_agent: str,
+    ) -> Warrant | None:
+        if warrant is None:
+            return None
+
+        warrant_obj: Warrant
+        if isinstance(warrant, dict):
+            try:
+                warrant_obj = Warrant.from_dict(warrant)
+            except Exception as exc:
+                hold_decision = Decision(
+                    verdict=Verdict.HOLD,
+                    rule_id="warrant:malformed",
+                    reason=f"Warrant dictionary malformed: {exc}",
+                    policy_version=self._engine.policy.policy_version,
+                    canonical_hash="sha256:" + ("0" * 64),
+                )
+                raise ActionBlockedError(hold_decision, "INVALID_WARRANT") from exc
+        elif isinstance(warrant, Warrant):
+            warrant_obj = warrant
+        else:
+            hold_decision = Decision(
+                verdict=Verdict.HOLD,
+                rule_id="warrant:malformed",
+                reason=f"Unsupported warrant type: {type(warrant).__name__}",
+                policy_version=self._engine.policy.policy_version,
+                canonical_hash="sha256:" + ("0" * 64),
+            )
+            raise ActionBlockedError(hold_decision, "INVALID_WARRANT")
+
+        if self._warrant_public_key is not None:
+            valid, msg = verify_warrant(
+                warrant_obj,
+                self._warrant_public_key,
+                expected_holder=effective_agent,
+            )
+            if not valid:
+                deny_decision = Decision(
+                    verdict=Verdict.DENY,
+                    rule_id="warrant:invalid",
+                    reason=f"Warrant cryptographic verification failed: {msg}",
+                    policy_version=self._engine.policy.policy_version,
+                    canonical_hash="sha256:" + ("0" * 64),
+                )
+                raise ActionBlockedError(deny_decision, "WARRANT_REJECTED")
+
+        if not is_action_permitted_by_warrant(warrant_obj, tool=tool, resource=resource):
+            deny_decision = Decision(
+                verdict=Verdict.DENY,
+                rule_id="warrant:scope-denied",
+                reason=(
+                    f"Action '{tool}' on '{resource}' is not authorized by warrant "
+                    f"'{warrant_obj.warrant_id}'"
+                ),
+                policy_version=self._engine.policy.policy_version,
+                canonical_hash="sha256:" + ("0" * 64),
+            )
+            raise ActionBlockedError(deny_decision, "WARRANT_SCOPE_DENIED")
+
+        if self._warrant_registry is not None:
+            rem = self._warrant_registry.remaining_uses(warrant_obj)
+            if rem is not None and rem <= 0:
+                deny_decision = Decision(
+                    verdict=Verdict.DENY,
+                    rule_id="warrant:exhausted",
+                    reason=(
+                        f"Warrant '{warrant_obj.warrant_id}' max uses "
+                        f"({warrant_obj.max_uses}) exceeded"
+                    ),
+                    policy_version=self._engine.policy.policy_version,
+                    canonical_hash="sha256:" + ("0" * 64),
+                )
+                raise ActionBlockedError(deny_decision, "WARRANT_EXHAUSTED")
+
+        return warrant_obj
 
     def freeze(self) -> None:
         self._engine.freeze()
@@ -202,16 +309,28 @@ class Boundary:
         user_goal: str | None = None,
         declared_by: Literal["human", "agent", "system"] = "agent",
         provenance: list[ProvenanceItem] | tuple[ProvenanceItem, ...] = (),
+        warrant: Warrant | dict[str, Any] | None = None,
         record_receipt: bool = False,
     ) -> Decision:
         """Simulate action evaluation without executing it.
 
-        Evaluates policy, risk tags, and session budgets. If record_receipt is True,
+        Evaluates warrants, policy, risk tags, and session budgets. If record_receipt is True,
         records a shadow decision receipt into the receipt store for auditing.
         """
         effective_session = session_id or self._session_id
         effective_agent = agent_id or self._agent_id
+        warrant_obj = self._check_warrant(
+            warrant,
+            tool=tool,
+            resource=resource,
+            effective_agent=effective_agent,
+        )
+
         prov_items = list(provenance)
+        if warrant_obj is not None:
+            prov_items.append(
+                ProvenanceItem(source=f"warrant:{warrant_obj.warrant_id}", trust="trusted")
+            )
         if self.get_session_taint(effective_session) == "untrusted" and not any(
             p.trust == "untrusted" for p in prov_items
         ):
@@ -260,10 +379,22 @@ class Boundary:
         user_goal: str | None = None,
         declared_by: Literal["human", "agent", "system"] = "agent",
         provenance: list[ProvenanceItem] | tuple[ProvenanceItem, ...] = (),
+        warrant: Warrant | dict[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> Any:
         """Evaluate an action, record a durable decision, enforce verdict, and record outcome."""
+        warrant_obj = self._check_warrant(
+            warrant,
+            tool=tool,
+            resource=resource,
+            effective_agent=self._agent_id,
+        )
+
         prov_items = list(provenance)
+        if warrant_obj is not None:
+            prov_items.append(
+                ProvenanceItem(source=f"warrant:{warrant_obj.warrant_id}", trust="trusted")
+            )
         if self.get_session_taint(self._session_id) == "untrusted" and not any(
             p.trust == "untrusted" for p in prov_items
         ):
@@ -338,6 +469,28 @@ class Boundary:
 
         if not decision.verdict.permits_execution:
             raise ActionBlockedError(decision, envelope.crossing_id)
+
+        # Record warrant consumption if registry is configured
+        if self._warrant_registry is not None and warrant_obj is not None:
+            try:
+                self._warrant_registry.record_use(warrant_obj)
+            except WarrantError as exc:
+                exhausted_decision = Decision(
+                    verdict=Verdict.DENY,
+                    rule_id="warrant:exhausted",
+                    reason=str(exc),
+                    policy_version=decision.policy_version,
+                    canonical_hash=envelope.canonical_hash,
+                )
+                self._store.record_outcome(
+                    crossing_id=envelope.crossing_id,
+                    session_id=envelope.session_id,
+                    canonical_hash=envelope.canonical_hash,
+                    policy_version=decision.policy_version,
+                    status="failure",
+                    error=str(exc),
+                )
+                raise ActionBlockedError(exhausted_decision, envelope.crossing_id) from exc
 
         # I3: Verify evaluated hash matches action payload immediately before execution.
         verify_hash = compute_action_hash(

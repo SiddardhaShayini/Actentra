@@ -89,6 +89,7 @@
     margin-bottom: 1.25rem;
   }
   .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 1.25rem; }
   .stat-label { font-size: 0.75rem; text-transform: uppercase; color: var(--text-muted); }
   .stat-val { font-size: 1.5rem; font-weight: 700; margin-top: 0.25rem; }
   .badge {
@@ -339,23 +340,85 @@
       </div>
     </div>
     <div class="card">
-      <h3 style="margin-bottom:0.75rem;">Quickstart Integration Snippet</h3>
-      <pre style="background:#090d16; padding:1rem; border-radius:6px; font-size:0.8rem; overflow:auto;">
-from actentra import Boundary, guard
-from actentra_core.policy import load_policy_file
-from actentra_core.receipts import ReceiptStore
+      <h3 style="margin-bottom:0.5rem;">Interactive Policy Generator & Guided Setup</h3>
+      <p style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.25rem;">
+        Generate a scoped, fail-closed policy for your agent, preview decisions, and get the exact integration code.
+      </p>
 
-boundary = Boundary.from_files(
-    policy_path="policies/examples/starter.yaml",
-    receipts_db="receipts.db",
-    session_id="agent-session-1"
-)
+      <div class="grid-2">
+        <!-- Configuration Controls -->
+        <div>
+          <div style="margin-bottom:1rem;">
+            <label style="font-size:0.8rem; font-weight:600; color:var(--text-muted);">Integration Target</label>
+            <select id="wiz-target" onchange="updateWizard()">
+              <option value="sdk">Python SDK (actentra.Boundary &amp; @guard)</option>
+              <option value="mcp">MCP Stdio Proxy (actentra mcp --policy ...)</option>
+              <option value="gateway">Local HTTP Gateway (/v1/crossings)</option>
+            </select>
+          </div>
 
-@guard(boundary, tool="fs.read", verb="read")
-def read_workspace_note(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as fh:
-        return fh.read()
-      </pre>
+          <div style="margin-bottom:1rem;">
+            <label style="font-size:0.8rem; font-weight:600; color:var(--text-muted);">Starter Template Archetype</label>
+            <select id="wiz-template" onchange="applyWizardTemplate()">
+              <option value="workspace">Workspace Filesystem Guard (Read Allowed, Ask on Write/Delete)</option>
+              <option value="data">Data Assistant (SQLite Query Allowed, Ask on Mutations, Deny Shell)</option>
+              <option value="http">Scoped Webhook / API Client (HTTPS Allowed, Ask on Mutating POST)</option>
+              <option value="strict">Strict Zero-Trust Baseline (Deny by default, explicit Ask rules)</option>
+            </select>
+          </div>
+
+          <div style="margin-bottom:1rem;">
+            <label style="font-size:0.8rem; font-weight:600; color:var(--text-muted);">Policy ID</label>
+            <input id="wiz-policy-id" type="text" value="agent-local-policy" oninput="updateWizard()">
+          </div>
+
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem; margin-bottom:1rem;">
+            <div>
+              <label style="font-size:0.8rem; font-weight:600; color:var(--text-muted);">Allowed Tool Pattern</label>
+              <input id="wiz-tool-pattern" type="text" value="fs.*" oninput="updateWizard()">
+            </div>
+            <div>
+              <label style="font-size:0.8rem; font-weight:600; color:var(--text-muted);">Allowed Resource Scope</label>
+              <input id="wiz-resource-pattern" type="text" value="path:./workspace/**" oninput="updateWizard()">
+            </div>
+          </div>
+
+          <div style="margin-bottom:1rem;">
+            <label style="font-size:0.8rem; font-weight:600; color:var(--text-muted);">Ask (Human Approval) Requirement</label>
+            <input id="wiz-ask-reason" type="text" value="Writing or deleting files requires human confirmation" oninput="updateWizard()">
+          </div>
+
+          <!-- Quick Live Action Preview -->
+          <div style="border-top:1px solid var(--border); padding-top:1rem; margin-top:1rem;">
+            <h4 style="font-size:0.85rem; margin-bottom:0.5rem; color:var(--teal);">Live Policy Preview (Simulator)</h4>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.5rem; margin-bottom:0.5rem;">
+              <input id="wiz-preview-tool" type="text" placeholder="Tool (e.g. fs.read)" value="fs.read">
+              <input id="wiz-preview-verb" type="text" placeholder="Verb (e.g. read)" value="read">
+            </div>
+            <input id="wiz-preview-resource" type="text" placeholder="Resource" value="path:./workspace/notes.txt" style="margin-bottom:0.5rem;">
+            <button class="btn btn-primary" style="width:100%;" onclick="runWizardPreview()">Test Action Preview</button>
+            <div id="wiz-preview-result" style="margin-top:0.5rem;"></div>
+          </div>
+        </div>
+
+        <!-- Output YAML and Integration Code -->
+        <div>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.25rem;">
+            <span style="font-size:0.8rem; font-weight:600; color:var(--text-muted);">Generated Policy YAML</span>
+            <div style="display:flex; gap:0.5rem;">
+              <button class="btn btn-secondary" style="padding:0.25rem 0.6rem; font-size:0.75rem;" onclick="copyWizardYaml()">Copy YAML</button>
+              <button class="btn btn-secondary" style="padding:0.25rem 0.6rem; font-size:0.75rem;" onclick="downloadWizardYaml()">Download</button>
+            </div>
+          </div>
+          <pre style="background:#090d16; padding:0.75rem; border-radius:6px; font-size:0.75rem; max-height:220px; overflow:auto; margin-bottom:1rem;"><code id="wiz-yaml-code"></code></pre>
+
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.25rem;">
+            <span style="font-size:0.8rem; font-weight:600; color:var(--text-muted);">Integration Code Snippet</span>
+            <button class="btn btn-secondary" style="padding:0.25rem 0.6rem; font-size:0.75rem;" onclick="copyWizardSnippet()">Copy Code</button>
+          </div>
+          <pre style="background:#090d16; padding:0.75rem; border-radius:6px; font-size:0.75rem; max-height:180px; overflow:auto;"><code id="wiz-snippet-code"></code></pre>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -695,9 +758,187 @@ async function exportAuditBundle() {
   } catch (e) { alert('Export failed: ' + e); }
 }
 
+function applyWizardTemplate() {
+  const tpl = document.getElementById('wiz-template').value;
+  const toolInput = document.getElementById('wiz-tool-pattern');
+  const resInput = document.getElementById('wiz-resource-pattern');
+  const reasonInput = document.getElementById('wiz-ask-reason');
+  const simTool = document.getElementById('wiz-preview-tool');
+  const simVerb = document.getElementById('wiz-preview-verb');
+  const simRes = document.getElementById('wiz-preview-resource');
+
+  if (tpl === 'workspace') {
+    toolInput.value = 'fs.*';
+    resInput.value = 'path:./workspace/**';
+    reasonInput.value = 'Writing or deleting files requires human confirmation';
+    simTool.value = 'fs.read';
+    simVerb.value = 'read';
+    simRes.value = 'path:./workspace/notes.txt';
+  } else if (tpl === 'data') {
+    toolInput.value = 'sqlite.*';
+    resInput.value = 'sqlite:data/*.db';
+    reasonInput.value = 'Database write or schema operations require approval';
+    simTool.value = 'sqlite.query';
+    simVerb.value = 'read';
+    simRes.value = 'sqlite:data/analytics.db';
+  } else if (tpl === 'http') {
+    toolInput.value = 'http.*';
+    resInput.value = 'https://api.github.com/**';
+    reasonInput.value = 'Mutating HTTP API calls require confirmation';
+    simTool.value = 'http.get';
+    simVerb.value = 'network';
+    simRes.value = 'https://api.github.com/repos/org/repo';
+  } else {
+    toolInput.value = '*';
+    resInput.value = '*';
+    reasonInput.value = 'Consequential agent actions require approval';
+    simTool.value = 'shell.exec';
+    simVerb.value = 'exec';
+    simRes.value = 'proc:cmd.exe';
+  }
+  updateWizard();
+}
+
+function updateWizard() {
+  const target = document.getElementById('wiz-target').value;
+  const policyId = (document.getElementById('wiz-policy-id').value || 'agent-local-policy').trim();
+  const toolPat = (document.getElementById('wiz-tool-pattern').value || 'fs.*').trim();
+  const resPat = (document.getElementById('wiz-resource-pattern').value || 'path:./workspace/**').trim();
+  const askReason = (document.getElementById('wiz-ask-reason').value || 'Action requires confirmation').trim();
+
+  const yaml = `version: 1
+policy_id: ${policyId}
+mode: enforce
+defaults:
+  verdict: deny
+
+rules:
+  # 1. Allow read-only actions within authorized scope
+  - id: allow-scoped-read
+    match:
+      tool: "${toolPat}"
+      verb: read
+      resource: "${resPat}"
+    verdict: allow
+
+  # 2. Require human approval for mutating actions
+  - id: ask-mutating-action
+    match:
+      tool: "${toolPat}"
+      resource: "${resPat}"
+    verdict: ask
+    reason: "${askReason}"
+
+  # 3. Deny all actions originating from untrusted context
+  - id: deny-untrusted-context
+    match:
+      taint: untrusted
+    verdict: deny
+    reason: "Untrusted prompt or session context cannot invoke tools"
+`;
+
+  let snippet = '';
+  if (target === 'sdk') {
+    snippet = `from actentra import Boundary, guard
+from actentra_core.policy import load_policy_file
+from actentra_core.receipts import ReceiptStore
+
+boundary = Boundary.from_files(
+    policy_path="policy.yaml",
+    receipts_db="receipts.db",
+    session_id="agent-session-1"
+)
+
+@boundary.guard(tool="${toolPat.replace('.*', '.read')}", verb="read", resource_fn=lambda path: f"path:{path}")
+def execute_tool(path: str) -> str:
+    # Tool logic executed safely under Actentra boundary
+    return f"Read {path}"
+`;
+  } else if (target === 'mcp') {
+    snippet = `# Run Actentra MCP stdio mediation proxy
+actentra mcp \\
+  --policy policy.yaml \\
+  --receipts-db receipts.db \\
+  --server-cmd "python" \\
+  --server-args "-m my_agent_mcp"
+`;
+  } else {
+    snippet = `# Submit action to Actentra local HTTP Gateway
+curl -X POST http://127.0.0.1:8765/v1/crossings \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "session_id": "session-1",
+    "agent_id": "agent-1",
+    "tool": "${toolPat.replace('.*', '.read')}",
+    "verb": "read",
+    "resource": "${resPat.replace('/**', '/test.txt')}",
+    "params": {}
+  }'
+`;
+  }
+
+  const yamlEl = document.getElementById('wiz-yaml-code');
+  if (yamlEl) yamlEl.innerText = yaml;
+  const snipEl = document.getElementById('wiz-snippet-code');
+  if (snipEl) snipEl.innerText = snippet;
+}
+
+function copyWizardYaml() {
+  const yaml = document.getElementById('wiz-yaml-code').innerText;
+  navigator.clipboard.writeText(yaml).then(() => alert('Policy YAML copied to clipboard!'));
+}
+
+function downloadWizardYaml() {
+  const yaml = document.getElementById('wiz-yaml-code').innerText;
+  const blob = new Blob([yaml], { type: 'text/yaml' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'policy.yaml';
+  a.click();
+}
+
+function copyWizardSnippet() {
+  const code = document.getElementById('wiz-snippet-code').innerText;
+  navigator.clipboard.writeText(code).then(() => alert('Integration snippet copied to clipboard!'));
+}
+
+async function runWizardPreview() {
+  const tool = (document.getElementById('wiz-preview-tool').value || '').trim();
+  const verb = (document.getElementById('wiz-preview-verb').value || '').trim();
+  const resource = (document.getElementById('wiz-preview-resource').value || '').trim();
+  const resDiv = document.getElementById('wiz-preview-result');
+
+  resDiv.innerHTML = '<span style="color:var(--text-muted)">Simulating against active policy...</span>';
+  try {
+    const res = await fetch('/v1/simulate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tool, verb, resource, params: {} })
+    });
+    const data = await res.json();
+    const vClass = data.verdict ? escapeHtml(data.verdict.toLowerCase()) : 'hold';
+    const safeVerdict = data.verdict ? escapeHtml(data.verdict.toUpperCase()) : 'UNKNOWN';
+    const safeRule = escapeHtml(data.rule_id || '-');
+    const safeReason = escapeHtml(data.reason || '-');
+    resDiv.innerHTML = `
+      <div style="background:#090d16; border:1px solid var(--border); border-radius:6px; padding:0.5rem 0.75rem;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span style="font-size:0.8rem;">Decision: <span class="badge ${vClass}">${safeVerdict}</span></span>
+          <span style="font-size:0.75rem; color:var(--text-muted);">Rule: <code>${safeRule}</code></span>
+        </div>
+        <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.25rem;">${safeReason}</div>
+      </div>
+    `;
+  } catch (e) {
+    resDiv.innerHTML = '<span style="color:var(--red)">Preview error: ' + escapeHtml(e) + '</span>';
+  }
+}
+
 // Initial bootstrap
 loadHealth();
 loadOverviewFeed();
+updateWizard();
 setInterval(() => {
   refreshApprovals();
   loadHealth();

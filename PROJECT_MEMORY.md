@@ -267,3 +267,29 @@ Agents working on this project must maintain this file as the durable handoff:
     - Total tests: 111 passed, 3 skipped, 0 failures.
     - Ruff: All checks passed.
     - Mypy: Success (0 errors in 28 source files).
+
+### 2026-11-14 19:40 IST
+
+- Implemented Phase 2 & 3 capabilities from `PLAN_V3.md`:
+  - **End-to-End Capability Warrant Enforcement in SDK (`boundary.py`, `test_warrants.py`):**
+    - Integrated `warrant: Warrant | dict | None` into `Boundary.execute()` and `Boundary.dry_run()`.
+    - Configured `warrant_public_key` (Ed25519) and `warrant_registry` (usage and quota tracker) in `Boundary`.
+    - Enforced fail-closed validation: cryptographic signature verification against public key, holder matching (`expected_holder=agent_id`), expiration check, and tool/resource scope check (`is_action_permitted_by_warrant`).
+    - Enforced consumption quota tracking (`WarrantRegistry.record_use()`), failing closed with `ActionBlockedError(rule_id="warrant:exhausted")` if `max_uses` is exceeded.
+    - Attached `warrant:<id>` to action envelope provenance and durable decision receipts for complete auditability.
+  - **End-to-End Credential Reference Resolution & Redaction (`http.py`, `test_http_executor.py`):**
+    - Updated `ScopedHTTPExecutor` and `ScopedHTTPTools` to support `SecretsBroker`.
+    - Added dynamic resolution of credential references (`secret:<NAME>`) in `secret_headers` constraints and request headers at execution time, keeping raw credentials out of policies, envelopes, and receipts.
+    - Enforced full redaction on error bodies, HTTP status messages, response bodies, and response headers (`self._secrets_broker.redact(...)`), preventing credentials from leaking in logs or exceptions.
+  - **Bounded Streaming Audit Log Iteration, Export & Archival (`receipts.py`, `test_receipt_archival.py`):**
+    - Added `ReceiptStore.iter_records_stream()` using bounded SQLite cursor chunking (`fetchmany`), preventing memory spikes when querying large audit logs.
+    - Updated `export_jsonl()` and `verify_log()` to stream records row-by-row / chunk-by-chunk in $O(1)$ memory.
+    - Implemented `ReceiptStore.archive_records()` to archive historical records before a given sequence number into a separate self-contained SQLite archive database while preserving envelope context and hash chain integrity, with optional source pruning (`delete_from_source=True`).
+  - **Guided Local Setup & Live Policy Preview in Web Console (`console.html`):**
+    - Added an interactive "Interactive Policy Generator & Guided Setup" wizard in the Integrations view.
+    - Allows operators and developers to select integration targets (Python SDK, MCP Stdio Proxy, Gateway HTTP API), choose template profiles (Workspace Filesystem Guard, Data Assistant, Scoped Webhook, Zero Trust), customize rules, copy/download generated YAML, and test simulated actions in real time.
+  - **Validation & Test Suite:**
+    - Added `tests/unit/test_receipt_archival.py` and expanded `tests/unit/test_warrants.py` and `tests/unit/test_http_executor.py`.
+    - Total test suite: 116 passed, 4 skipped (Windows sandbox loopback/symlink privileges), 0 failures.
+    - Ruff: All checks passed.
+    - Mypy: Success (0 errors in 28 source files, strict mode).

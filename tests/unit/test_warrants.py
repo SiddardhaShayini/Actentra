@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from actentra import ActionBlockedError, Boundary
 from actentra_core.checkpoints import generate_ed25519_keypair
+from actentra_core.policy import load_policy_yaml
+from actentra_core.receipts import ReceiptStore
+from actentra_core.verdict import Verdict
 from actentra_core.warrants import (
     Warrant,
     WarrantError,
@@ -123,3 +129,216 @@ def test_warrant_registry_use_tracking() -> None:
     # Third use exceeds max_uses -> raises WarrantError
     with pytest.raises(WarrantError, match="max uses"):
         registry.record_use(warrant)
+
+
+def test_boundary_warrant_enforcement(tmp_path: Path) -> None:
+    priv, pub = generate_ed25519_keypair()
+    _, other_pub = generate_ed25519_keypair()
+
+    db_path = tmp_path / "warrant_receipts.db"
+    store = ReceiptStore(db_path)
+    policy = load_policy_yaml(
+        """
+version: 1
+policy_id: test-warrants
+mode: enforce
+defaults: { verdict: deny }
+rules:
+  - id: allow-fs
+    match: { tool: fs.read, verb: read }
+    verdict: allow
+  - id: allow-shell
+    match: { tool: shell.exec, verb: exec }
+    verdict: allow
+"""
+    )
+    registry = WarrantRegistry()
+    boundary = Boundary(
+        policy=policy,
+        receipt_store=store,
+        agent_id="agent-007",
+        warrant_public_key=pub,
+        warrant_registry=registry,
+    )
+
+    # 1. Issue valid warrant with max_uses=2 for agent-007
+    warrant = issue_warrant(
+        holder="agent-007",
+        allowed_tools=["fs.read"],
+        allowed_resources=["path:C:/data/**"],
+        privkey_pem=priv,
+        issuer_id="security-lead",
+        ttl_seconds=300.0,
+        max_uses=2,
+    )
+
+    # 1a. Successful execution with valid warrant
+    res1 = boundary.execute(
+        tool="fs.read",
+        verb="read",
+        resource="path:C:/data/report.txt",
+        warrant=warrant,
+        fn=lambda env, dec: "content-1",
+    )
+    assert res1 == "content-1"
+    assert registry.remaining_uses(warrant) == 1
+
+    # Verify receipt provenance includes warrant
+    records = store.iter_records()
+    assert len(records) == 2  # decision + outcome
+    envelope = store.get_envelope(records[0].crossing_id)
+    assert any(p["source"] == f"warrant:{warrant.warrant_id}" for p in envelope["provenance"])
+
+    # 1b. Second execution with valid warrant succeeds
+    res2 = boundary.execute(
+        tool="fs.read",
+        verb="read",
+        resource="path:C:/data/other.txt",
+        warrant=warrant.to_dict(),  # Pass as dict to test dict deserialization
+        fn=lambda env, dec: "content-2",
+    )
+    assert res2 == "content-2"
+    assert registry.remaining_uses(warrant) == 0
+
+    # 1c. Third execution exceeds max_uses -> fails closed
+    with pytest.raises(ActionBlockedError) as exc_info:
+        boundary.execute(
+            tool="fs.read",
+            verb="read",
+            resource="path:C:/data/third.txt",
+            warrant=warrant,
+            fn=lambda env, dec: "content-3",
+        )
+    assert exc_info.value.decision.rule_id == "warrant:exhausted"
+    assert "max uses" in exc_info.value.decision.reason
+
+    # 2. Scope denied: tool not in warrant (even if allowed by policy)
+    scope_warrant = issue_warrant(
+        holder="agent-007",
+        allowed_tools=["fs.read"],
+        allowed_resources=["path:C:/data/**"],
+        privkey_pem=priv,
+        issuer_id="security-lead",
+        ttl_seconds=300.0,
+    )
+    with pytest.raises(ActionBlockedError) as exc_info2:
+        boundary.execute(
+            tool="shell.exec",
+            verb="exec",
+            resource="proc:cmd.exe",
+            warrant=scope_warrant,
+            fn=lambda env, dec: "shell-run",
+        )
+    assert exc_info2.value.decision.rule_id == "warrant:scope-denied"
+    assert "not authorized by warrant" in exc_info2.value.decision.reason
+
+    # 3. Holder mismatch: warrant issued for different agent
+    foreign_warrant = issue_warrant(
+        holder="agent-999",
+        allowed_tools=["fs.read"],
+        allowed_resources=["path:C:/data/**"],
+        privkey_pem=priv,
+        issuer_id="security-lead",
+        ttl_seconds=300.0,
+    )
+    with pytest.raises(ActionBlockedError) as exc_info3:
+        boundary.execute(
+            tool="fs.read",
+            verb="read",
+            resource="path:C:/data/report.txt",
+            warrant=foreign_warrant,
+            fn=lambda env, dec: "secret",
+        )
+    assert exc_info3.value.decision.rule_id == "warrant:invalid"
+    assert "holder mismatch" in exc_info3.value.decision.reason
+
+    # 4. Expired warrant
+    expired_warrant = issue_warrant(
+        holder="agent-007",
+        allowed_tools=["fs.read"],
+        allowed_resources=["path:C:/data/**"],
+        privkey_pem=priv,
+        issuer_id="security-lead",
+        ttl_seconds=-10.0,  # Already expired
+    )
+    with pytest.raises(ActionBlockedError) as exc_info4:
+        boundary.execute(
+            tool="fs.read",
+            verb="read",
+            resource="path:C:/data/report.txt",
+            warrant=expired_warrant,
+            fn=lambda env, dec: "expired",
+        )
+    assert exc_info4.value.decision.rule_id == "warrant:invalid"
+    assert "expired" in exc_info4.value.decision.reason
+
+    # 5. Boundary configured with different public key (signature verification fails)
+    boundary_wrong_key = Boundary(
+        policy=policy,
+        receipt_store=store,
+        agent_id="agent-007",
+        warrant_public_key=other_pub,
+    )
+    with pytest.raises(ActionBlockedError) as exc_info5:
+        boundary_wrong_key.execute(
+            tool="fs.read",
+            verb="read",
+            resource="path:C:/data/report.txt",
+            warrant=scope_warrant,
+            fn=lambda env, dec: "bad-sig",
+        )
+    assert exc_info5.value.decision.rule_id == "warrant:invalid"
+    assert "signature invalid" in exc_info5.value.decision.reason
+
+
+def test_boundary_warrant_dry_run(tmp_path: Path) -> None:
+    priv, pub = generate_ed25519_keypair()
+    db_path = tmp_path / "warrant_dryrun.db"
+    store = ReceiptStore(db_path)
+    policy = load_policy_yaml(
+        """
+version: 1
+policy_id: test-warrants-dryrun
+mode: enforce
+defaults: { verdict: deny }
+rules:
+  - id: allow-fs
+    match: { tool: fs.read, verb: read }
+    verdict: allow
+"""
+    )
+    boundary = Boundary(
+        policy=policy,
+        receipt_store=store,
+        agent_id="agent-dry",
+        warrant_public_key=pub,
+    )
+
+    warrant = issue_warrant(
+        holder="agent-dry",
+        allowed_tools=["fs.read"],
+        allowed_resources=["path:C:/data/**"],
+        privkey_pem=priv,
+        issuer_id="sec-lead",
+    )
+
+    # Valid warrant dry-run
+    dec = boundary.dry_run(
+        tool="fs.read",
+        verb="read",
+        resource="path:C:/data/file.txt",
+        warrant=warrant,
+    )
+    assert dec.verdict == Verdict.ALLOW
+    assert dec.rule_id == "allow-fs"
+
+    # Unauthorized resource in dry-run
+    with pytest.raises(ActionBlockedError) as exc_info:
+        boundary.dry_run(
+            tool="fs.read",
+            verb="read",
+            resource="path:C:/other/file.txt",
+            warrant=warrant,
+        )
+    assert exc_info.value.decision.rule_id == "warrant:scope-denied"
+

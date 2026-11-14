@@ -12,6 +12,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 
 from actentra.boundary import Boundary
+from actentra.secrets import SecretsBroker, SecretsError
 from actentra_core.canonicalize import CanonicalizationError, canonicalize_unicode
 from actentra_core.envelope import ActionEnvelope, ProvenanceItem
 from actentra_core.verdict import Decision
@@ -23,6 +24,7 @@ _ALLOWED_SCHEMES = frozenset({"http", "https"})
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _ALL_METHODS = _SAFE_METHODS | _MUTATING_METHODS
+_SECRET_REF_PATTERN = re.compile(r"secret:([a-zA-Z0-9_\-]+)")
 
 
 def _is_private_ip(ip_str: str) -> bool:
@@ -123,6 +125,7 @@ class ScopedHTTPExecutor:
         allow_private_ips: bool = False,
         default_timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
         default_max_response_bytes: int = _DEFAULT_MAX_RESPONSE_BYTES,
+        secrets_broker: SecretsBroker | None = None,
     ) -> None:
         self._allowed_hosts = (
             tuple(h.lower().strip() for h in allowed_hosts) if allowed_hosts else None
@@ -130,6 +133,7 @@ class ScopedHTTPExecutor:
         self._allow_private_ips = allow_private_ips
         self._default_timeout = default_timeout_seconds
         self._default_max_bytes = default_max_response_bytes
+        self._secrets_broker = secrets_broker
 
     def _check_host_allowed(self, hostname: str, constraints: dict[str, Any]) -> None:
         host_rules = constraints.get("allowed_hosts") or self._allowed_hosts
@@ -237,9 +241,30 @@ class ScopedHTTPExecutor:
         # Secrets injection via broker if configured
         secret_headers = constraints.get("secret_headers")
         if isinstance(secret_headers, dict):
-            # secret_headers maps header_name to secret_value
+            # secret_headers maps header_name to secret_value or secret:NAME reference
             for h_name, h_val in secret_headers.items():
                 headers[str(h_name)] = str(h_val)
+
+        # Resolve secret references in any header: "secret:NAME" or "Bearer secret:NAME"
+        for h_name, h_val in list(headers.items()):
+            if "secret:" in h_val:
+
+                def _replace_secret(match: re.Match[str], header_key: str = h_name) -> str:
+                    sec_name = match.group(1)
+                    if self._secrets_broker is None:
+                        raise ExecutorError(
+                            "SecretsBroker is required to resolve secret reference "
+                            f"'secret:{sec_name}' in header {header_key!r}"
+                        )
+                    try:
+                        return self._secrets_broker.get_secret(sec_name)
+                    except SecretsError as exc:
+                        raise ExecutorError(
+                            f"Failed to resolve secret reference 'secret:{sec_name}' "
+                            f"in header {header_key!r}: {exc}"
+                        ) from exc
+
+                headers[h_name] = _SECRET_REF_PATTERN.sub(_replace_secret, h_val)
 
         # Prepare payload
         body_data: bytes | None = None
@@ -283,6 +308,12 @@ class ScopedHTTPExecutor:
                 except UnicodeDecodeError:
                     text_content = f"<binary data: {len(content_bytes)} bytes>"
 
+                if self._secrets_broker is not None:
+                    text_content = self._secrets_broker.redact(text_content)
+                    resp_headers = {
+                        k: self._secrets_broker.redact(str(v)) for k, v in resp_headers.items()
+                    }
+
                 return {
                     "status_code": status_code,
                     "url": canon_url,
@@ -293,19 +324,34 @@ class ScopedHTTPExecutor:
                 }
         except HTTPError as exc:
             err_body = exc.read(4096).decode("utf-8", errors="replace")
+            err_reason = str(exc.reason)
+            resp_headers_dict = dict(exc.headers)
+            if self._secrets_broker is not None:
+                err_body = self._secrets_broker.redact(err_body)
+                err_reason = self._secrets_broker.redact(err_reason)
+                resp_headers_dict = {
+                    k: self._secrets_broker.redact(str(v)) for k, v in resp_headers_dict.items()
+                }
             return {
                 "status_code": exc.code,
                 "url": canon_url,
-                "headers": dict(exc.headers),
+                "headers": resp_headers_dict,
                 "body": err_body,
                 "byte_count": len(err_body.encode("utf-8")),
                 "truncated": False,
-                "error": str(exc.reason),
+                "error": err_reason,
             }
         except URLError as exc:
-            raise ExecutorError(f"HTTP connection failed: {exc.reason}") from exc
+            err_msg = f"HTTP connection failed: {exc.reason}"
+            if self._secrets_broker is not None:
+                err_msg = self._secrets_broker.redact(err_msg)
+            raise ExecutorError(err_msg) from exc
         except TimeoutError as exc:
             raise ExecutorError(f"HTTP request timed out after {timeout}s") from exc
+        except ExecutorError as exc:
+            if self._secrets_broker is not None:
+                raise ExecutorError(self._secrets_broker.redact(str(exc))) from exc
+            raise
 
 
 class ScopedHTTPTools:
@@ -314,6 +360,8 @@ class ScopedHTTPTools:
     def __init__(self, boundary: Boundary, executor: ScopedHTTPExecutor) -> None:
         self._boundary = boundary
         self._executor = executor
+        if self._executor._secrets_broker is None and boundary.secrets_broker is not None:
+            self._executor._secrets_broker = boundary.secrets_broker
 
     def get(
         self,

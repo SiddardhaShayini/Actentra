@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from actentra import ActionBlockedError, Boundary
+from actentra.secrets import SecretsBroker
 from actentra_core.canonicalize import CanonicalizationError
 from actentra_core.envelope import ProvenanceItem
 from actentra_core.policy import load_policy_yaml
@@ -119,6 +120,23 @@ class _TestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/auth-check":
+            auth = self.headers.get("Authorization", "")
+            body = f"auth received: {auth}".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("X-Echo-Auth", auth)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/auth-error":
+            auth = self.headers.get("Authorization", "")
+            body = f"error with secret {auth}".encode()
+            self.send_response(401)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()
@@ -187,3 +205,98 @@ rules:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_http_executor_secrets_broker_injection(tmp_path: Path) -> None:
+    server = _LocalTestServer(("127.0.0.1", 0), _TestHandler)
+    port = server.server_port
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+
+    raw_token = "ghp_super_secret_production_token_xyz999"
+    broker = SecretsBroker(initial={"GITHUB_API_KEY": raw_token})
+
+    try:
+        db_path = tmp_path / "secret_receipts.db"
+        policy = load_policy_yaml(
+            f"""
+version: 1
+defaults: {{ verdict: deny }}
+rules:
+  - id: allow-api-with-secret
+    match: {{ tool: "http.*", resource: "http://127.0.0.1:{port}/*" }}
+    verdict: allow
+    constraints:
+      secret_headers:
+        Authorization: "Bearer secret:GITHUB_API_KEY"
+"""
+        )
+        boundary = Boundary(
+            policy=policy,
+            receipt_store=ReceiptStore(db_path),
+            secrets_broker=broker,
+        )
+        executor = ScopedHTTPExecutor(allow_private_ips=True, secrets_broker=broker)
+        tools = ScopedHTTPTools(boundary, executor)
+
+        # 1. GET with secret injection
+        try:
+            res = tools.get(f"http://127.0.0.1:{port}/auth-check")
+        except (OSError, ExecutorError) as exc:
+            if "10013" in str(exc) or "forbidden" in str(exc).lower():
+                pytest.skip(f"Loopback socket access restricted by sandbox: {exc}")
+            raise
+
+        assert res["status_code"] == 200
+        # The raw secret MUST be redacted from response body and echoed headers
+        assert raw_token not in res["body"]
+        assert "[REDACTED]" in res["body"]
+        assert raw_token not in str(res["headers"])
+
+        # 2. Verify audit receipts NEVER contain raw secret
+        store = ReceiptStore(db_path)
+        records = store.iter_records()
+        for rec in records:
+            assert raw_token not in str(rec.to_dict())
+            if rec.record_type == "decision":
+                env = store.get_envelope(rec.crossing_id)
+                assert raw_token not in str(env)
+
+        # 3. HTTP 401 error with secret leak is also redacted
+        res_err = tools.get(f"http://127.0.0.1:{port}/auth-error")
+        assert res_err["status_code"] == 401
+        assert raw_token not in res_err["body"]
+        assert "[REDACTED]" in res_err["body"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_executor_secret_ref_missing_broker(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing_broker.db"
+    policy = load_policy_yaml(
+        """
+version: 1
+defaults: { verdict: deny }
+rules:
+  - id: allow-http
+    match: { tool: "http.*" }
+    verdict: allow
+    constraints:
+      secret_headers:
+        Authorization: "Bearer secret:MISSING_TOKEN"
+"""
+    )
+    boundary = Boundary(policy=policy, receipt_store=ReceiptStore(db_path))
+    # Executor without secrets broker
+    executor = ScopedHTTPExecutor(allow_private_ips=True, secrets_broker=None)
+
+    with pytest.raises(ExecutorError) as exc_info:
+        boundary.execute(
+            tool="http.get",
+            verb="network",
+            resource="http://127.0.0.1:8080/data",
+            fn=executor.execute,
+        )
+    assert "SecretsBroker is required" in str(exc_info.value)
+
