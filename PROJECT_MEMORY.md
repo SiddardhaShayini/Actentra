@@ -329,3 +329,4 @@ Agents working on this project must maintain this file as the durable handoff:
     - Total test suite: 119 passed, 4 skipped, 0 failures.
     - Ruff: All checks passed.
     - Mypy: Success (0 issues in 28 source files, strict mode).
+    - Tuned performance test margins in `test_resource_budget.py` to account for virtualized I/O variance on GitHub Actions Windows runners (`CI=true`).
