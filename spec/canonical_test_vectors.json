@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "format": "Deterministic UTF-8 Canonical JSON (RFC 8785 subset: sorted keys, no whitespace separators, NFC UTF-8)",
+  "vectors": [
+    {
+      "name": "empty_dict",
+      "input": {},
+      "canonical_json": "{}",
+      "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    },
+    {
+      "name": "empty_list",
+      "input": [],
+      "canonical_json": "[]",
+      "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "name": "key_sorting",
+      "input": {
+        "z": 1,
+        "a": 2,
+        "m": 3
+      },
+      "canonical_json": "{\"a\":2,\"m\":3,\"z\":1}",
+      "sha256": "ebba85cfdc0a724b6cc327ecc545faeb38b9fe02eca603b430eb872f5cf75370"
+    },
+    {
+      "name": "nested_structure",
+      "input": {
+        "b": [
+          2,
+          1
+        ],
+        "a": {
+          "d": 4,
+          "c": 3
+        }
+      },
+      "canonical_json": "{\"a\":{\"c\":3,\"d\":4},\"b\":[2,1]}",
+      "sha256": "e9265d3632ad8859e7c4b360122cd8eda57128da98362e063804611bd5ae6bdc"
+    },
+    {
+      "name": "unicode_characters",
+      "input": {
+        "msg": "naïve café 🚀"
+      },
+      "canonical_json": "{\"msg\":\"naïve café 🚀\"}",
+      "sha256": "1a5d6f4790473d59c8759380b51676f05fe16aeffbc656a8979d53b738dbef5b"
+    },
+    {
+      "name": "primitive_types",
+      "input": {
+        "int": 42,
+        "float": 1.5,
+        "bool": true,
+        "null": null
+      },
+      "canonical_json": "{\"bool\":true,\"float\":1.5,\"int\":42,\"null\":null}",
+      "sha256": "9fda0e8bd5ef2d1f600c75950adfc57d628f7b0535cfead64823bc1f2304f6d9"
+    },
+    {
+      "name": "empty_string",
+      "input": {
+        "str": ""
+      },
+      "canonical_json": "{\"str\":\"\"}",
+      "sha256": "96c4f81774d258dcf8bc58eab5b43943e88941b0ac131c750b94477d8afe7382"
+    },
+    {
+      "name": "deep_nesting",
+      "input": {
+        "level1": {
+          "level2": {
+            "level3": [
+              true,
+              false,
+              null
+            ]
+          }
+        }
+      },
+      "canonical_json": "{\"level1\":{\"level2\":{\"level3\":[true,false,null]}}}",
+      "sha256": "40b6fdfa668e5b66c322420b4cc802de5bbd3d01568630b1be04b7d491439cee"
+    }
+  ]
+}

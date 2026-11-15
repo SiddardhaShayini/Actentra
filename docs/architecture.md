@@ -90,3 +90,40 @@
 * **Invariant I5:** No action executes unless its decision receipt is durable; each execution attempt records an immutable outcome record.
 * **Invariant I6:** Policy updates never apply partially; invalid policies are rejected while preserving the last-known-good configuration.
 * **Invariant I7:** Secrets managed by the Secrets Broker never appear in logs, error messages, or envelopes returned to the agent.
+
+---
+
+## Operational Maintenance & Production Lifecycle
+
+Actentra is designed for local-first, low-overhead operation on resource-constrained host machines (Windows 11, Intel i5, 8 GB RAM, CPU-only). Maintenance operations are strictly bounded in memory and time.
+
+### 1. SQLite WAL & Hot Backup Strategy
+- **Concurrency & Resilience:** The audit receipt engine operates SQLite in Write-Ahead Logging (`WAL`) mode (`journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`). WAL allows concurrent zero-copy readers alongside a single active writer without lock contention.
+- **Hot Online Backups:** Operators can take consistent point-in-time snapshots of a live Actentra audit database without stopping the gateway daemon using SQLite's online backup capability:
+  ```bash
+  sqlite3 receipts.db "VACUUM INTO 'backups/receipts_backup.db'"
+  ```
+  This creates a compacted, verified replica of the database with intact hash chains and envelope linkages.
+- **WAL Checkpointing:** Automatic checkpointing flushes WAL pages back into the main database file; operators can force a complete flush if needed via `PRAGMA wal_checkpoint(TRUNCATE)`.
+
+### 2. Audit Log Partitioning & Streaming Archival
+- **Bounded Iteration:** `ReceiptStore.iter_records_stream()` retrieves audit records using cursor-bounded batching (`fetchmany`), maintaining $O(1)$ memory consumption regardless of database size.
+- **Archival Command:** When logs grow large, historical records before a given sequence number can be cleanly migrated to an archive database while preserving cryptographic integrity:
+  ```bash
+  actentra archive-log receipts.db receipts_archive_2026.db --before-seq 50000 --delete-from-source
+  ```
+  The archival procedure operates in an atomic transaction: it verifies source integrity, migrates the exact receipt slice along with matching action envelopes, and preserves hash-chain continuity.
+
+### 3. Dual-Layer Audit Verification
+- **Hash Chain Verification:** `actentra verify-log <db_path>` validates that every receipt's `prev_hash` correctly links to the predecessor's `entry_hash` and matches its canonical payload hash.
+- **Context Integrity Verification:** The `--verify-envelopes` (`-e`) flag verifies that the stored action envelopes in `action_envelopes` have not been altered or substituted after authorization by checking `SHA-256(canonicalize_json(envelope)) == decision.canonical_hash`.
+- **Signed Checkpoints:** `actentra checkpoint-log <db_path> --key-file <key>` anchors the current chain head with an Ed25519 signature, providing verifiable proof against local host tampering or truncation.
+
+### 4. Crash Recovery & Unknown Outcomes
+- **Handling Interrupted Executions:** If a process crashes or loses power between an `ALLOW` decision receipt (Invariant I5) and the completion of tool dispatch, a crossing would be left without an outcome.
+- **Atomic Recovery:** On startup or via `ReceiptStore.recover_pending_outcomes()`, Actentra identifies any `ALLOW` decision lacking an outcome receipt and commits an `unknown` outcome receipt (`reason="crashed_or_interrupted"`). This preserves Invariant I5 and ensures audit logs are never left in an ambiguous or half-recorded state.
+
+### 5. Scoped Credential Resolution & Redaction
+- **Platform DPAPI Storage:** The `SecretsBroker` secures credentials using Windows Data Protection API (DPAPI) tied to the local user account, falling back to AES-256-GCM on POSIX.
+- **Dynamic Resolution:** Agents refer to credentials only via opaque handles (`secret:<NAME>`). Scoped executors resolve and inject these handles into HTTP headers or parameters only at the moment of dispatch.
+- **Zero-Leak Redaction:** All outgoing requests, incoming response headers, bodies, error messages, and durable receipts pass through `secrets_broker.redact()`, guaranteeing that raw secrets are never leaked to logs or the agent context.

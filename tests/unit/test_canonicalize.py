@@ -103,3 +103,28 @@ def test_json_canonicalization_deterministic() -> None:
 
     with pytest.raises(CanonicalizationError):
         canonicalize_json({"bad": float("nan")})
+
+
+def test_canonical_json_spec_test_vectors() -> None:
+    vectors_path = REPO_ROOT / "spec" / "canonical_test_vectors.json"
+    assert vectors_path.exists(), f"Missing spec vectors file: {vectors_path}"
+    raw = json.loads(vectors_path.read_text(encoding="utf-8"))
+    vectors = raw.get("vectors", [])
+    assert len(vectors) >= 8
+
+    for v in vectors:
+        input_data = v["input"]
+        expected_json = v["canonical_json"]
+        expected_hash = f"sha256:{v['sha256']}"
+
+        # 1. Exact deterministic JSON string serialization
+        actual_json = canonicalize_json(input_data)
+        assert actual_json == expected_json, f"Mismatch in vector {v['name']}"
+
+        # 2. Exact SHA-256 canonical hash
+        actual_hash = hash_canonical(input_data)
+        assert actual_hash == expected_hash, f"Hash mismatch in vector {v['name']}"
+
+        # 3. Idempotence under parse-reserialize
+        reserialized = canonicalize_json(json.loads(actual_json))
+        assert reserialized == expected_json, f"Idempotence failure in vector {v['name']}"

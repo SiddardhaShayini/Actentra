@@ -311,3 +311,21 @@ Agents working on this project must maintain this file as the durable handoff:
     - Total test suite: 117 passed, 4 skipped (Windows sandbox loopback/symlink restrictions), 0 failures.
     - Ruff: All checks passed.
     - Mypy: Success (0 issues in 28 source files, strict mode).
+
+### 2026-11-15 18:50 IST
+
+- Implemented Phase 4 Production Readiness milestones from `PLAN_V3.md`:
+  - **Standardized Canonical JSON Test Vectors (`spec/canonical_test_vectors.json`, `test_canonicalize.py`):**
+    - Created spec test vectors covering empty structures, dictionary key sorting, unicode NFC normalization, numeric representation, and nested data structures with verified SHA-256 digests.
+    - Added `test_canonical_json_spec_test_vectors()` in `tests/unit/test_canonicalize.py` verifying `canonicalize_json` and `hash_canonical` against the standardized spec vectors.
+  - **SQLite WAL Performance & Resource Benchmarking (`tests/perf/test_resource_budget.py`):**
+    - Added `test_receipt_store_append_and_query_latency()` benchmarking decision append latency (p95 < 25 ms target), paginated query latency (p95 < 15 ms target), and streaming export latency (p95 < 50 ms target) under SQLite WAL mode.
+  - **Threat Model Updates (`docs/threat-model.md`):**
+    - Updated T3, T4, and T6 to reflect supported DPAPI secrets broker, cumulative budgets, and dual-layer streaming audit log archival.
+    - Added T11 (Capability delegation hijack / warrant tampering and replay mitigations) and T12 (SSRF / cloud metadata exfiltration and redirect mitigations).
+  - **Operational Maintenance Architecture (`docs/architecture.md`):**
+    - Added Section 3 detailing SQLite WAL and hot online backups (`VACUUM INTO`), bounded streaming log archival, dual-layer context verification (`actentra verify-log -e`), crash recovery (`ReceiptStore.recover_pending_outcomes`), and scoped credential resolution with zero-leak redaction.
+  - **Validation & Test Suite:**
+    - Total test suite: 119 passed, 4 skipped, 0 failures.
+    - Ruff: All checks passed.
+    - Mypy: Success (0 issues in 28 source files, strict mode).
