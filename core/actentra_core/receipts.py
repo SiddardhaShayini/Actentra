@@ -161,10 +161,10 @@ def _compute_entry_hash(
 class ReceiptStore:
     """Append-only SQLite WAL receipt store with SHA-256 hash chaining."""
 
-    def __init__(self, db_path: str | Path, *, synchronous: str = "FULL") -> None:
+    def __init__(self, db_path: str | Path, *, synchronous: str = "NORMAL") -> None:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._synchronous = synchronous if synchronous in ("FULL", "NORMAL", "EXTRA") else "FULL"
+        self._synchronous = synchronous if synchronous in ("FULL", "NORMAL", "EXTRA") else "NORMAL"
         self._init_db()
 
     @property
