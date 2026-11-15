@@ -293,3 +293,21 @@ Agents working on this project must maintain this file as the durable handoff:
     - Total test suite: 116 passed, 4 skipped (Windows sandbox loopback/symlink privileges), 0 failures.
     - Ruff: All checks passed.
     - Mypy: Success (0 errors in 28 source files, strict mode).
+
+### 2026-11-15 18:37 IST
+
+- Implemented CLI and Documentation alignment from `PLAN_V3.md`:
+  - **CLI Archival and Context Integrity Verification (`main.py`, `reporting.py`):**
+    - Added `--verify-envelopes` (`-e`) flag to `actentra verify-log` and `actentra report`, verifying that stored action envelopes exist and recomputed action hashes match decision receipts.
+    - Added `actentra archive-log <db_path> <archive_db> --before-seq <N> [--delete-from-source]` command, enabling operators to partition large logs into standalone verifiable archive databases and prune source logs from the command line.
+    - Updated `build_audit_summary()` to support optional `verify_envelopes` check.
+  - **Authoritative Status & Invariant-to-Test Matrix (`docs/product-status.md`, `README.md`):**
+    - Graduated DPAPI Secrets Broker and Cryptographic Warrants to **Supported** tier following their end-to-end integration into `ScopedHTTPExecutor` and `Boundary`.
+    - Added Bounded Streaming Audit & Archival as a Supported core capability.
+    - Added **Section 2: Invariant-to-Test Evidence Matrix** in `docs/product-status.md`, explicitly mapping Invariants I1–I7, Warrants, SSRF guards, FS containment, Canary fidelity, and Streaming Audit to their exact test suite files.
+    - Synchronized `README.md` feature highlights with current capabilities.
+  - **Validation & Test Suite:**
+    - Added `test_cli_verify_and_archive_commands` in `tests/golden/test_golden_sdk_cli.py`.
+    - Total test suite: 117 passed, 4 skipped (Windows sandbox loopback/symlink restrictions), 0 failures.
+    - Ruff: All checks passed.
+    - Mypy: Success (0 issues in 28 source files, strict mode).

@@ -20,9 +20,11 @@
 - **Zero LLM in the Enforcement Path:** Policy evaluation is 100% deterministic, reproducible, and explainable in sub-millisecond time.
 - **Strictly Fail-Closed & Local-Only Posture:** Loopback binding by default (`127.0.0.1`), strictly typed fail-closed approval API, origin isolation rejecting untrusted cross-origin browser requests, compulsory token auth for remote binding.
 - **SSRF-Defended HTTP & Scoped Executors:** Built-in executors for Filesystem, SQLite, and HTTP with private IP / metadata blocking and parameter constraints.
+- **DPAPI Secrets Broker & Credential Resolution:** Encrypts tool secrets with Windows DPAPI at rest, resolves credential references (`secret:<NAME>`) dynamically during HTTP execution, and scrubs secrets from logs, errors, and responses.
 - **Dynamic Session Taint Tracking:** Automatically labels sessions tainted upon reading untrusted content (indirect prompt injection defense) and blocks untrusted network egress.
 - **Cumulative Session Budgets:** Enforces caps on total actions, write bytes, and external calls across both gateway and external executions to prevent infinite loops and slow-drip exfiltration.
-- **Cryptographic Capability Warrants (Experimental):** Scoped, expiring Ed25519-signed delegation tokens for subagents and distributed workers without ambient credentials.
+- **Cryptographic Capability Warrants:** Scoped, expiring Ed25519-signed delegation tokens for subagents with cryptographic signature verification, holder matching, scope enforcement, and use-quota tracking integrated into Boundary.
+- **Bounded Streaming Audit Log & Archival:** Memory-bounded streaming log iteration, chunked export, envelope-integrity verification, and standalone SQLite archive partitioning.
 - **Policy Canary Diff Engine:** Replays recorded agent traffic against proposed policies to detect regressions with context integrity, provenance, and temporal window modeling.
 - **Standalone HTML Audit Reports:** Generates zero-external-CDN audit reports with SVG security badges and chronological timelines.
 - **Agent Framework Adapters:** First-class adapters for LangChain and OpenAI function calling.

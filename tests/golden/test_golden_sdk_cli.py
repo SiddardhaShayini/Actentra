@@ -13,7 +13,7 @@ from actentra_cli.main import app
 from actentra_core.envelope import ProvenanceItem, build_envelope
 from actentra_core.policy import load_policy_file
 from actentra_core.receipts import ReceiptStore, verify_log
-from actentra_core.verdict import Verdict
+from actentra_core.verdict import Decision, Verdict
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -154,3 +154,58 @@ def test_cli_commands_smoke(tmp_path: Path) -> None:
     assert "[ALLOW]" in res_demo.output
     assert "[BLOCKED]" in res_demo.output
     assert "[VERIFY] ok=True" in res_demo.output
+
+
+def test_cli_verify_and_archive_commands(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "cli_test.db"
+    store = ReceiptStore(db_path)
+    env = build_envelope(
+        tool="fs.read",
+        verb="read",
+        resource="path:C:/work/notes.txt",
+        session_id="s1",
+    )
+    dec = Decision(
+        verdict=Verdict.ALLOW,
+        rule_id="r1",
+        reason="ok",
+        policy_version="1",
+        canonical_hash=env.canonical_hash,
+    )
+    store.record_decision(env, dec)
+    store.record_outcome(
+        crossing_id=env.crossing_id,
+        session_id=env.session_id,
+        canonical_hash=env.canonical_hash,
+        policy_version=dec.policy_version,
+        status="success",
+    )
+
+    # 1. verify-log with --verify-envelopes
+    res_v = runner.invoke(app, ["verify-log", str(db_path), "--verify-envelopes"])
+    assert res_v.exit_code == 0
+    assert "OK verified 2 record(s) (including action envelopes)" in res_v.output
+
+    # 2. report with --verify-envelopes
+    res_r = runner.invoke(app, ["report", str(db_path), "--verify-envelopes"])
+    assert res_r.exit_code == 0
+    assert "Integrity Status    : OK" in res_r.output
+
+    # 3. archive-log
+    archive_db = tmp_path / "archived.db"
+    res_a = runner.invoke(
+        app,
+        [
+            "archive-log",
+            str(db_path),
+            str(archive_db),
+            "--before-seq",
+            "3",
+            "--delete-from-source",
+        ],
+    )
+    assert res_a.exit_code == 0
+    assert "Archived 2 record(s)" in res_a.output
+    assert len(store.iter_records()) == 0
+

@@ -46,12 +46,14 @@ class AuditSummary:
     items: tuple[CrossingAuditItem, ...] = field(default_factory=tuple)
 
 
-def build_audit_summary(db_path: str | Path) -> AuditSummary:
+def build_audit_summary(
+    db_path: str | Path, *, verify_envelopes: bool = False
+) -> AuditSummary:
     """Analyze an Actentra receipt database and produce an immutable AuditSummary."""
     path = Path(db_path)
     store = ReceiptStore(path)
     records = store.iter_records()
-    vr = verify_log(path)
+    vr = verify_log(path, verify_envelopes=verify_envelopes)
 
     decisions_by_crossing: dict[str, ReceiptRecord] = {}
     outcomes_by_crossing: dict[str, ReceiptRecord] = {}

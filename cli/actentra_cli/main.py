@@ -198,25 +198,74 @@ def policy_canary_cmd(
 @app.command("verify-log")
 def verify_log_cmd(
     db_path: Annotated[Path, typer.Argument(help="Path to SQLite receipt database.")],
+    verify_envelopes: Annotated[
+        bool,
+        typer.Option(
+            "--verify-envelopes",
+            "-e",
+            help="Verify that stored action envelopes exist and recomputed hashes match.",
+        ),
+    ] = False,
 ) -> None:
     """Verify hash-chain integrity of an Actentra receipt database."""
-    result = verify_log(db_path)
+    result = verify_log(db_path, verify_envelopes=verify_envelopes)
     if not result.ok:
         typer.echo(f"VERIFICATION FAILED ({result.total_records} records):", err=True)
         for err in result.errors:
             typer.echo(f"  - {err}", err=True)
         raise typer.Exit(code=1)
-    typer.echo(f"OK verified {result.total_records} record(s); head={result.last_hash}")
+    env_note = " (including action envelopes)" if verify_envelopes else ""
+    typer.echo(f"OK verified {result.total_records} record(s){env_note}; head={result.last_hash}")
 
 
 @app.command("export-log")
 def export_log_cmd(
     db_path: Annotated[Path, typer.Argument(help="Path to SQLite receipt database.")],
     out_path: Annotated[Path, typer.Argument(help="Output JSONL path.")],
+    chunk_size: Annotated[
+        int,
+        typer.Option("--chunk-size", "-c", help="Bounded chunk size for streaming export."),
+    ] = 500,
 ) -> None:
     """Export all receipt records to a JSONL file."""
-    count = export_jsonl(db_path, out_path)
+    count = export_jsonl(db_path, out_path, chunk_size=chunk_size)
     typer.echo(f"Exported {count} receipt record(s) to {out_path}")
+
+
+@app.command("archive-log")
+def archive_log_cmd(
+    db_path: Annotated[Path, typer.Argument(help="Path to source SQLite receipt database.")],
+    archive_db: Annotated[Path, typer.Argument(help="Path to target archive SQLite database.")],
+    before_seq: Annotated[
+        int,
+        typer.Option(
+            "--before-seq",
+            "-s",
+            help="Archive receipt records with sequence number strictly less than this value.",
+        ),
+    ],
+    delete_from_source: Annotated[
+        bool,
+        typer.Option(
+            "--delete-from-source",
+            "-d",
+            help="Delete archived records from source database after copying.",
+        ),
+    ] = False,
+) -> None:
+    """Archive older receipts and action envelopes into a separate archive database."""
+    if not db_path.exists():
+        typer.echo(f"Source receipt database not found: {db_path}", err=True)
+        raise typer.Exit(code=1)
+
+    store = ReceiptStore(db_path)
+    count = store.archive_records(
+        before_seq=before_seq,
+        archive_db_path=archive_db,
+        delete_from_source=delete_from_source,
+    )
+    del_note = " and pruned from source" if delete_from_source else ""
+    typer.echo(f"Archived {count} record(s) (seq < {before_seq}) to {archive_db}{del_note}.")
 
 
 @app.command("report")
@@ -226,13 +275,21 @@ def report_cmd(
         Path | None,
         typer.Option("--html", "-o", help="Optional output path for HTML report."),
     ] = None,
+    verify_envelopes: Annotated[
+        bool,
+        typer.Option(
+            "--verify-envelopes",
+            "-e",
+            help="Verify action envelope integrity during audit report.",
+        ),
+    ] = False,
 ) -> None:
     """Generate an audit report and summary from an Actentra receipt database."""
     if not db_path.exists():
         typer.echo(f"Receipt database not found: {db_path}", err=True)
         raise typer.Exit(code=1)
 
-    summary = build_audit_summary(db_path)
+    summary = build_audit_summary(db_path, verify_envelopes=verify_envelopes)
     status_str = "OK" if summary.integrity_ok else "FAILED"
     typer.echo(f"=== Actentra Audit Report: {db_path} ===")
     typer.echo(
