@@ -1,0 +1,148 @@
+# Actentra — Project Memory 2
+
+**Updated:** 2026-11-16  
+**Purpose:** Current handoff for future agents. This file carries forward the durable rules and architecture from `PROJECT_MEMORY.md`, updates the status to reflect the current repository, and adds the V4 evidence/research direction. The original memory remains historical context; routine future memory updates belong in this file, not `PROJECT_MEMORY.md`, unless the user explicitly asks otherwise.
+
+## Project summary
+
+Actentra is a lightweight, local-first, deterministic execution boundary for AI agents. It evaluates tool actions against policy, can require human approval, dispatches through scoped executors, and records decision/execution outcomes. Enforcement must not depend on an LLM.
+
+The current repository is substantially beyond an initial planned MVP: it includes a Python core and SDK, CLI, function-calling and LangChain adapters, MCP stdio proxy, local HTTP gateway/operator console, scoped filesystem/SQLite/HTTP executors, SQLite WAL receipts and pending approvals, policy dry-run/canary/replay, signed checkpoints, secrets and warrant primitives, schemas, corpora, and tests. The project is still an early local-first product/prototype; broad module presence is not by itself proof of a production guarantee.
+
+**Core identity:** Actentra determines whether a mediated action is permitted, how it is constrained/executed, and what its execution path reports. Verifying whether resulting external state exists and remains valid is a possible additive capability, not a current guarantee. Use [PLAN_V4.md](PLAN_V4.md) as the current strategic direction and [docs/product-status.md](docs/product-status.md) as the implementation capability matrix, subject to source/test evidence.
+
+## Required context for agents
+
+1. Before project changes, read [PLAN_V4.md](PLAN_V4.md) and this file. Consult [docs/product-status.md](docs/product-status.md), [docs/lifecycle-contract.md](docs/lifecycle-contract.md), [docs/guarantees-and-limits.md](docs/guarantees-and-limits.md), and relevant source/tests for the affected behavior.
+2. `PROJECT_MEMORY.md` is retained as history. **Update `PROJECT_MEMORY_2.md`, not `PROJECT_MEMORY.md`, for routine memory maintenance.** Preserve prior entries in this file and append a dated/timed entry; do not silently rewrite history.
+3. Keep changes surgical, preserve existing work, follow the current lifecycle contract, and validate the exact behavior with the smallest relevant test/check when implementation is requested.
+4. Do not treat plans, README claims, or historical reviews as proof of current behavior. Inspect current source and tests. Label static observations, test evidence, assumptions, and proposals distinctly.
+5. Do not claim that a receipt hash proves external truth, that approval means execution, or that a successful caller report independently verifies an outcome.
+6. Avoid adding infrastructure or dependencies without a concrete use case. Prefer existing `AppServices`, `ExecutorRegistry`, `ReceiptStore`, SQLite, CLI, and embedded console.
+
+## Architecture reference
+
+- **Core:** `core/actentra_core/` — envelope and canonicalization, risk, YAML policy/verdicts, rate/cumulative budgets, receipts and pending approvals, canary, checkpoints, reporting, and warrants.
+- **SDK/adapters:** `sdk/python/actentra/` — `Boundary.execute()` / `@guard`, secrets broker, function-calling adapter, and LangChain wrapper.
+- **Executors:** `executors/actentra_executors/` — scoped filesystem, SQLite, and SSRF-defended HTTP.
+- **Gateway:** `gateway/actentra_gateway/` — `AppServices`, executor registry, HTTP service, embedded console, MCP stdio proxy.
+- **CLI:** `cli/actentra_cli/main.py` — policy, simulation/replay, gateway, MCP, audit, archive, report, checkpoint, warrant, and approval operations.
+- **Contracts and examples:** `spec/`, `policies/`, and `corpus/`.
+- **Tests/CI:** `tests/` includes unit, golden, chaos, property, replay, and performance suites; [ci.yml](.github/workflows/ci.yml) runs Windows Python 3.12 CI checks.
+- **Python/runtime dependencies:** Python `>=3.12`; PyYAML, `cryptography`, and Typer are runtime dependencies. The product uses standard-library SQLite and HTTP components.
+
+## Historical context carried forward
+
+The original memory contains the detailed dated implementation log. Retain it as historical context; do not copy old status claims forward as current facts. Key milestones and lessons recorded there:
+
+- **2026-11-12:** Established the spec-first kernel, SDK/CLI, filesystem executor, MCP proxy, SQLite executor, schemas, starter policy, incident corpus, and initial tests. Canonicalization must reject suspicious leading/trailing whitespace instead of silently normalizing it. Python SQLite connection context managers do not close their handles; use explicit close/cleanup where needed.
+- **2026-11-13:** Added HTTP/SQLite executors, approvals, gateway/services/console, budgets, taint, canary, warrants, secrets, checkpoints, reports, and lifecycle documentation. Windows symlink/junction checks may require privileges; keep deterministic mocked coverage in addition to privilege-gated tests. Use a controllable clock for TTL tests instead of timing-sensitive sleeps.
+- **2026-11-13 to 2026-11-15:** Addressed historical review findings around approval validation/claims, redirects, remote binding gates, UI escaping, session taint/budget hooks, outcome uniqueness, envelope checks, and bounded receipt operations. Later source and tests supersede the corresponding old review snapshot where confirmed.
+- **2026-11-14 to 2026-11-15:** Expanded end-to-end warrant/secret integration, streaming receipt export/verification/archive, canonicalization vectors, and performance tests; aligned product status and documentation with features believed implemented at that time.
+
+The original log reports test/lint/type-check results at historical points. They were not rerun as part of this memory/plan analysis and must not be presented as current validation.
+
+### Main action lifecycle
+
+Agent/caller proposal → canonical `ActionEnvelope` → deterministic risk and policy evaluation → `DENY`/`HOLD`/`ASK`/`ALLOW` → persisted decision → explicit approval if required → scoped executor or registered callable → outcome record → optional separate state observation.
+
+Relevant entry points:
+
+- `Boundary.execute()` / `Boundary.dry_run()` in [boundary.py](sdk/python/actentra/boundary.py).
+- `AppServices.submit_crossing()`, `_dispatch_and_record()`, `resolve_approval()`, and `execute_approved_crossing()` in [services.py](gateway/actentra_gateway/services.py).
+- HTTP routes in [http_service.py](gateway/actentra_gateway/http_service.py), including `/v1/crossings`, `/v1/crossings/pending`, approval/execute/outcome continuations, `/v1/receipts`, `/v1/verify`, `/v1/bundle/export`, and `/ui`.
+- Persistent records, pending approvals, envelope context, receipt verification, and recovery helpers in [receipts.py](core/actentra_core/receipts.py).
+
+## Existing guarantees and their limits
+
+- **Deterministic enforcement:** The core policy path does not need LLM inference. Default policy verdicts are fail-closed.
+- **Approval:** SQLite stores pending approval status/expiry; approvals are action-hash scoped and the gateway has an atomic claim-for-execution path. Approval is not execution.
+- **Audit:** Decision/outcome receipt records are linked by a SHA-256 hash chain; envelopes and approvals are persisted in SQLite. This detects many accidental/local edits but is not immutable against an administrator who can rewrite the database unless an independently protected checkpoint anchors it.
+- **Outcome:** An Actentra-registered executor reports its own result to the service; external execution can be reported by a caller and is labeled `caller-reported`. Neither a caller-supplied result hash nor a result hash alone proves current real-world state.
+- **Context binding:** The action hash covers envelope version, session ID, agent ID, and action. It does not currently bind all provenance/intent context. Envelope integrity verification therefore should not be described as integrity over every trust-relevant field.
+- **Restart:** SQLite receipts, action envelopes, and approval statuses persist. Taint, budget counters, policy rate-limit buckets, freeze state, and warrant-use counters are process-local. `recover_pending_outcomes()` and `recover_pending_approvals()` exist, but are not automatically invoked by a production startup call site in the inspected source.
+- **Recovery caution:** Do not blindly recover every allowed decision without an outcome as `unknown`: some decision-only crossings are awaiting external execution/outcome. First distinguish not-dispatched from dispatch-started/uncertain.
+- **Identity:** Gateway `session_id`, `agent_id`, and provenance may arrive in caller input. Treat them as caller claims unless a trusted integration assigns/authenticates them.
+- **Security boundary:** Actentra mediates only calls routed through it. It does not replace OS/cloud IAM or protect against a fully compromised host. Keep loopback as the normal mode; explicit remote binding does not make the built-in plain-HTTP server a remote control plane.
+- **Audit/resource bounds:** Receipt pages and request bodies have caps; streaming audit features exist. Some full-history paths (e.g. audit bundle/canary materialization) can still consume memory proportional to log size.
+
+## Product and change conventions
+
+- Preserve the small local-first design: Windows 11, 8 GB RAM, Intel i5, CPU-only, no requirement for Docker or a local GPU.
+- Keep decision-making deterministic and explainable. A model may propose an action but must never authorize itself.
+- Preserve `DENY`/`HOLD`/`ASK`/`ALLOW` distinctions and fail closed on invalid input or unavailable durable decision recording.
+- Use existing schemas and patterns; version persisted data changes and test old-database compatibility.
+- Keep identity and provenance authority explicit; do not trust model-supplied `agent_id`, intent, or trust labels as authentication.
+- Prefer explicit typed lifecycle and evidence state over implicit booleans. Distinguish proposal, decision, approval, dispatch, outcome, observation, and stale/unknown state.
+- Add evidence as a small, separate, versioned data shape. Minimize retained data; do not store raw file/API contents by default.
+- Keep state observations scoped, timestamped, source-labeled, and freshness-bounded. A verified observation is only as trustworthy as its verifier and trust domain.
+- Build causal trace with typed SQLite references and views; do not add a graph database just to render a graph.
+- Keep `PROJECT_MEMORY_2.md` current when project files are created/edited/moved/deleted: append local date/time, paths changed, reason, key decisions/assumptions, and validation status. Do not record secrets or unnecessary personal data.
+
+## Hardware and lightweight-work rules
+
+Development is on a **Windows 11 laptop with 8 GB RAM, Intel i5 CPU, and no GPU**. Lightweight operation is a core requirement:
+
+- Avoid actions likely to cause out-of-memory conditions, sustained high memory use, CPU saturation, or disruptive lag.
+- Prefer small incremental work and bounded processes, workers, queues, test data, and timeouts. Avoid unnecessary parallel builds or test runs.
+- Do not start heavy VMs, Docker, large model downloads, GPU/ML stacks, load tests, fuzzing, or other resource-intensive jobs on the laptop by default. Keep heavy or long-running checks opt-in or in CI where practical.
+- Do not enable a background daemon or automatic startup by default. Ask before an action whose resource impact is uncertain or potentially disruptive.
+- Treat resource figures in plans/tests as targets to measure on the actual device, not guarantees.
+- Prefer SQLite and existing standard-library components over network services, vector stores, or multiple processes.
+- Hosted inference is optional. Before sending project data to any provider, explain the data/privacy implications and use only user-authorized credentials. Free-tier availability and pricing may change.
+
+## GPU / High-Resource Testing Guidance
+
+If a task requires GPU resources, larger models, or hardware beyond the available local machine:
+
+- Inform the user before proceeding with that approach.
+- Explain why local execution is unsuitable.
+- Recommend an appropriate alternative, such as Kaggle notebooks with GPU.
+- Provide clear, step-by-step guidance for setting up and running the experiment on Kaggle.
+- Keep local development and GPU experimentation clearly separated.
+- Never assume GPU access or silently introduce resource-intensive requirements.
+
+This guidance does not imply that Actentra’s authorization or first demonstration needs GPU resources; they do not.
+
+## Status and strategy
+
+- Near-term priority: reconcile lifecycle/identity/evidence claims and deliver a restart-safe local gateway demonstration using existing components.
+- Next high-value research step: one narrowly scoped read-only state verifier with explicit freshness and provenance.
+- Later: causal references in SQLite, then a constrained A→B→C handoff experiment.
+- Defer general world models, autonomous agent teams, graph/vector databases, cloud control plane, SSO, desktop shell, and broad connector expansion until real user need and measured constraints justify them.
+- Use [PLAN_V4.md](PLAN_V4.md) as the project roadmap; keep [docs/product-status.md](docs/product-status.md) aligned with implementation evidence.
+
+## Change log
+
+### 2026-11-16 10:31 IST
+
+- Created `PLAN_V4.md` and `PROJECT_MEMORY_2.md`; did not modify `PROJECT_MEMORY.md` or source/configuration files.
+- Why: provide a source-grounded current roadmap and a current handoff file that future agents update instead of the original memory file.
+- Analysis: static inspection only. No commands, tests, builds, services, installs, or runtime experiments were executed.
+- Key decisions: preserve Actentra’s deterministic action-boundary purpose; prioritize an existing-component local demo; evaluate state evidence as an additive, scoped SQLite capability; defer general graph infrastructure and multi-agent continuity until identity/evidence foundations are established.
+
+### 2026-11-16 15:15 IST
+
+- Implemented Phase 0 (Contract and evidence baseline reconciliation) and Phase 1 (Restart-safe action demonstration and execution lifecycle fixes).
+- Files modified/created:
+  * `gateway/actentra_gateway/demo.py`: Added full end-to-end restart-safe demonstration runner (`run_gateway_demonstration`).
+  * `gateway/actentra_gateway/__init__.py`: Exported demo functions and types.
+  * `examples/gateway_demo.py`: Added standalone demonstration entry point script.
+  * `cli/actentra_cli/main.py`: Added `actentra demo-gateway` command and `--gateway` flag to `actentra demo`.
+  * `sdk/python/actentra/boundary.py`: Added `Boundary.consume_approval` for explicit in-memory grant consumption.
+  * `gateway/actentra_gateway/services.py`: Fixed `execute_approved_crossing` to honor SQLite-persisted approvals across process restarts and atomically claim them with `claim_approval_for_execution`; automated expired approval cleanup on startup.
+  * `docs/lifecycle-contract.md`: Reconciled lifecycle states (`CONSUMED`), persistence scope vs. process-local state, identity authority, outcome evidence tiers (first-party vs caller-reported), and restart recovery semantics.
+  * `docs/product-status.md`: Updated capability matrix and test mapping to document restart-safe gateway demonstration and evidence tiers.
+  * `README.md`: Added demonstration instructions to Quick Start.
+  * `tests/unit/test_gateway_demo.py`: Added comprehensive unit tests for demo execution, CLI invocation, and HTTP handler dispatch.
+  * `tests/unit/test_app_services.py`: Added unit test verifying execution of approved crossing across process restarts.
+- Key decisions & rationale:
+  * Preserved deterministic policy evaluation and deny-by-default architecture; zero model in enforcement loop.
+  * Preserved backwards compatibility of Envelope v1 canonical hashes and test vectors while clarifying context binding limits.
+  * Maintained strict separation between first-party executor results and caller-reported external outcomes.
+  * Avoided adding any new server processes, heavy frameworks, or external dependencies.
+- Validation:
+  * All 123 tests passing with 0 failures (`uv run pytest -m "not slow"`).
+  * `uv run ruff check` clean (all source files pass).
+  * `uv run mypy` strict type check passes with 0 issues across all source files.
+  * `actentra demo-gateway` executed and verified manually.

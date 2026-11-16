@@ -86,20 +86,28 @@
 .venv\Scripts\actentra dry-run -p policies/examples/starter.yaml -t fs.read -r "path:C:/work/.env" -v read
 ```
 
-### 3. Launch the Local Operator Console
+### 3. Run the Restart-Safe Action Demonstration
+
+```powershell
+# Execute the complete end-to-end restart-safe lifecycle demonstration
+# (Allowed read -> ASK delete -> process restart -> approval -> restart -> execution -> duplicate rejection -> verify)
+.venv\Scripts\actentra demo --gateway
+```
+
+### 4. Launch the Local Operator Console
 
 ```powershell
 .venv\Scripts\actentra serve --policy policies/examples/starter.yaml --port 8080
 ```
 - Open `http://127.0.0.1:8080/ui` in your browser to view pending approvals, verify hash-chain integrity, and inspect active crossings.
 
-### 4. Generate an HTML Audit Report
+### 5. Generate an HTML Audit Report
 
 ```powershell
 .venv\Scripts\actentra report receipts.db --html audit_report.html
 ```
 
-### 5. Replay 32 Documented Agent Incidents
+### 6. Replay 32 Documented Agent Incidents
 
 ```powershell
 .venv\Scripts\actentra replay corpus/incidents/agent_incidents.jsonl --policy policies/examples/starter.yaml

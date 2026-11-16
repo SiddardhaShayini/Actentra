@@ -39,6 +39,7 @@ from actentra_core.warrants import (
     verify_warrant,
 )
 from actentra_executors.fs import LocalFSExecutor, ScopedFSTools
+from actentra_gateway.demo import run_gateway_demonstration
 from actentra_gateway.http_service import serve_http
 from actentra_gateway.mcp_proxy import serve_stdio
 from actentra_gateway.services import AppServices, ExecutorRegistry
@@ -546,9 +547,22 @@ def run(
         typer.echo(f"[VERIFY] ok={vr.ok} records={vr.total_records} head={vr.last_hash}")
 
 
-@app.command()
-def demo() -> None:
+@app.command("demo")
+def demo(
+    gateway: Annotated[
+        bool,
+        typer.Option(
+            "--gateway",
+            "-g",
+            help="Run full restart-safe HTTP gateway and approval demonstration.",
+        ),
+    ] = False,
+) -> None:
     """Run a self-contained local demo showing allow, block, and receipt verification."""
+    if gateway:
+        run_gateway_demonstration(echo=typer.echo)
+        return
+
     policy = load_policy_yaml(_DEFAULT_STARTER_POLICY)
     with tempfile.TemporaryDirectory(prefix="actentra-demo-") as tmpdir:
         db_path = Path(tmpdir) / "receipts.db"
@@ -595,6 +609,25 @@ def demo() -> None:
 
         vr = verify_log(db_path)
         typer.echo(f"[VERIFY] ok={vr.ok} records={vr.total_records} head={vr.last_hash}")
+
+
+@app.command("demo-gateway")
+def demo_gateway_cmd(
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Custom workspace directory for demo fixtures."),
+    ] = None,
+    db_path: Annotated[
+        Path | None,
+        typer.Option("--db", help="Path to SQLite receipt database."),
+    ] = None,
+) -> None:
+    """Run the restart-safe HTTP gateway and persistent human approval demonstration."""
+    run_gateway_demonstration(
+        workspace_dir=workspace,
+        db_path=db_path,
+        echo=typer.echo,
+    )
 
 
 @app.command("mcp-proxy")

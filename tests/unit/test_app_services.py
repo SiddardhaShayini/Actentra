@@ -90,6 +90,65 @@ def test_persistent_approvals_survive_restart(tmp_path: Path) -> None:
     assert rec.status == "approved"
 
 
+def test_execute_approved_crossing_survives_restart(tmp_path: Path) -> None:
+    """Invariant: An approved crossing can be executed after process restart."""
+    db_path = tmp_path / "approved_exec_restart.db"
+    store1 = ReceiptStore(db_path)
+    policy = load_policy_yaml(_test_policy())
+    boundary1 = Boundary(policy=policy, receipt_store=store1, session_id="sess-exec-restart")
+    registry1 = ExecutorRegistry()
+    test_file = tmp_path / "target.txt"
+    test_file.write_text("must be deleted", encoding="utf-8")
+    registry1.register_fs(tmp_path)
+    services1 = AppServices(boundary1, executor_registry=registry1)
+
+    # 1. Propose action producing ASK
+    sub = services1.submit_crossing(
+        {
+            "tool": "fs.delete",
+            "verb": "delete",
+            "resource": f"path:{test_file.as_posix()}",
+            "params": {"path": "target.txt"},
+            "session_id": "sess-exec-restart",
+        },
+        execute=True,
+    )
+    cid = sub["crossing_id"]
+    assert sub["verdict"] == "ask"
+    assert test_file.exists()
+
+    # 2. Operator resolves approval in Process 1 (without immediate execution)
+    res = services1.resolve_approval(cid, approved=True, execute=False)
+    assert res["status"] == "approved"
+    assert test_file.exists()
+
+    # 3. Simulate process crash / restart
+    del services1
+    del boundary1
+    del store1
+
+    # 4. Process 2 starts with same SQLite DB and executor registry
+    store2 = ReceiptStore(db_path)
+    boundary2 = Boundary(policy=policy, receipt_store=store2, session_id="sess-exec-restart")
+    registry2 = ExecutorRegistry()
+    registry2.register_fs(tmp_path)
+    services2 = AppServices(boundary2, executor_registry=registry2)
+
+    # 5. Execute the approved crossing in the new process!
+    exec_res = services2.execute_approved_crossing(cid)
+    assert exec_res.get("status") == "success"
+    assert not test_file.exists()  # Target file has been deleted by LocalFSExecutor
+
+    # 6. Verify duplicate execution is rejected
+    dup_res = services2.execute_approved_crossing(cid)
+    assert "error" in dup_res
+    assert "not in approved state" in dup_res["error"] or "could not be claimed" in dup_res["error"]
+
+    # 7. Audit log verification
+    vr = verify_log(db_path, verify_envelopes=True)
+    assert vr.ok
+
+
 def test_approval_ttl_expiration(tmp_path: Path) -> None:
     """Expired approvals cannot be resolved and are automatically marked expired."""
     db_path = tmp_path / "expiry.db"

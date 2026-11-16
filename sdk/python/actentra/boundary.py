@@ -281,6 +281,12 @@ class Boundary:
                 expires_at=time.monotonic() + self._approval_ttl,
             )
 
+    def consume_approval(self, canonical_hash: str, *, session_id: str | None = None) -> bool:
+        """Explicitly consume/remove an in-memory approval grant."""
+        sid = session_id or self._session_id
+        with self._lock:
+            return self._approvals.pop((sid, canonical_hash), None) is not None
+
     def get_session_taint(self, session_id: str | None = None) -> str | None:
         """Return the cumulative taint level for a session."""
         sid = session_id or self._session_id

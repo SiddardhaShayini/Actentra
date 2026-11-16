@@ -82,6 +82,8 @@ class AppServices:
         self.boundary = boundary
         self.registry = executor_registry or ExecutorRegistry()
         self.approval_ttl_seconds = approval_ttl_seconds
+        # Clean up expired approvals upon service startup (idempotent, restart-safe)
+        self.boundary.receipt_store.recover_pending_approvals()
 
     # --- 1. Health & Status ---
 
@@ -330,6 +332,10 @@ class AppServices:
             return {
                 "error": f"Crossing '{crossing_id}' is not in approved state (status={p.status})"
             }
+        if p.expires_at <= time.time():
+            return {
+                "error": f"Crossing '{crossing_id}' approval has expired"
+            }
 
         raw_env = self.boundary.receipt_store.get_envelope(crossing_id)
         if raw_env is None:
@@ -354,8 +360,15 @@ class AppServices:
             crossing_id=crossing_id,
         )
 
+        if envelope.canonical_hash != p.canonical_hash:
+            return {
+                "error": "Canonical hash mismatch between pending approval and stored envelope",
+                "crossing_id": crossing_id,
+            }
+
         decision = self.boundary.engine.evaluate(envelope)
-        if decision.verdict == Verdict.ASK and self.boundary._has_valid_approval(envelope):
+        if decision.verdict == Verdict.ASK:
+            # Crossing was approved by human operator and verified in SQLite pending_approvals
             decision = Decision(
                 verdict=Verdict.ALLOW,
                 rule_id=f"{decision.rule_id}:approved",
@@ -396,6 +409,9 @@ class AppServices:
                 ),
                 "crossing_id": crossing_id,
             }
+
+        # Consume any corresponding in-memory approval grant
+        self.boundary.consume_approval(envelope.canonical_hash, session_id=envelope.session_id)
 
         try:
             result = self._dispatch_and_record(envelope, decision, executor)

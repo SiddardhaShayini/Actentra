@@ -78,18 +78,60 @@ Every supported integration path adheres to the following linear lifecycle:
 
 | State | Description | Next Valid States |
 | --- | --- | --- |
-| `PROPOSED` | Action has been submitted by agent or caller. | `EVALUATED`, `INVALID` |
-| `INVALID` | Canonicalization or envelope schema validation failed. | `HOLD` (terminal) |
+| `PROPOSED` | Action submitted by agent or caller. | `EVALUATED`, `INVALID` |
+| `INVALID` | Canonicalization or envelope validation failed. | `HOLD` (terminal) |
 | `EVALUATED` | Deterministic engine produced a verdict (`ALLOW`, `ALLOW_WITH_CONSTRAINTS`, `DENY`, `HOLD`, `ASK`). | `PENDING_APPROVAL`, `RECORDING_DECISION`, `TERMINATED` |
-| `PENDING_APPROVAL` | Verdict was `ASK`. Awaiting operator resolution. Persisted in SQLite WAL. | `APPROVED`, `REJECTED`, `EXPIRED` |
-| `APPROVED` | Human operator approved the exact `canonical_hash` for the session. | `EXECUTING`, `EXPIRED` |
-| `REJECTED` | Human operator rejected the pending action. | `TERMINATED` (terminal) |
+| `PENDING_APPROVAL` | Verdict was `ASK`. Awaiting human operator resolution. Persisted in SQLite WAL. | `APPROVED`, `REJECTED`, `EXPIRED` |
+| `APPROVED` | Operator approved the exact `canonical_hash`. Survives gateway restarts. | `CONSUMED` (dispatch started), `EXPIRED` |
+| `REJECTED` | Operator rejected the pending action. | `TERMINATED` (terminal) |
 | `EXPIRED` | Pending approval TTL elapsed without resolution. | `TERMINATED` (terminal) |
+| `CONSUMED` | Approval grant atomically claimed for execution. Prevents concurrent duplicates. | `EXECUTING`, `OUTCOME_UNKNOWN` |
 | `RECORDING_DECISION` | Committing decision receipt to SQLite WAL hash chain. | `EXECUTING`, `TERMINATED` |
-| `EXECUTING` | Action is actively executing within the scoped executor. | `COMPLETED_SUCCESS`, `COMPLETED_FAILURE`, `OUTCOME_UNKNOWN` |
-| `COMPLETED_SUCCESS` | Executor completed successfully; result hash recorded. | `TERMINATED` (terminal) |
-| `COMPLETED_FAILURE` | Executor raised an error; redacted error label recorded. | `TERMINATED` (terminal) |
-| `OUTCOME_UNKNOWN` | Process terminated during execution; recovered as `unknown` upon restart. | `TERMINATED` (terminal) |
+| `EXECUTING` | Action actively running in registered scoped executor or caller callable. | `COMPLETED_SUCCESS`, `COMPLETED_FAILURE`, `OUTCOME_UNKNOWN` |
+| `COMPLETED_SUCCESS` | Execution succeeded; result digest/hash recorded in outcome receipt. | `TERMINATED` (terminal) |
+| `COMPLETED_FAILURE` | Execution failed with error; redacted error label recorded. | `TERMINATED` (terminal) |
+| `OUTCOME_UNKNOWN` | Process terminated during in-flight execution; recovered as `unknown`. | `TERMINATED` (terminal) |
+
+### 3.1 Persistence Scope vs. Process-Local State
+
+Actentra maintains a strict boundary between what is durable across restarts and what is process-local:
+
+- **Persisted in SQLite WAL (survives restart & power cycle):**
+  1. `receipts` table: Append-only hash chain of decision and outcome records (`seq`, `crossing_id`, `session_id`, `canonical_hash`, `policy_version`, `verdict`/`status`, `result_hash`, `error`, `prev_hash`, `entry_hash`).
+  2. `action_envelopes` table: Full canonical action envelope JSON indexed by `crossing_id`.
+  3. `pending_approvals` table: Human approval requests (`crossing_id`, `session_id`, `canonical_hash`, `tool`, `verb`, `resource`, `params`, `risk_tags`, `status`, `expires_at`, `resolution_ts`). Survives in `pending`, `approved`, `rejected`, `expired`, or `consumed` status.
+- **Process-Local State (reset upon process restart):**
+  1. `Boundary` session taint tracking (`_session_taints` dictionary).
+  2. In-memory policy rate-limit token buckets (`RateLimiter._buckets`).
+  3. Cumulative session budget counters (`BudgetTracker._usage`).
+  4. Emergency freeze state (`PolicyEngine._frozen`).
+  5. Cryptographic capability warrant in-memory quota tracking (`WarrantRegistry._use_counts`).
+
+### 3.2 Identity & Provenance Authority
+
+1. **Caller-Asserted Identity:** Over the local HTTP gateway (`/v1/crossings`), caller-supplied `session_id`, `agent_id`, and declared `provenance` are **caller assertions**, not authenticated principals.
+2. **Untrusted Declaration Boundary:** An agent model or untrusted remote caller must never be permitted to authorize itself or elevate its trust classification via self-declared provenance.
+3. **Trusted Integration Harness:** In multi-agent or production workflows, principal identity and session bindings must be injected by the trusted integration wrapper (e.g., authenticated proxy, server-side harness, or DPAPI credentials), not extracted from untrusted model outputs.
+4. **Envelope Action Hash Scope:** The canonical action hash binds `envelope_version`, `session_id`, `agent_id`, and the canonical `ActionSpec`. It does not cover unstructured intent or subjective claims.
+
+### 3.3 Outcome Evidence Classes
+
+Actentra categorizes outcomes into two strictly distinct evidential tiers:
+
+1. **Executor-Observed Outcome (`reported_by: None` / first-party):**
+   - Dispatched through Actentra's registered scoped executors (`LocalFSExecutor`, `ScopedSQLiteExecutor`, `ScopedHTTPExecutor`).
+   - The executor runs within the local boundary and computes the result hash directly from execution return data before recording the outcome receipt.
+2. **Caller-Reported Outcome (`reported_by: "caller"`):**
+   - For externally managed executions, recorded via `POST /v1/crossings/{id}/outcome`.
+   - The receipt explicitly records `reason: "caller-reported"` and returns `reported_by: "caller"`.
+   - **Crucial Distinction:** A caller-reported outcome receipt proves that an external agent reported an outcome to Actentra; it does **not** constitute independent proof of real-world state or proof that a remote system performed the requested effect.
+
+### 3.4 Restart, Crash, and Recovery Semantics
+
+1. **Startup Approval Cleanup:** On startup, `AppServices` calls `ReceiptStore.recover_pending_approvals()`, which transitions any pending or approved records whose TTL has elapsed to `'expired'`. Unexpired pending and approved crossings remain intact and executable.
+2. **Crash Recovery Distinction:** Crossings that were authorized but never dispatched must not be blindly recovered as `unknown`, because decision-only crossings may intentionally await external caller reporting. Only crossings where execution dispatch was actively in flight when the process terminated should be marked `unknown` upon restart.
+3. **Atomic Execution Claims:** Transitioning an approved crossing from `'approved'` to `'consumed'` is performed atomically in SQLite WAL via `claim_approval_for_execution()` with `BEGIN IMMEDIATE`. Concurrent or duplicate execute requests fail closed.
+4. **Local Hash Chain Boundary:** The SQLite SHA-256 hash chain provides tamper evidence against accidental edits and uncoordinated modifications. It does not defend against a hostile root administrator capable of rewriting the database unless anchored to an independently stored, signed Ed25519 checkpoint.
 
 ---
 
