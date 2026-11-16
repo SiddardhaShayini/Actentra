@@ -12,6 +12,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from actentra_core.canonicalize import canonicalize_json, hash_canonical
+from actentra_core.causal import (
+    CausalLink,
+    CausalTraceEdge,
+    CycleDetectedError,
+    detect_cycles,
+)
 from actentra_core.envelope import (
     ActionEnvelope,
     ActionSpec,
@@ -282,6 +288,33 @@ class ReceiptStore:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_obs_observed_at ON observations(observed_at);"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS causal_links (
+                    link_id TEXT PRIMARY KEY,
+                    link_version TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    relation TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_causal_links_source
+                ON causal_links(source_type, source_id);
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_causal_links_target
+                ON causal_links(target_type, target_id);
+                """
             )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to initialize receipt store: {exc}") from exc
@@ -562,6 +595,48 @@ class ReceiptStore:
             )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to fetch decision receipt: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_outcome_receipt(self, crossing_id: str) -> ReceiptRecord | None:
+        """Fetch the outcome receipt record for a crossing_id if one exists."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT seq, record_type, crossing_id, session_id, canonical_hash,
+                       policy_version, verdict, rule_id, reason, risk_tags_json,
+                       shadow, status, result_hash, error, ts, prev_hash, entry_hash
+                FROM receipts
+                WHERE crossing_id = ? AND record_type = 'outcome'
+                ORDER BY seq DESC LIMIT 1;
+                """,
+                (crossing_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            risk_list = json.loads(str(row[9]))
+            return ReceiptRecord(
+                seq=int(row[0]),
+                record_type="outcome",
+                crossing_id=str(row[2]),
+                session_id=str(row[3]),
+                canonical_hash=str(row[4]),
+                policy_version=str(row[5]),
+                verdict=str(row[6]) if row[6] is not None else None,
+                rule_id=str(row[7]) if row[7] is not None else None,
+                reason=str(row[8]) if row[8] is not None else None,
+                risk_tags=tuple(str(t) for t in risk_list),
+                shadow=bool(row[10]),
+                status=str(row[11]) if row[11] is not None else None,
+                result_hash=str(row[12]) if row[12] is not None else None,
+                error=str(row[13]) if row[13] is not None else None,
+                ts=str(row[14]),
+                prev_hash=str(row[15]),
+                entry_hash=str(row[16]),
+            )
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch outcome receipt: {exc}") from exc
         finally:
             conn.close()
 
@@ -1354,6 +1429,177 @@ class ReceiptStore:
             metadata=meta,
             error=str(row[12]) if row[12] is not None else None,
             observation_hash=str(row[13]),
+        )
+
+    # --- 9. Causal Links and Trace (Phase 3) ---
+
+    def record_causal_link(self, link: CausalLink) -> CausalLink:
+        """Persist a typed causal link, validating that it does not introduce cycles."""
+        existing_links = self.list_causal_links(limit=1000)
+        edges: list[CausalTraceEdge] = []
+        for el in existing_links:
+            if el.relation in ("caused_by", "verifies", "derived_from", "part_of"):
+                src, tgt = el.target_id, el.source_id
+            else:
+                src, tgt = el.source_id, el.target_id
+            edges.append(
+                CausalTraceEdge(
+                    source_id=src,
+                    target_id=tgt,
+                    relation=el.relation,
+                    edge_type="explicit",
+                )
+            )
+
+        if link.relation in ("caused_by", "verifies", "derived_from", "part_of"):
+            cand_src, cand_tgt = link.target_id, link.source_id
+        else:
+            cand_src, cand_tgt = link.source_id, link.target_id
+        edges.append(
+            CausalTraceEdge(
+                source_id=cand_src,
+                target_id=cand_tgt,
+                relation=link.relation,
+                edge_type="explicit",
+            )
+        )
+
+        if detect_cycles(edges):
+            raise CycleDetectedError(
+                f"Causal link introduces a cycle between '{link.source_id}' and '{link.target_id}'"
+            )
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO causal_links (
+                    link_id, link_version, source_id, source_type, relation,
+                    target_id, target_type, created_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    link.link_id,
+                    link.link_version,
+                    link.source_id,
+                    link.source_type,
+                    link.relation,
+                    link.target_id,
+                    link.target_type,
+                    link.created_at,
+                    json.dumps(link.metadata, ensure_ascii=False),
+                ),
+            )
+            conn.execute("COMMIT;")
+            return link
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to record causal link: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_causal_link(self, link_id: str) -> CausalLink | None:
+        """Fetch a causal link by ID."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """
+                SELECT link_id, link_version, source_id, source_type, relation,
+                       target_id, target_type, created_at, metadata_json
+                FROM causal_links WHERE link_id = ?;
+                """,
+                (link_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return self._row_to_causal_link(row)
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch causal link: {exc}") from exc
+        finally:
+            conn.close()
+
+    def list_causal_links(
+        self,
+        entity_id: str | None = None,
+        *,
+        limit: int = 100,
+    ) -> list[CausalLink]:
+        """List causal links, optionally filtered by source or target entity ID."""
+        conn = self._connect()
+        try:
+            if entity_id is not None:
+                cur = conn.execute(
+                    """
+                    SELECT link_id, link_version, source_id, source_type, relation,
+                           target_id, target_type, created_at, metadata_json
+                    FROM causal_links
+                    WHERE source_id = ? OR target_id = ?
+                    ORDER BY created_at ASC, rowid ASC LIMIT ?;
+                    """,
+                    (entity_id, entity_id, limit),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    SELECT link_id, link_version, source_id, source_type, relation,
+                           target_id, target_type, created_at, metadata_json
+                    FROM causal_links
+                    ORDER BY created_at ASC, rowid ASC LIMIT ?;
+                    """,
+                    (limit,),
+                )
+            rows = cur.fetchall()
+            return [self._row_to_causal_link(row) for row in rows]
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to list causal links: {exc}") from exc
+        finally:
+            conn.close()
+
+    def delete_causal_link(self, link_id: str) -> bool:
+        """Delete a causal link by ID. Returns True if deleted, False if not found."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            cur = conn.execute("DELETE FROM causal_links WHERE link_id = ?;", (link_id,))
+            deleted = cur.rowcount > 0
+            conn.execute("COMMIT;")
+            return deleted
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to delete causal link: {exc}") from exc
+        finally:
+            conn.close()
+
+    def count_causal_links(self) -> int:
+        """Return total number of causal links stored."""
+        conn = self._connect()
+        try:
+            cur = conn.execute("SELECT COUNT(*) FROM causal_links;")
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _row_to_causal_link(row: tuple[Any, ...]) -> CausalLink:
+        try:
+            meta = json.loads(str(row[8])) if row[8] else {}
+        except Exception:
+            meta = {}
+        return CausalLink(
+            link_id=str(row[0]),
+            link_version=str(row[1]),
+            source_id=str(row[2]),
+            source_type=row[3],
+            relation=row[4],
+            target_id=str(row[5]),
+            target_type=row[6],
+            created_at=str(row[7]),
+            metadata=meta,
         )
 
 

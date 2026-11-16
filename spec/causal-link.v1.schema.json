@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://actentra.dev/spec/causal-link.v1.schema.json",
+  "title": "Actentra Causal Link Record v1",
+  "description": "Explicit typed directed relationship connecting crossings, tasks, or observations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "link_id",
+    "link_version",
+    "source_id",
+    "source_type",
+    "relation",
+    "target_id",
+    "target_type",
+    "created_at",
+    "metadata"
+  ],
+  "properties": {
+    "link_id": { "type": "string", "pattern": "^lnk_[0-9A-HJKMNP-TV-Z]{26}$" },
+    "link_version": { "type": "string", "enum": ["1"] },
+    "source_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "source_type": { "type": "string", "enum": ["crossing", "observation", "task"] },
+    "relation": {
+      "type": "string",
+      "enum": ["caused_by", "verifies", "derived_from", "triggers", "part_of"]
+    },
+    "target_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "target_type": { "type": "string", "enum": ["crossing", "observation", "task"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "metadata": { "type": "object" }
+  }
+}

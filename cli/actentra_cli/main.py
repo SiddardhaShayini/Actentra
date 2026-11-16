@@ -12,6 +12,12 @@ import typer
 
 from actentra import ActionBlockedError, Boundary
 from actentra_core.canary import run_policy_canary
+from actentra_core.causal import (
+    CausalLink,
+    CycleDetectedError,
+    build_causal_trace,
+    generate_link_id,
+)
 from actentra_core.checkpoints import (
     CheckpointError,
     generate_ed25519_keypair,
@@ -62,6 +68,8 @@ bundle_app = typer.Typer(help="Export and manage offline audit bundles.")
 app.add_typer(bundle_app, name="bundle")
 observation_app = typer.Typer(help="Inspect and verify real-world state observations.")
 app.add_typer(observation_app, name="observation")
+trace_app = typer.Typer(help="Trace and inspect causal dependency graphs and timelines.")
+app.add_typer(trace_app, name="trace")
 
 _DEFAULT_STARTER_POLICY = """\
 version: 1
@@ -896,6 +904,133 @@ def observation_show_cmd(
         typer.echo(f"Observation '{observation_id}' not found", err=True)
         raise typer.Exit(code=1)
     typer.echo(json.dumps(obs.to_dict(), indent=2))
+
+
+@trace_app.command("show")
+def trace_show_cmd(
+    entity_id: Annotated[
+        str,
+        typer.Argument(
+            help="Root entity ID to trace (crossing_id, observation_id, or task_id)."
+        ),
+    ],
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Output trace in JSON format.")
+    ] = False,
+    max_depth: Annotated[
+        int, typer.Option("--max-depth", help="Maximum traversal depth.")
+    ] = 10,
+) -> None:
+    """Show the causal trace DAG and chronological timeline for an entity."""
+    store = ReceiptStore(db_path)
+    trace = build_causal_trace(store, entity_id, max_depth=max_depth)
+    if as_json:
+        typer.echo(json.dumps(trace.to_dict(), indent=2))
+    else:
+        typer.echo(trace.render_ascii())
+
+
+@trace_app.command("link")
+def trace_link_cmd(
+    source_id: Annotated[str, typer.Argument(help="Source entity ID.")],
+    relation: Annotated[
+        str,
+        typer.Argument(
+            help="Causal relation (caused_by, verifies, derived_from, triggers, part_of)."
+        ),
+    ],
+    target_id: Annotated[str, typer.Argument(help="Target entity ID.")],
+    source_type: Annotated[
+        str, typer.Option("--source-type", "-s", help="Source type (crossing, observation, task).")
+    ] = "crossing",
+    target_type: Annotated[
+        str, typer.Option("--target-type", "-t", help="Target type (crossing, observation, task).")
+    ] = "crossing",
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+) -> None:
+    """Create an explicit directional causal link between entities."""
+    valid_relations = ("caused_by", "verifies", "derived_from", "triggers", "part_of")
+    if relation not in valid_relations:
+        typer.echo(
+            f"Invalid relation '{relation}'. Must be one of: {', '.join(valid_relations)}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    valid_types = ("crossing", "observation", "task")
+    if source_type not in valid_types or target_type not in valid_types:
+        typer.echo(
+            f"Invalid entity types. Must be one of: {', '.join(valid_types)}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    link = CausalLink(
+        link_id=generate_link_id(),
+        link_version="1",
+        source_id=source_id,
+        source_type=source_type,  # type: ignore[arg-type]
+        relation=relation,  # type: ignore[arg-type]
+        target_id=target_id,
+        target_type=target_type,  # type: ignore[arg-type]
+        created_at=time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+    )
+    store = ReceiptStore(db_path)
+    try:
+        saved = store.record_causal_link(link)
+        typer.echo(
+            f"Created causal link {saved.link_id}: "
+            f"[{saved.source_type}:{saved.source_id}] ──({saved.relation})──> "
+            f"[{saved.target_type}:{saved.target_id}]"
+        )
+    except CycleDetectedError as exc:
+        typer.echo(f"Cycle detected: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@trace_app.command("list")
+def trace_list_cmd(
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+    entity_id: Annotated[
+        str | None, typer.Option("--entity-id", "-e", help="Filter by entity ID.")
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", help="Max links to return.")] = 50,
+) -> None:
+    """List recorded causal links."""
+    store = ReceiptStore(db_path)
+    links = store.list_causal_links(entity_id=entity_id, limit=limit)
+    if not links:
+        typer.echo("No causal links found matching criteria.")
+        return
+    for lnk in links:
+        typer.echo(
+            f"[{lnk.link_id}] [{lnk.source_type}:{lnk.source_id}] "
+            f"──({lnk.relation})──> [{lnk.target_type}:{lnk.target_id}] at={lnk.created_at}"
+        )
+
+
+@trace_app.command("delete")
+def trace_delete_cmd(
+    link_id: Annotated[str, typer.Argument(help="Link ID to delete.")],
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+) -> None:
+    """Delete an explicit causal link."""
+    store = ReceiptStore(db_path)
+    deleted = store.delete_causal_link(link_id)
+    if deleted:
+        typer.echo(f"Deleted causal link '{link_id}'")
+    else:
+        typer.echo(f"Causal link '{link_id}' not found", err=True)
+        raise typer.Exit(code=1)
 
 
 @checkpoint_app.command("keygen")

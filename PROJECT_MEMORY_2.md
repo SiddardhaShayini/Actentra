@@ -170,3 +170,27 @@ This guidance does not imply that Actentra’s authorization or first demonstrat
   * All 130 tests passing with 0 failures (`uv run pytest -m "not slow"`).
   * `uv run ruff check core executors gateway sdk cli tests examples` passes with 0 issues.
   * `uv run mypy core executors gateway sdk cli tests/unit/test_observations.py` passes with 0 issues.
+
+### 2026-11-16 16:15 IST
+
+- Implemented Phase 3 (Causal trace as SQLite references and DAG integrity) according to PLAN_V4.md.
+- Files modified/created:
+  * `spec/causal-trace.v1.schema.json`: Formal JSON Schema for version 1 causal trace graphs and timelines.
+  * `spec/causal-link.v1.schema.json`: Formal JSON Schema for version 1 explicit causal link records.
+  * `core/actentra_core/causal.py`: Core causal module with `CausalLink`, `CausalTraceNode`, `CausalTraceEdge`, `CausalTimelineEvent`, `CausalTrace`, `detect_cycles` (DFS-based cycle detection), and `build_causal_trace` graph/timeline reconstructor.
+  * `core/actentra_core/receipts.py`: Added `causal_links` table with indexes on `(source_type, source_id)` and `(target_type, target_id)`; added `record_causal_link` (with cycle prevention), `get_causal_link`, `list_causal_links`, `delete_causal_link`, `count_causal_links`, and `get_outcome_receipt`.
+  * `core/actentra_core/__init__.py`: Exported causal models and helpers (`CausalLink`, `CausalTrace`, `build_causal_trace`, etc.).
+  * `gateway/actentra_gateway/services.py`: Added trace methods (`get_causal_trace`, `record_causal_link`, `list_causal_links`, `delete_causal_link`) to `AppServices`; included `causal_links` in `export_audit_bundle`.
+  * `gateway/actentra_gateway/http_service.py`: Added REST endpoints (`GET /v1/trace/{id}`, `GET /v1/trace/links`, `POST /v1/trace/links`, `DELETE /v1/trace/links/{id}`).
+  * `cli/actentra_cli/main.py`: Added `trace` CLI subcommand group (`actentra trace show`, `link`, `list`, `delete`) with ASCII DAG/timeline rendering and `--json` support.
+  * `tests/unit/test_causal_trace.py`: Added 7 comprehensive unit tests (schema validation, DAG cycle detection, intrinsic lifecycle reconstruction, approval/task linkage, HTTP endpoints, and CLI commands).
+  * `docs/product-status.md`: Updated capability matrix and invariant mapping to mark Causal Graph / Reference Trace as Supported.
+- Key decisions & rationale:
+  * Relational SQLite references: implemented causal tracing using indexed SQLite relationships and DAG cycle checks without introducing a graph database, microservice, or external daemon.
+  * Distinct causation vs ledger order: separates `entry_hash`/`prev_hash` sequential ledger chain from directional causal dependencies (`caused_by`, `verifies`, `derived_from`, `triggers`, `part_of`).
+  * Fail-closed DAG enforcement: rejects cyclic links (`CycleDetectedError`) at persistence time before commit.
+  * Clear authority labels in timeline: timeline explicitly tags provenance authority (`caller_asserted`, `policy_kernel`, `operator_human`, `executor_observed`, `verifier_observed`).
+- Validation:
+  * All 137 tests passing with 0 failures (`uv run pytest -m "not slow"`).
+  * `uv run ruff check core executors gateway sdk cli tests examples` passes with 0 issues.
+  * `uv run mypy core executors gateway sdk cli tests/unit/test_causal_trace.py tests/unit/test_observations.py` passes with 0 issues.

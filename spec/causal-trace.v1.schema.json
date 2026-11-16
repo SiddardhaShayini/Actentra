@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://actentra.dev/spec/causal-trace.v1.schema.json",
+  "title": "Actentra Causal Trace v1",
+  "description": "Typed causal references, DAG relationships, and ordered timeline linking crossings, approvals, outcomes, and observations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "root_id",
+    "root_type",
+    "nodes",
+    "edges",
+    "timeline",
+    "dag_verified"
+  ],
+  "properties": {
+    "root_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "root_type": { "type": "string", "enum": ["crossing", "observation", "task"] },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["node_id", "entity_type", "role", "label", "timestamp", "status", "summary"],
+        "properties": {
+          "node_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "entity_type": {
+            "type": "string",
+            "enum": ["crossing", "observation", "task", "receipt", "approval"]
+          },
+          "role": {
+            "type": "string",
+            "enum": ["proposal", "decision", "approval", "outcome", "observation", "task"]
+          },
+          "label": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "timestamp": { "type": "string" },
+          "status": { "type": "string", "maxLength": 64 },
+          "summary": { "type": "string", "maxLength": 1000 },
+          "metadata": { "type": "object" }
+        }
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_id", "target_id", "relation", "edge_type"],
+        "properties": {
+          "source_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "target_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "relation": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "edge_type": { "type": "string", "enum": ["intrinsic", "explicit"] }
+        }
+      }
+    },
+    "timeline": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["step", "timestamp", "entity_id", "role", "summary", "authority"],
+        "properties": {
+          "step": { "type": "integer", "minimum": 1 },
+          "timestamp": { "type": "string" },
+          "entity_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "role": { "type": "string", "maxLength": 64 },
+          "summary": { "type": "string", "maxLength": 1000 },
+          "authority": { "type": "string", "maxLength": 128 }
+        }
+      }
+    },
+    "dag_verified": { "type": "boolean" },
+    "missing_references": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

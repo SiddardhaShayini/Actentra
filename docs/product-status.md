@@ -34,7 +34,7 @@ Each capability in Actentra is explicitly labeled under one of three tiers:
 | **Agent Adapters (LangChain & Function Calling)** | **Supported** | `actentra.adapters` | Duck-typed tool wrappers and OpenAI/Anthropic call dictionary adapters. |
 | **Restart-Safe Gateway Demo** | **Supported** | `actentra_gateway.demo` | Automated demonstration of allowed read, ASK delete, pending restart, approval grant, approved restart, execution, and verification (`actentra demo-gateway`). |
 | **Verifiable World State Observation** | **Supported** | `actentra_core.observations`<br>`actentra_executors.verifiers` | Additive read-only verifier for workspace file state, hash-chained records in SQLite, freshness bounds, REST/CLI inspection. |
-| **Causal Graph / Reference Trace** | **Planned** | — | Typed SQLite relationship references across crossings and observations (Phase 3). |
+| **Causal Graph / Reference Trace** | **Supported** | `actentra_core.causal`<br>`actentra_core.receipts` | Typed directional relationships, DAG cycle detection, timeline reconstruction, and REST/CLI trace inspection. |
 | **Enterprise Remote Control Plane / SSO** | **Planned** | — | Non-goal for local-first architecture. |
 | **Native Desktop Shell / Installer** | **Planned** | — | Deferred to post-beta based on user adoption. |
 
@@ -60,6 +60,7 @@ Every claimed core guarantee and invariant is directly verified by automated tes
 | **Audit: Streaming & archival** | $O(1)$ memory streaming log verification and DB archival | `tests/unit/test_receipt_archival.py`<br>`tests/golden/test_golden_sdk_cli.py` | Verifies large receipt logs without memory spikes; archives historical records to standalone databases. |
 | **Gateway: Restart-safe approvals** | Approved crossings in SQLite execute after restart with atomic claim | `tests/unit/test_app_services.py`<br>`tests/unit/test_gateway_demo.py` | Approvals in SQLite survive restart; unexecuted approved crossings execute in new process; double-dispatch rejected. |
 | **Observations: Verifiable state** | Read-only verifier captures subject digest, claim, trust domain, and freshness | `tests/unit/test_observations.py` | Verifies workspace file claims (exists, absent, digest_match), bounds freshness, chains observation hash, fails closed outside workspace. |
+| **Causal Trace: Provenance DAG** | Typed references link proposals, decisions, approvals, outcomes, and observations | `tests/unit/test_causal_trace.py` | Verifies acyclic DAG integrity, detects cycles, reconstructs chronological and causal role timeline, exposes REST and CLI trace inspection. |
 
 ---
 

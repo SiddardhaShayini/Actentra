@@ -15,6 +15,11 @@ from typing import Any, Literal
 
 from actentra.boundary import ActionBlockedError, Boundary
 from actentra_core.canonicalize import hash_canonical
+from actentra_core.causal import (
+    CausalLink,
+    build_causal_trace,
+    generate_link_id,
+)
 from actentra_core.envelope import (
     ActionEnvelope,
     EnvelopeError,
@@ -678,6 +683,10 @@ class AppServices:
                 obs.to_dict()
                 for obs in self.boundary.receipt_store.list_observations(limit=500)
             ],
+            "causal_links": [
+                lnk.to_dict()
+                for lnk in self.boundary.receipt_store.list_causal_links(limit=500)
+            ],
         }
         if out_path is not None:
             dest = Path(out_path)
@@ -744,3 +753,60 @@ class AppServices:
             offset=offset,
         )
         return [r.to_dict() for r in records]
+
+    # --- Causal Trace and Reference Links (Phase 3) ---
+
+    def get_causal_trace(
+        self,
+        root_id: str,
+        *,
+        root_type: Literal["crossing", "observation", "task"] | None = None,
+        max_depth: int = 10,
+    ) -> dict[str, Any]:
+        """Reconstruct the causal trace DAG and chronological timeline for an entity."""
+        trace = build_causal_trace(
+            self.boundary.receipt_store,
+            root_id=root_id,
+            root_type=root_type,
+            max_depth=max_depth,
+        )
+        return trace.to_dict()
+
+    def record_causal_link(
+        self,
+        *,
+        source_id: str,
+        source_type: Literal["crossing", "observation", "task"],
+        relation: Literal["caused_by", "verifies", "derived_from", "triggers", "part_of"],
+        target_id: str,
+        target_type: Literal["crossing", "observation", "task"],
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create and persist an explicit directional causal relationship."""
+        link = CausalLink(
+            link_id=generate_link_id(),
+            link_version="1",
+            source_id=source_id,
+            source_type=source_type,
+            relation=relation,
+            target_id=target_id,
+            target_type=target_type,
+            created_at=time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            metadata=dict(metadata or {}),
+        )
+        saved = self.boundary.receipt_store.record_causal_link(link)
+        return saved.to_dict()
+
+    def list_causal_links(
+        self,
+        entity_id: str | None = None,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List causal links, optionally filtered by entity."""
+        links = self.boundary.receipt_store.list_causal_links(entity_id=entity_id, limit=limit)
+        return [lnk.to_dict() for lnk in links]
+
+    def delete_causal_link(self, link_id: str) -> bool:
+        """Delete an explicit causal link."""
+        return self.boundary.receipt_store.delete_causal_link(link_id)

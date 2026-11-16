@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from actentra.boundary import Boundary
+from actentra_core.causal import CycleDetectedError
 from actentra_gateway.services import AppServices, ExecutorRegistry
 
 _MAX_BODY_BYTES = 2 * 1024 * 1024  # 2 MiB bound on HTTP request body
@@ -280,6 +281,19 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, obs_detail)
             return
 
+        if path == "/v1/trace/links":
+            ent_f = query.get("entity_id", [None])[0]
+            lim_f = int(query.get("limit", [100])[0])
+            links = services.list_causal_links(entity_id=ent_f, limit=lim_f)
+            self._send_json(HTTPStatus.OK, {"items": links, "count": len(links)})
+            return
+
+        if path.startswith("/v1/trace/"):
+            trace_id = path[len("/v1/trace/") :]
+            trace_data = services.get_causal_trace(trace_id)
+            self._send_json(HTTPStatus.OK, trace_data)
+            return
+
         if path in ("/ui", "/"):
             self._send_html(HTTPStatus.OK, self._render_dashboard_html())
             return
@@ -478,6 +492,41 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, res)
             return
 
+        if path == "/v1/trace/links":
+            try:
+                data = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid body: {exc}"})
+                return
+
+            req_fields = ("source_id", "source_type", "relation", "target_id", "target_type")
+            missing = [f for f in req_fields if not data.get(f)]
+            if missing:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": f"Missing required fields: {', '.join(missing)}"},
+                )
+                return
+
+            try:
+                link = services.record_causal_link(
+                    source_id=str(data["source_id"]),
+                    source_type=data["source_type"],
+                    relation=data["relation"],
+                    target_id=str(data["target_id"]),
+                    target_type=data["target_type"],
+                    metadata=data.get("metadata"),
+                )
+                self._send_json(HTTPStatus.CREATED, link)
+            except CycleDetectedError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": str(exc), "code": "cycle_detected"},
+                )
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Failed to record link: {exc}"})
+            return
+
         if path == "/v1/freeze":
             self.server.boundary.freeze()
             self._send_json(
@@ -489,6 +538,36 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         if path == "/v1/unfreeze":
             self.server.boundary.unfreeze()
             self._send_json(HTTPStatus.OK, {"frozen": False, "message": "System unfrozen"})
+            return
+
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Route '{path}' not found"})
+
+    def do_DELETE(self) -> None:
+        if not self._check_auth():
+            return
+
+        parts = urlsplit(self.path)
+        path = parts.path.rstrip("/")
+        services = self.server.services
+
+        origin = self.headers.get("Origin")
+        if origin and not self._allowed_origin():
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "Forbidden: cross-origin browser request rejected"},
+            )
+            return
+
+        if path.startswith("/v1/trace/links/"):
+            link_id = path[len("/v1/trace/links/") :]
+            deleted = services.delete_causal_link(link_id)
+            if deleted:
+                self._send_json(HTTPStatus.OK, {"deleted": True, "link_id": link_id})
+            else:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": f"Causal link '{link_id}' not found"},
+                )
             return
 
         self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Route '{path}' not found"})
