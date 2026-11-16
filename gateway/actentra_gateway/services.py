@@ -28,6 +28,7 @@ from actentra_core.verdict import Decision, Verdict
 from actentra_executors.fs import LocalFSExecutor
 from actentra_executors.http import ScopedHTTPExecutor
 from actentra_executors.sqlite import ScopedSQLiteExecutor
+from actentra_executors.verifiers import WorkspaceFileVerifier
 
 ToolExecutorCallable = Callable[[ActionEnvelope, Decision], Any]
 
@@ -37,6 +38,11 @@ class ExecutorRegistry:
 
     def __init__(self) -> None:
         self._executors: dict[str, ToolExecutorCallable] = {}
+        self._workspace_root: str | None = None
+
+    @property
+    def workspace_root(self) -> str | None:
+        return self._workspace_root
 
     def register(self, tool_name: str, fn: ToolExecutorCallable) -> None:
         """Register a callable executor for a specific tool name or prefix."""
@@ -45,6 +51,7 @@ class ExecutorRegistry:
     def register_fs(self, workspace_root: str | Path) -> None:
         """Register Scoped Filesystem executor for fs.* tools."""
         executor = LocalFSExecutor(workspace_root)
+        self._workspace_root = executor.workspace_root
         for t in ("fs.list", "fs.read", "fs.write", "fs.delete"):
             self.register(t, executor.execute)
 
@@ -77,11 +84,18 @@ class AppServices:
         boundary: Boundary,
         *,
         executor_registry: ExecutorRegistry | None = None,
+        file_verifier: WorkspaceFileVerifier | None = None,
         approval_ttl_seconds: float = 300.0,
     ) -> None:
         self.boundary = boundary
         self.registry = executor_registry or ExecutorRegistry()
         self.approval_ttl_seconds = approval_ttl_seconds
+        if file_verifier is not None:
+            self.file_verifier: WorkspaceFileVerifier | None = file_verifier
+        elif self.registry.workspace_root is not None:
+            self.file_verifier = WorkspaceFileVerifier(self.registry.workspace_root)
+        else:
+            self.file_verifier = None
         # Clean up expired approvals upon service startup (idempotent, restart-safe)
         self.boundary.receipt_store.recover_pending_approvals()
 
@@ -660,6 +674,10 @@ class AppServices:
                 "errors": list(vr.errors),
             },
             "receipts": records,
+            "observations": [
+                obs.to_dict()
+                for obs in self.boundary.receipt_store.list_observations(limit=500)
+            ],
         }
         if out_path is not None:
             dest = Path(out_path)
@@ -668,3 +686,61 @@ class AppServices:
                 json.dump(bundle, fh, indent=2, ensure_ascii=False)
             bundle["exported_file"] = str(dest.resolve())
         return bundle
+
+    # --- 8. State Observations (Phase 2) ---
+
+    def verify_state(
+        self,
+        resource: str,
+        claim: str,
+        *,
+        crossing_id: str | None = None,
+        expected_digest: str | None = None,
+        ttl_seconds: float = 60.0,
+    ) -> dict[str, Any]:
+        """Perform a read-only state verification and persist an observation record."""
+        if self.file_verifier is None:
+            return {
+                "error": "No file verifier configured (register filesystem executor or verifier)",
+                "status": "error",
+            }
+        obs = self.file_verifier.verify(
+            resource=resource,
+            claim=claim,
+            crossing_id=crossing_id,
+            expected_digest=expected_digest,
+            ttl_seconds=ttl_seconds,
+        )
+        self.boundary.receipt_store.record_observation(obs)
+        return obs.to_dict()
+
+    def get_observation(self, observation_id: str) -> dict[str, Any] | None:
+        """Fetch detail for a specific observation."""
+        obs = self.boundary.receipt_store.get_observation(observation_id)
+        return obs.to_dict() if obs is not None else None
+
+    def get_latest_observation(
+        self,
+        subject_resource: str,
+        claim: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Fetch latest observation for a resource."""
+        obs = self.boundary.receipt_store.get_latest_observation(subject_resource, claim=claim)
+        return obs.to_dict() if obs is not None else None
+
+    def list_observations(
+        self,
+        *,
+        crossing_id: str | None = None,
+        subject_resource: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List persisted observations."""
+        records = self.boundary.receipt_store.list_observations(
+            crossing_id=crossing_id,
+            subject_resource=subject_resource,
+            limit=limit,
+            offset=offset,
+        )
+        return [r.to_dict() for r in records]

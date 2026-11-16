@@ -18,6 +18,7 @@ from actentra_core.envelope import (
     compute_action_hash,
     utc_now_iso,
 )
+from actentra_core.observations import ObservationRecord
 from actentra_core.verdict import Decision
 
 GENESIS_HASH = "sha256:" + ("0" * 64)
@@ -250,6 +251,37 @@ class ReceiptStore:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_pending_expires ON pending_approvals(expires_at);"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS observations (
+                    observation_id TEXT PRIMARY KEY,
+                    crossing_id TEXT,
+                    subject_resource TEXT NOT NULL,
+                    claim TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('verified', 'refuted', 'unknown', 'error', 'stale')
+                    ),
+                    observed_digest TEXT,
+                    observed_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    verifier_id TEXT NOT NULL,
+                    verifier_version TEXT NOT NULL,
+                    trust_domain TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    error TEXT,
+                    observation_hash TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_obs_crossing ON observations(crossing_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_obs_resource ON observations(subject_resource);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_obs_observed_at ON observations(observed_at);"
             )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to initialize receipt store: {exc}") from exc
@@ -1136,6 +1168,193 @@ class ReceiptStore:
                 )
             )
         return records, total_count
+
+    # --- 8. State Observations (Phase 2) ---
+
+    def record_observation(self, obs: ObservationRecord) -> ObservationRecord:
+        """Persist a verifiable state observation record."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO observations (
+                    observation_id, crossing_id, subject_resource, claim, status,
+                    observed_digest, observed_at, expires_at, verifier_id,
+                    verifier_version, trust_domain, metadata_json, error, observation_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    obs.observation_id,
+                    obs.crossing_id,
+                    obs.subject_resource,
+                    obs.claim,
+                    obs.status,
+                    obs.observed_digest,
+                    obs.observed_at,
+                    obs.expires_at,
+                    obs.verifier_id,
+                    obs.verifier_version,
+                    obs.trust_domain,
+                    json.dumps(obs.metadata, ensure_ascii=False),
+                    obs.error,
+                    obs.observation_hash,
+                ),
+            )
+            conn.execute("COMMIT;")
+            return obs
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to record observation: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_observation(self, observation_id: str) -> ObservationRecord | None:
+        """Fetch a specific observation by ID."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """
+                SELECT observation_id, crossing_id, subject_resource, claim, status,
+                       observed_digest, observed_at, expires_at, verifier_id,
+                       verifier_version, trust_domain, metadata_json, error, observation_hash
+                FROM observations WHERE observation_id = ?;
+                """,
+                (observation_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return self._row_to_observation(row)
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch observation: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_latest_observation(
+        self,
+        subject_resource: str,
+        claim: str | None = None,
+    ) -> ObservationRecord | None:
+        """Fetch the most recent observation for a subject resource and optional claim."""
+        conn = self._connect()
+        try:
+            if claim is not None:
+                cur = conn.execute(
+                    """
+                    SELECT observation_id, crossing_id, subject_resource, claim, status,
+                           observed_digest, observed_at, expires_at, verifier_id,
+                           verifier_version, trust_domain, metadata_json, error, observation_hash
+                    FROM observations
+                    WHERE subject_resource = ? AND claim = ?
+                    ORDER BY observed_at DESC, rowid DESC LIMIT 1;
+                    """,
+                    (subject_resource, claim),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    SELECT observation_id, crossing_id, subject_resource, claim, status,
+                           observed_digest, observed_at, expires_at, verifier_id,
+                           verifier_version, trust_domain, metadata_json, error, observation_hash
+                    FROM observations
+                    WHERE subject_resource = ?
+                    ORDER BY observed_at DESC, rowid DESC LIMIT 1;
+                    """,
+                    (subject_resource,),
+                )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return self._row_to_observation(row)
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch latest observation: {exc}") from exc
+        finally:
+            conn.close()
+
+    def list_observations(
+        self,
+        *,
+        crossing_id: str | None = None,
+        subject_resource: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[ObservationRecord]:
+        """List observations with optional filtering and pagination."""
+        clamped_limit = max(1, min(limit, 500))
+        clamped_offset = max(0, offset)
+        conn = self._connect()
+        try:
+            query = (
+                "SELECT observation_id, crossing_id, subject_resource, claim, status, "
+                "observed_digest, observed_at, expires_at, verifier_id, "
+                "verifier_version, trust_domain, metadata_json, error, observation_hash "
+                "FROM observations "
+            )
+            params: list[Any] = []
+            clauses: list[str] = []
+            if crossing_id is not None:
+                clauses.append("crossing_id = ?")
+                params.append(crossing_id)
+            if subject_resource is not None:
+                clauses.append("subject_resource = ?")
+                params.append(subject_resource)
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
+            query += " ORDER BY observed_at DESC, rowid DESC LIMIT ? OFFSET ?;"
+            params.extend([clamped_limit, clamped_offset])
+
+            cur = conn.execute(query, tuple(params))
+            rows = cur.fetchall()
+            return [self._row_to_observation(r) for r in rows]
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to list observations: {exc}") from exc
+        finally:
+            conn.close()
+
+    def count_observations(self, *, subject_resource: str | None = None) -> int:
+        """Count total observations, optionally filtered by resource."""
+        conn = self._connect()
+        try:
+            if subject_resource is not None:
+                cur = conn.execute(
+                    "SELECT COUNT(*) FROM observations WHERE subject_resource = ?;",
+                    (subject_resource,),
+                )
+            else:
+                cur = conn.execute("SELECT COUNT(*) FROM observations;")
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to count observations: {exc}") from exc
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _row_to_observation(row: tuple[Any, ...]) -> ObservationRecord:
+        meta_raw = row[11]
+        try:
+            meta = json.loads(meta_raw) if isinstance(meta_raw, str) else dict(meta_raw)
+        except Exception:
+            meta = {}
+        return ObservationRecord(
+            observation_id=str(row[0]),
+            observation_version="1",
+            crossing_id=str(row[1]) if row[1] is not None else None,
+            subject_resource=str(row[2]),
+            claim=str(row[3]),
+            status=row[4],
+            observed_digest=str(row[5]) if row[5] is not None else None,
+            observed_at=str(row[6]),
+            expires_at=str(row[7]) if row[7] is not None else None,
+            verifier_id=str(row[8]),
+            verifier_version=str(row[9]),
+            trust_domain=row[10],
+            metadata=meta,
+            error=str(row[12]) if row[12] is not None else None,
+            observation_hash=str(row[13]),
+        )
 
 
 def verify_log(

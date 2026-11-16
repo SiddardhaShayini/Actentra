@@ -181,6 +181,7 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
 
         parts = urlsplit(self.path)
         path = parts.path.rstrip("/") or "/"
+        query = parse_qs(parts.query)
         services = self.server.services
 
         if path == "/health":
@@ -252,6 +253,31 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         if path == "/v1/bundle/export":
             bundle = services.export_audit_bundle()
             self._send_json(HTTPStatus.OK, bundle)
+            return
+
+        if path == "/v1/observations":
+            cid_f = query.get("crossing_id", [None])[0]
+            res_f = query.get("resource", [None])[0]
+            lim_f = int(query.get("limit", [50])[0])
+            off_f = int(query.get("offset", [0])[0])
+            obs_list = services.list_observations(
+                crossing_id=cid_f,
+                subject_resource=res_f,
+                limit=lim_f,
+                offset=off_f,
+            )
+            self._send_json(HTTPStatus.OK, obs_list)
+            return
+
+        if path.startswith("/v1/observations/") and path != "/v1/observations/verify":
+            obs_id = path[len("/v1/observations/") :]
+            obs_detail = services.get_observation(obs_id)
+            if obs_detail is None:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND, {"error": f"Observation '{obs_id}' not found"}
+                )
+            else:
+                self._send_json(HTTPStatus.OK, obs_detail)
             return
 
         if path in ("/ui", "/"):
@@ -424,6 +450,32 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, sim_res)
             except Exception as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Simulation failed: {exc}"})
+            return
+
+        if path == "/v1/observations/verify":
+            try:
+                data = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid body: {exc}"})
+                return
+
+            resource = data.get("resource")
+            claim = data.get("claim")
+            if not resource or not claim:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "Fields 'resource' and 'claim' are required"},
+                )
+                return
+
+            res = services.verify_state(
+                resource=str(resource),
+                claim=str(claim),
+                crossing_id=data.get("crossing_id"),
+                expected_digest=data.get("expected_digest"),
+                ttl_seconds=float(data.get("ttl_seconds", 60.0)),
+            )
+            self._send_json(HTTPStatus.OK, res)
             return
 
         if path == "/v1/freeze":

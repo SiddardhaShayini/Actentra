@@ -39,6 +39,7 @@ from actentra_core.warrants import (
     verify_warrant,
 )
 from actentra_executors.fs import LocalFSExecutor, ScopedFSTools
+from actentra_executors.verifiers import WorkspaceFileVerifier
 from actentra_gateway.demo import run_gateway_demonstration
 from actentra_gateway.http_service import serve_http
 from actentra_gateway.mcp_proxy import serve_stdio
@@ -59,6 +60,8 @@ approvals_app = typer.Typer(help="Inspect and resolve persistent human approvals
 app.add_typer(approvals_app, name="approvals")
 bundle_app = typer.Typer(help="Export and manage offline audit bundles.")
 app.add_typer(bundle_app, name="bundle")
+observation_app = typer.Typer(help="Inspect and verify real-world state observations.")
+app.add_typer(observation_app, name="observation")
 
 _DEFAULT_STARTER_POLICY = """\
 version: 1
@@ -802,6 +805,97 @@ def bundle_export_cmd(
     bundle = services.export_audit_bundle(out_path=out_path)
     rec_count = bundle["integrity"]["total_records"]
     typer.echo(f"Exported audit bundle ({rec_count} receipts) -> {out_path}")
+
+
+@observation_app.command("verify")
+def observation_verify_cmd(
+    resource: Annotated[str, typer.Argument(help="Resource to inspect (e.g. 'path:notes.txt').")],
+    claim: Annotated[
+        str,
+        typer.Option("--claim", "-c", help="Claim to verify (exists, absent, digest_match)."),
+    ] = "exists",
+    workspace: Annotated[
+        Path,
+        typer.Option("--workspace", "-w", help="Workspace root directory."),
+    ] = Path("."),
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+    crossing_id: Annotated[
+        str | None, typer.Option("--crossing-id", help="Optional crossing ID to link.")
+    ] = None,
+    expected_digest: Annotated[
+        str | None, typer.Option("--expected-digest", help="Expected SHA-256 digest.")
+    ] = None,
+    ttl: Annotated[float, typer.Option("--ttl", help="Freshness duration in seconds.")] = 60.0,
+) -> None:
+    """Perform a read-only state verification and record the observation."""
+    verifier = WorkspaceFileVerifier(workspace, default_ttl_seconds=ttl)
+    obs = verifier.verify(
+        resource=resource,
+        claim=claim,
+        crossing_id=crossing_id,
+        expected_digest=expected_digest,
+        ttl_seconds=ttl,
+    )
+    store = ReceiptStore(db_path)
+    store.record_observation(obs)
+    status_label = obs.status.upper()
+    typer.echo(
+        f"[{status_label}] id={obs.observation_id} resource={obs.subject_resource} "
+        f"claim={obs.claim} fresh={obs.is_fresh()}"
+    )
+    if obs.observed_digest:
+        typer.echo(f"  digest={obs.observed_digest}")
+    if obs.error:
+        typer.echo(f"  error={obs.error}", err=True)
+
+
+@observation_app.command("list")
+def observation_list_cmd(
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+    crossing_id: Annotated[
+        str | None, typer.Option("--crossing-id", help="Filter by crossing ID.")
+    ] = None,
+    resource: Annotated[
+        str | None, typer.Option("--resource", help="Filter by subject resource.")
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", help="Max observations to return.")] = 50,
+) -> None:
+    """List recorded state observations from SQLite store."""
+    store = ReceiptStore(db_path)
+    records = store.list_observations(
+        crossing_id=crossing_id,
+        subject_resource=resource,
+        limit=limit,
+    )
+    if not records:
+        typer.echo("No observations found matching criteria.")
+        return
+    for r in records:
+        fresh_tag = "FRESH" if r.is_fresh() else "STALE"
+        typer.echo(
+            f"[{r.status.upper()} / {fresh_tag}] id={r.observation_id} res={r.subject_resource} "
+            f"claim={r.claim} at={r.observed_at}"
+        )
+
+
+@observation_app.command("show")
+def observation_show_cmd(
+    observation_id: Annotated[str, typer.Argument(help="Observation ID to show.")],
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+) -> None:
+    """Show details of a specific state observation."""
+    store = ReceiptStore(db_path)
+    obs = store.get_observation(observation_id)
+    if obs is None:
+        typer.echo(f"Observation '{observation_id}' not found", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(json.dumps(obs.to_dict(), indent=2))
 
 
 @checkpoint_app.command("keygen")

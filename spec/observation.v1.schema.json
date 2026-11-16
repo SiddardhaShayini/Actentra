@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://actentra.dev/spec/observation.v1.schema.json",
+  "title": "Actentra Observation Record v1",
+  "description": "Durable record of a scoped state observation with provenance, verifier identity, and freshness.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "observation_id",
+    "observation_version",
+    "subject_resource",
+    "claim",
+    "status",
+    "observed_at",
+    "verifier_id",
+    "verifier_version",
+    "trust_domain",
+    "metadata",
+    "observation_hash"
+  ],
+  "properties": {
+    "observation_id": { "type": "string", "minLength": 8, "maxLength": 64 },
+    "observation_version": { "type": "string", "enum": ["1"] },
+    "crossing_id": { "type": ["string", "null"], "maxLength": 64 },
+    "subject_resource": { "type": "string", "minLength": 1, "maxLength": 1024 },
+    "claim": { "type": "string", "enum": ["exists", "absent", "digest_match", "custom"] },
+    "status": {
+      "type": "string",
+      "enum": ["verified", "refuted", "unknown", "error", "stale"]
+    },
+    "observed_digest": {
+      "type": ["string", "null"],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "observed_at": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": ["string", "null"], "format": "date-time" },
+    "verifier_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "verifier_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "trust_domain": { "type": "string", "enum": ["local_host", "remote_service", "external_witness"] },
+    "metadata": { "type": "object" },
+    "error": { "type": ["string", "null"], "maxLength": 1000 },
+    "observation_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

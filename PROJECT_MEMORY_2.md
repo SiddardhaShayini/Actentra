@@ -146,3 +146,27 @@ This guidance does not imply that Actentra’s authorization or first demonstrat
   * `uv run ruff check` clean (all source files pass).
   * `uv run mypy` strict type check passes with 0 issues across all source files.
   * `actentra demo-gateway` executed and verified manually.
+
+### 2026-11-16 15:55 IST
+
+- Implemented Phase 2 (Minimal Verifiable State for One Resource Type) according to PLAN_V4.md.
+- Files modified/created:
+  * `spec/observation.v1.schema.json`: Formal JSON Schema for version 1 observation records with strict type constraints.
+  * `core/actentra_core/observations.py`: Implemented `ObservationRecord`, canonical `compute_observation_hash`, `build_observation`, and ISO-8601 `is_fresh` expiry checking.
+  * `core/actentra_core/receipts.py`: Added `observations` SQLite table with indexes on `(subject_resource, observed_at)` and `crossing_id`, along with `record_observation`, `get_observation`, `get_latest_observation`, `list_observations`, and `count_observations`.
+  * `core/actentra_core/__init__.py`: Exported `ObservationRecord`, `build_observation`, and `compute_observation_hash`.
+  * `executors/actentra_executors/verifiers.py`: Created `WorkspaceFileVerifier` read-only verifier capturing SHA-256 digests and claims (`exists`, `absent`, `digest_match`) strictly confined within workspace root (preventing path traversal).
+  * `executors/actentra_executors/__init__.py`: Exported `WorkspaceFileVerifier`.
+  * `gateway/actentra_gateway/services.py`: Added observation methods (`verify_state`, `get_observation`, `list_observations`) to `AppServices` with default workspace file verifier.
+  * `gateway/actentra_gateway/http_service.py`: Added REST endpoints (`POST /v1/observations/verify`, `GET /v1/observations`, `GET /v1/observations/{id}`) and included observations in `POST /v1/bundle/export`.
+  * `cli/actentra_cli/main.py`: Added `observation` CLI subcommand group (`actentra observation verify`, `list`, `show`).
+  * `tests/unit/test_observations.py`: Added 7 comprehensive unit tests covering record validation, hash integrity, freshness, workspace containment, service integration, HTTP dispatch, and CLI commands.
+  * `docs/product-status.md`: Updated capability matrix and invariant-to-test mapping to reflect Verifiable World State Observation as Supported.
+- Key decisions & rationale:
+  * Additive schema: observations exist in a separate SQLite table alongside receipts, without mutating receipt envelopes or breaking backwards compatibility.
+  * Separate evidence tier: observations are explicitly marked with `verifier_id` and `trust_domain` (e.g. `local_host`) and have finite validity via `expires_at`, maintaining clear separation from caller-reported outcomes.
+  * Strict confinement: `WorkspaceFileVerifier` rejects any attempt to observe paths outside workspace boundaries or path traversal attacks.
+- Validation:
+  * All 130 tests passing with 0 failures (`uv run pytest -m "not slow"`).
+  * `uv run ruff check core executors gateway sdk cli tests examples` passes with 0 issues.
+  * `uv run mypy core executors gateway sdk cli tests/unit/test_observations.py` passes with 0 issues.
