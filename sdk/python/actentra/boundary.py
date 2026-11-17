@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import inspect
 import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, cast
 
 from actentra.secrets import SecretsBroker
 from actentra_core.canonicalize import CanonicalizationError, hash_canonical
+from actentra_core.causal import CausalLink, generate_link_id
+from actentra_core.coordination import (
+    LeaseMode,
+    ResourceLease,
+    build_lease,
+    utc_iso,
+)
 from actentra_core.envelope import (
     ActionEnvelope,
     EnvelopeError,
@@ -19,6 +27,8 @@ from actentra_core.envelope import (
     build_envelope,
     compute_action_hash,
 )
+from actentra_core.evidence import EvidenceTier, build_evidence_record
+from actentra_core.observations import ObservationRecord
 from actentra_core.policy import PolicyEngine, PolicyPack, load_policy_file
 from actentra_core.receipts import ReceiptError, ReceiptStore
 from actentra_core.verdict import Decision, Verdict
@@ -96,6 +106,7 @@ class Boundary:
         secrets_broker: SecretsBroker | None = None,
         warrant_public_key: bytes | None = None,
         warrant_registry: WarrantRegistry | None = None,
+        verifier: Any | None = None,
     ) -> None:
         self._engine = PolicyEngine(policy)
         self._store = receipt_store
@@ -109,6 +120,7 @@ class Boundary:
         self._secrets_broker = secrets_broker
         self._warrant_public_key = warrant_public_key
         self._warrant_registry = warrant_registry
+        self._verifier = verifier
         self._lock = threading.Lock()
         self._approvals: dict[tuple[str, str], ApprovalGrant] = {}
         self._session_taints: dict[str, str] = {}
@@ -125,6 +137,7 @@ class Boundary:
         secrets_broker: SecretsBroker | None = None,
         warrant_public_key: bytes | None = None,
         warrant_registry: WarrantRegistry | None = None,
+        verifier: Any | None = None,
     ) -> Boundary:
         policy = load_policy_file(policy_path)
         store = ReceiptStore(receipts_db)
@@ -137,6 +150,7 @@ class Boundary:
             secrets_broker=secrets_broker,
             warrant_public_key=warrant_public_key,
             warrant_registry=warrant_registry,
+            verifier=verifier,
         )
 
     @property
@@ -146,6 +160,10 @@ class Boundary:
     @property
     def receipt_store(self) -> ReceiptStore:
         return self._store
+
+    @property
+    def verifier(self) -> Any | None:
+        return self._verifier
 
     @property
     def secrets_broker(self) -> SecretsBroker | None:
@@ -395,6 +413,8 @@ class Boundary:
         provenance: list[ProvenanceItem] | tuple[ProvenanceItem, ...] = (),
         warrant: Warrant | dict[str, Any] | None = None,
         idempotency_key: str | None = None,
+        verify_postcondition: bool = False,
+        postcondition_claim: str = "exists",
     ) -> Any:
         """Evaluate an action, record a durable decision, enforce verdict, and record outcome."""
         warrant_obj = self._check_warrant(
@@ -439,6 +459,29 @@ class Boundary:
                 canonical_hash="sha256:" + ("0" * 64),
             )
             raise ActionBlockedError(hold_decision, "INVALID") from exc
+
+        # Multi-agent coordination conflict check:
+        # mutating operations check for active lease conflicts
+        if envelope.action.verb in ("write", "delete", "exec", "admin"):
+            conflict = self._store.find_resource_conflict(
+                resource=envelope.action.resource,
+                agent_id=self._agent_id,
+                mode="exclusive",
+            )
+            if conflict is not None:
+                deny_decision = Decision(
+                    verdict=Verdict.DENY,
+                    rule_id="coordination:resource-locked",
+                    reason=(
+                        f"Resource '{envelope.action.resource}' is locked by agent "
+                        f"'{conflict.owner_agent_id}' under lease '{conflict.lease_id}' "
+                        f"until {conflict.expires_at}"
+                    ),
+                    policy_version=self._engine.policy.policy_version,
+                    canonical_hash=envelope.canonical_hash,
+                )
+                self._store.record_decision(envelope, deny_decision)
+                raise ActionBlockedError(deny_decision, envelope.crossing_id)
 
         # Update session taint tracker if this action is untrusted
         if envelope.max_taint == "untrusted":
@@ -570,7 +613,111 @@ class Boundary:
         )
         # Update session cumulative budgets
         self._engine.budget_tracker.record_usage(envelope)
+
+        # Postcondition verification if requested and verifier configured
+        if verify_postcondition and self._verifier is not None:
+            with contextlib.suppress(Exception):
+                obs = self._verifier.verify(
+                    resource=envelope.action.resource,
+                    claim=postcondition_claim,
+                    crossing_id=envelope.crossing_id,
+                )
+                self._store.record_observation(obs)
+                if obs.status == "verified":
+                    ev = build_evidence_record(
+                        crossing_id=envelope.crossing_id,
+                        tier=EvidenceTier.EXTERNALLY_VERIFIED,
+                        trust_domain="verifier:workspace",
+                        collector=obs.verifier_id,
+                        details={
+                            "observation_id": obs.observation_id,
+                            "resource": obs.subject_resource,
+                            "claim": obs.claim,
+                            "status": obs.status,
+                            "observed_digest": obs.observed_digest,
+                        },
+                        expires_at=obs.expires_at,
+                    )
+                    self._store.record_evidence(ev)
+                    link = CausalLink(
+                        link_id=generate_link_id(),
+                        link_version="1",
+                        source_id=envelope.crossing_id,
+                        source_type="crossing",
+                        relation="verifies",
+                        target_id=obs.observation_id,
+                        target_type="observation",
+                        created_at=utc_iso(),
+                    )
+                    self._store.record_causal_link(link)
+
         return result
+
+    def acquire_lease(
+        self,
+        resource: str,
+        *,
+        mode: LeaseMode = "exclusive",
+        ttl_seconds: float = 60.0,
+        metadata: dict[str, Any] | None = None,
+    ) -> ResourceLease:
+        """Acquire a durable resource lease for this agent and session."""
+        lease = build_lease(
+            resource=resource,
+            owner_agent_id=self._agent_id,
+            session_id=self._session_id,
+            mode=mode,
+            ttl_seconds=ttl_seconds,
+            metadata=metadata,
+        )
+        return self._store.acquire_lease(lease)
+
+    def release_lease(self, lease_id: str) -> bool:
+        """Release a resource lease owned by this agent."""
+        return self._store.release_lease(lease_id, owner_agent_id=self._agent_id)
+
+    def list_active_leases(self) -> list[ResourceLease]:
+        """List currently active resource leases."""
+        return self._store.list_leases(status="active")
+
+    def verify_state(
+        self,
+        resource: str,
+        claim: str = "exists",
+        *,
+        crossing_id: str | None = None,
+        expected_digest: str | None = None,
+        ttl_seconds: float = 60.0,
+    ) -> ObservationRecord:
+        """Execute verifiable state check through the configured verifier."""
+        if self._verifier is None:
+            raise ValueError("No verifier configured on Boundary")
+        obs = self._verifier.verify(
+            resource=resource,
+            claim=claim,
+            crossing_id=crossing_id,
+            expected_digest=expected_digest,
+            ttl_seconds=ttl_seconds,
+        )
+        self._store.record_observation(obs)
+        if obs.status == "verified" and crossing_id:
+            with contextlib.suppress(Exception):
+                ev = build_evidence_record(
+                    crossing_id=crossing_id,
+                    tier=EvidenceTier.EXTERNALLY_VERIFIED,
+                    trust_domain="verifier:workspace",
+                    collector=obs.verifier_id,
+                    details={
+                        "observation_id": obs.observation_id,
+                        "resource": obs.subject_resource,
+                        "claim": obs.claim,
+                        "status": obs.status,
+                        "observed_digest": obs.observed_digest,
+                    },
+                    expires_at=obs.expires_at,
+                )
+                self._store.record_evidence(ev)
+        return cast(ObservationRecord, obs)
 
     def guard(
         self,

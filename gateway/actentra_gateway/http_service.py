@@ -344,6 +344,33 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, ev)
             return
 
+        if path == "/v1/leases":
+            query = parse_qs(parts.query)
+            res_f = query.get("resource", [None])[0]
+            agent_f = query.get("owner_agent_id", [None])[0]
+            stat_f = query.get("status", [None])[0]
+            try:
+                lim_f = int(query.get("limit", ["50"])[0])
+            except ValueError:
+                lim_f = 50
+            leases = services.list_resource_leases(
+                resource=res_f,
+                owner_agent_id=agent_f,
+                status=stat_f,
+                limit=lim_f,
+            )
+            self._send_json(HTTPStatus.OK, leases)
+            return
+
+        if path.startswith("/v1/leases/") and not path.endswith("/release"):
+            lid = path[len("/v1/leases/") :]
+            lease = services.get_resource_lease(lid)
+            if lease is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Lease '{lid}' not found"})
+            else:
+                self._send_json(HTTPStatus.OK, lease)
+            return
+
         if path in ("/ui", "/"):
             self._send_html(HTTPStatus.OK, self._render_dashboard_html())
             return
@@ -716,6 +743,60 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     HTTPStatus.BAD_REQUEST, {"error": f"Failed to verify handoff: {exc}"}
                 )
+            return
+
+        if path == "/v1/leases":
+            try:
+                data = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid body: {exc}"})
+                return
+
+            resource = data.get("resource")
+            agent_id = data.get("owner_agent_id") or data.get("agent_id")
+            session_id = data.get("session_id") or "default"
+            if not resource or not agent_id:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": (
+                            "Fields 'resource' and 'owner_agent_id' (or 'agent_id') are required"
+                        )
+                    },
+                )
+                return
+
+            res = services.acquire_resource_lease(
+                resource=str(resource),
+                owner_agent_id=str(agent_id),
+                session_id=str(session_id),
+                mode=data.get("mode", "exclusive"),
+                ttl_seconds=float(data.get("ttl_seconds", 60.0)),
+                metadata=data.get("metadata"),
+            )
+            if res.get("status") == "conflict":
+                self._send_json(HTTPStatus.CONFLICT, res)
+            elif res.get("status") == "error":
+                self._send_json(HTTPStatus.BAD_REQUEST, res)
+            else:
+                self._send_json(HTTPStatus.CREATED, res)
+            return
+
+        if path.startswith("/v1/leases/") and path.endswith("/release"):
+            lid = path[len("/v1/leases/") : -len("/release")]
+            try:
+                data = self._read_json_body()
+            except Exception:
+                data = {}
+            owner = data.get("owner_agent_id") or data.get("agent_id")
+            res = services.release_resource_lease(lid, owner_agent_id=owner)
+            if not res.get("released"):
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": f"Lease '{lid}' not found, already released, or unauthorized"},
+                )
+            else:
+                self._send_json(HTTPStatus.OK, res)
             return
 
         if path == "/v1/freeze":

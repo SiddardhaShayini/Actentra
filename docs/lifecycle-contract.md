@@ -103,6 +103,7 @@ Actentra maintains a strict boundary between what is durable across restarts and
   4. `session_budgets` table: Durable cumulative session counters (`actions_count`, `external_calls_count`, `write_bytes_count`, `updated_at`) surviving process restarts.
   5. `session_taints` table: Durable session taint level (`trusted`, `untrusted`, `unknown`) surviving process restarts.
   6. `evidence_records` table: Cryptographically hashed evidential observation records binding crossings to verification tiers.
+  7. `resource_leases` table: Durable multi-agent coordination leases (`lease_id`, `resource`, `owner_agent_id`, `session_id`, `mode`, `status`, `expires_at`, `lease_hash`).
 - **Process-Local State (reset upon process restart):**
   1. In-memory policy rate-limit token buckets (`RateLimiter._buckets`).
   2. Emergency freeze state (`PolicyEngine._frozen`).
@@ -143,6 +144,13 @@ Actentra classifies evidence into 5 formal tiers (`spec/evidence.v1.schema.json`
 2. **Crash Recovery Distinction:** Crossings that were authorized but never dispatched must not be blindly recovered as `unknown`, because decision-only crossings may intentionally await external caller reporting. Only crossings where execution dispatch was actively in flight when the process terminated should be marked `unknown` upon restart.
 3. **Atomic Execution Claims:** Transitioning an approved crossing from `'approved'` to `'consumed'` is performed atomically in SQLite WAL via `claim_approval_for_execution()` with `BEGIN IMMEDIATE`. Concurrent or duplicate execute requests fail closed.
 4. **Local Hash Chain Boundary:** The SQLite SHA-256 hash chain provides tamper evidence against accidental edits and uncoordinated modifications. It does not defend against a hostile root administrator capable of rewriting the database unless anchored to an independently stored, signed Ed25519 checkpoint.
+
+### 3.5 Multi-Agent Coordination & Resource Leases
+
+1. **Durable Conflict Locking:** Agents coordinate operations on shared resources using explicit `ResourceLease` records stored in SQLite WAL (`spec/lease.v1.schema.json`).
+2. **Exclusive vs. Shared Modes:** Mutating verbs (`write`, `delete`, `exec`, `admin`) require holding an exclusive lease or ensuring no active exclusive lease is held by another agent. Conflicting attempts fail closed with `Verdict.DENY` (`rule_id="coordination:resource-locked"`).
+3. **Lease TTL & Automatic Expiry:** Leases carry explicit ISO-8601 expiration timestamps (`expires_at`). Expired leases do not block subsequent agents.
+4. **Postcondition Verification:** When requested (`verify_postcondition=True`), successful mutations trigger automatic workspace observation via `WorkspaceFileVerifier`, recording `ObservationRecord` and generating an `externally_verified` `EvidenceRecord` linked to the crossing via causal DAG reference (`verifies`).
 
 ---
 

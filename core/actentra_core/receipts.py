@@ -18,6 +18,13 @@ from actentra_core.causal import (
     CycleDetectedError,
     detect_cycles,
 )
+from actentra_core.coordination import (
+    ResourceConflictError,
+    ResourceLease,
+)
+from actentra_core.coordination import (
+    utc_iso as utc_lease_iso,
+)
 from actentra_core.envelope import (
     ActionEnvelope,
     ActionSpec,
@@ -457,6 +464,36 @@ class ReceiptStore:
                     updated_at TEXT NOT NULL
                 );
                 """
+            )
+
+            # Phase 6: Durable resource leases for multi-agent coordination
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS resource_leases (
+                    lease_id TEXT PRIMARY KEY,
+                    lease_version TEXT NOT NULL,
+                    resource TEXT NOT NULL,
+                    owner_agent_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    mode TEXT NOT NULL CHECK (mode IN ('exclusive', 'shared')),
+                    status TEXT NOT NULL CHECK (status IN ('active', 'released', 'expired')),
+                    acquired_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    lease_hash TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lease_resource ON resource_leases(resource);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lease_owner ON resource_leases("
+                "owner_agent_id, status);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lease_status_exp ON resource_leases("
+                "status, expires_at);"
             )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to initialize receipt store: {exc}") from exc
@@ -2139,6 +2176,238 @@ class ReceiptStore:
             return {str(r[0]): str(r[1]) for r in rows}
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to list session taints: {exc}") from exc
+        finally:
+            conn.close()
+
+    def _row_to_lease(self, row: tuple[Any, ...]) -> ResourceLease:
+        return ResourceLease(
+            lease_id=str(row[0]),
+            lease_version=str(row[1]),
+            resource=str(row[2]),
+            owner_agent_id=str(row[3]),
+            session_id=str(row[4]),
+            mode=row[5],
+            status=row[6],
+            acquired_at=str(row[7]),
+            expires_at=str(row[8]),
+            metadata=json.loads(row[9]),
+            lease_hash=str(row[10]),
+        )
+
+    def find_resource_conflict(
+        self,
+        resource: str,
+        agent_id: str,
+        mode: str = "exclusive",
+        now: float | None = None,
+    ) -> ResourceLease | None:
+        """Check if an active unexpired lease conflicts with the requested resource and mode."""
+        curr_time = now if now is not None else time.time()
+        now_iso = utc_lease_iso(curr_time)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT lease_id, lease_version, resource, owner_agent_id,
+                       session_id, mode, status, acquired_at, expires_at,
+                       metadata_json, lease_hash
+                FROM resource_leases
+                WHERE status = 'active' AND expires_at > ?;
+                """,
+                (now_iso,),
+            ).fetchall()
+            for r in rows:
+                lease = self._row_to_lease(r)
+                if lease.owner_agent_id == agent_id:
+                    continue  # Self-held lease is not a conflict
+                if lease.matches_resource(resource) and (
+                    mode == "exclusive" or lease.mode == "exclusive"
+                ):
+                    return lease
+            return None
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to check resource conflict: {exc}") from exc
+        finally:
+            conn.close()
+
+    def acquire_lease(
+        self,
+        lease: ResourceLease,
+        now: float | None = None,
+    ) -> ResourceLease:
+        """Atomically acquire a resource lease, rejecting if a conflict exists."""
+        curr_time = now if now is not None else time.time()
+        now_iso = utc_lease_iso(curr_time)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            rows = conn.execute(
+                """
+                SELECT lease_id, lease_version, resource, owner_agent_id,
+                       session_id, mode, status, acquired_at, expires_at,
+                       metadata_json, lease_hash
+                FROM resource_leases
+                WHERE status = 'active' AND expires_at > ?;
+                """,
+                (now_iso,),
+            ).fetchall()
+            for r in rows:
+                existing = self._row_to_lease(r)
+                overlaps = existing.matches_resource(lease.resource) or lease.matches_resource(
+                    existing.resource
+                )
+                if (
+                    existing.owner_agent_id != lease.owner_agent_id
+                    and overlaps
+                    and (lease.mode == "exclusive" or existing.mode == "exclusive")
+                ):
+                    conn.execute("ROLLBACK;")
+                    raise ResourceConflictError(
+                        f"Resource '{lease.resource}' conflicts with active lease "
+                        f"'{existing.lease_id}' held by agent '{existing.owner_agent_id}' "
+                        f"until {existing.expires_at}"
+                    )
+
+            conn.execute(
+                """
+                INSERT INTO resource_leases (
+                    lease_id, lease_version, resource, owner_agent_id,
+                    session_id, mode, status, acquired_at, expires_at,
+                    metadata_json, lease_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    lease.lease_id,
+                    lease.lease_version,
+                    lease.resource,
+                    lease.owner_agent_id,
+                    lease.session_id,
+                    lease.mode,
+                    lease.status,
+                    lease.acquired_at,
+                    lease.expires_at,
+                    json.dumps(lease.metadata),
+                    lease.lease_hash,
+                ),
+            )
+            conn.execute("COMMIT;")
+            return lease
+        except (ResourceConflictError, ReceiptError):
+            raise
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to acquire resource lease: {exc}") from exc
+        finally:
+            conn.close()
+
+    def release_lease(
+        self,
+        lease_id: str,
+        owner_agent_id: str | None = None,
+    ) -> bool:
+        """Release an active lease. Returns True if released, False if not found/unauthorized."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            row = conn.execute(
+                "SELECT owner_agent_id, status FROM resource_leases WHERE lease_id = ?;",
+                (lease_id,),
+            ).fetchone()
+            if not row:
+                conn.execute("ROLLBACK;")
+                return False
+            if owner_agent_id is not None and str(row[0]) != owner_agent_id:
+                conn.execute("ROLLBACK;")
+                return False
+            conn.execute(
+                "UPDATE resource_leases SET status = 'released' WHERE lease_id = ?;",
+                (lease_id,),
+            )
+            conn.execute("COMMIT;")
+            return True
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to release lease: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_lease(self, lease_id: str) -> ResourceLease | None:
+        """Fetch a resource lease by ID."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT lease_id, lease_version, resource, owner_agent_id,
+                       session_id, mode, status, acquired_at, expires_at,
+                       metadata_json, lease_hash
+                FROM resource_leases
+                WHERE lease_id = ?;
+                """,
+                (lease_id,),
+            ).fetchone()
+            return self._row_to_lease(row) if row else None
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to get lease: {exc}") from exc
+        finally:
+            conn.close()
+
+    def list_leases(
+        self,
+        *,
+        resource: str | None = None,
+        owner_agent_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[ResourceLease]:
+        """List resource leases with optional filtering."""
+        conditions: list[str] = []
+        params: list[Any] = []
+        if resource is not None:
+            conditions.append("resource = ?")
+            params.append(resource)
+        if owner_agent_id is not None:
+            conditions.append("owner_agent_id = ?")
+            params.append(owner_agent_id)
+        if status is not None:
+            conditions.append("status = ?")
+            params.append(status)
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        sql = f"""
+            SELECT lease_id, lease_version, resource, owner_agent_id,
+                   session_id, mode, status, acquired_at, expires_at,
+                   metadata_json, lease_hash
+            FROM resource_leases
+            {where_clause}
+            ORDER BY acquired_at DESC, lease_id DESC
+            LIMIT ? OFFSET ?;
+        """  # noqa: S608
+        params.extend([max(1, limit), max(0, offset)])
+        conn = self._connect()
+        try:
+            rows = conn.execute(sql, params).fetchall()
+            return [self._row_to_lease(r) for r in rows]
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to list leases: {exc}") from exc
+        finally:
+            conn.close()
+
+    def count_leases(self, status: str | None = None) -> int:
+        """Count total leases matching status."""
+        conn = self._connect()
+        try:
+            if status is not None:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM resource_leases WHERE status = ?;",
+                    (status,),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) FROM resource_leases;").fetchone()
+            return int(row[0]) if row else 0
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to count leases: {exc}") from exc
         finally:
             conn.close()
 

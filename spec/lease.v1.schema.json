@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://actentra.dev/spec/lease.v1.schema.json",
+  "title": "Actentra Resource Lease Record v1",
+  "description": "Durable multi-agent coordination lease locking resources against concurrent conflicting mutations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "lease_id",
+    "lease_version",
+    "resource",
+    "owner_agent_id",
+    "session_id",
+    "mode",
+    "status",
+    "acquired_at",
+    "expires_at",
+    "lease_hash"
+  ],
+  "properties": {
+    "lease_id": {
+      "type": "string",
+      "pattern": "^lease_[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "lease_version": {
+      "type": "string",
+      "enum": ["1"]
+    },
+    "resource": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "owner_agent_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["exclusive", "shared"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "released", "expired"]
+    },
+    "acquired_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    },
+    "lease_hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

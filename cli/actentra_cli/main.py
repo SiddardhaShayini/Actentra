@@ -26,6 +26,10 @@ from actentra_core.checkpoints import (
     verify_checkpoint,
     write_checkpoint,
 )
+from actentra_core.coordination import (
+    ResourceConflictError,
+    build_lease,
+)
 from actentra_core.envelope import EnvelopeError, ProvenanceItem, build_envelope
 from actentra_core.handoffs import (
     HandoffError,
@@ -79,6 +83,8 @@ handoff_app = typer.Typer(help="Manage and verify cross-agent task handoffs.")
 app.add_typer(handoff_app, name="handoff")
 evidence_app = typer.Typer(help="Inspect and verify execution evidence records.")
 app.add_typer(evidence_app, name="evidence")
+lease_app = typer.Typer(help="Manage multi-agent resource coordination leases.")
+app.add_typer(lease_app, name="lease")
 
 _DEFAULT_STARTER_POLICY = """\
 version: 1
@@ -1274,6 +1280,137 @@ def evidence_show_cmd(
         typer.echo(f"Evidence '{evidence_id}' not found.", err=True)
         raise typer.Exit(code=1)
     typer.echo(json.dumps(ev.to_dict(), indent=2))
+
+
+@lease_app.command("acquire")
+def lease_acquire_cmd(
+    resource: Annotated[str, typer.Argument(help="Target resource or wildcard pattern.")],
+    agent_id: Annotated[str, typer.Option("--agent", "-a", help="Owner agent ID.")],
+    session_id: Annotated[str, typer.Option("--session", "-s", help="Session ID.")] = "default",
+    mode: Annotated[
+        str, typer.Option("--mode", "-m", help="Lease mode (exclusive or shared).")
+    ] = "exclusive",
+    ttl: Annotated[float, typer.Option("--ttl", help="Lease TTL in seconds.")] = 60.0,
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/receipts.db"
+    ),
+    as_json: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    """Acquire a multi-agent resource coordination lease."""
+    if not db_path.exists():
+        typer.echo(f"Database not found: {db_path}", err=True)
+        raise typer.Exit(code=1)
+    store = ReceiptStore(db_path)
+    try:
+        lease = build_lease(
+            resource=resource,
+            owner_agent_id=agent_id,
+            session_id=session_id,
+            mode=mode,  # type: ignore[arg-type]
+            ttl_seconds=ttl,
+        )
+        saved = store.acquire_lease(lease)
+        if as_json:
+            typer.echo(json.dumps(saved.to_dict(), indent=2))
+        else:
+            typer.echo(
+                f"Lease acquired: id={saved.lease_id} resource={saved.resource} "
+                f"owner={saved.owner_agent_id} mode={saved.mode} expires={saved.expires_at}"
+            )
+    except ResourceConflictError as exc:
+        typer.echo(f"Conflict error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    except Exception as exc:
+        typer.echo(f"Failed to acquire lease: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@lease_app.command("release")
+def lease_release_cmd(
+    lease_id: Annotated[str, typer.Argument(help="Lease ID to release.")],
+    agent_id: Annotated[
+        str | None, typer.Option("--agent", "-a", help="Owner agent ID verification.")
+    ] = None,
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/receipts.db"
+    ),
+) -> None:
+    """Release an active resource lease."""
+    if not db_path.exists():
+        typer.echo(f"Database not found: {db_path}", err=True)
+        raise typer.Exit(code=1)
+    store = ReceiptStore(db_path)
+    released = store.release_lease(lease_id, owner_agent_id=agent_id)
+    if not released:
+        typer.echo(
+            f"Lease '{lease_id}' not found, already released, or agent unauthorized.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(f"Lease '{lease_id}' successfully released.")
+
+
+@lease_app.command("list")
+def lease_list_cmd(
+    resource: Annotated[
+        str | None, typer.Option("--resource", "-r", help="Filter by resource.")
+    ] = None,
+    agent_id: Annotated[
+        str | None, typer.Option("--agent", "-a", help="Filter by owner agent ID.")
+    ] = None,
+    status: Annotated[
+        str | None,
+        typer.Option("--status", "-s", help="Filter by status (active, released, expired)."),
+    ] = "active",
+    limit: Annotated[int, typer.Option("--limit", "-l", help="Max records.")] = 50,
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/receipts.db"
+    ),
+    as_json: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    """List multi-agent resource coordination leases."""
+    if not db_path.exists():
+        typer.echo(f"Database not found: {db_path}", err=True)
+        raise typer.Exit(code=1)
+    store = ReceiptStore(db_path)
+    leases = store.list_leases(
+        resource=resource,
+        owner_agent_id=agent_id,
+        status=status if status != "all" else None,
+        limit=limit,
+    )
+    if as_json:
+        typer.echo(json.dumps([lease_rec.to_dict() for lease_rec in leases], indent=2))
+        return
+    if not leases:
+        typer.echo("No resource leases found matching criteria.")
+        return
+    for lease_rec in leases:
+        active_tag = "ACTIVE" if lease_rec.is_active() else lease_rec.status.upper()
+        typer.echo(
+            f"[{active_tag} / {lease_rec.mode.upper()}] id={lease_rec.lease_id} "
+            f"resource={lease_rec.resource} owner={lease_rec.owner_agent_id} "
+            f"session={lease_rec.session_id} expires={lease_rec.expires_at}"
+        )
+
+
+@lease_app.command("show")
+def lease_show_cmd(
+    lease_id: Annotated[str, typer.Argument(help="Lease ID to inspect.")],
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/receipts.db"
+    ),
+) -> None:
+    """Show details of a specific resource lease."""
+    if not db_path.exists():
+        typer.echo(f"Database not found: {db_path}", err=True)
+        raise typer.Exit(code=1)
+    store = ReceiptStore(db_path)
+    lease = store.get_lease(lease_id)
+    if lease is None:
+        typer.echo(f"Lease '{lease_id}' not found.", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(json.dumps(lease.to_dict(), indent=2))
 
 
 @checkpoint_app.command("keygen")

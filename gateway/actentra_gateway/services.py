@@ -20,6 +20,11 @@ from actentra_core.causal import (
     build_causal_trace,
     generate_link_id,
 )
+from actentra_core.coordination import (
+    LeaseMode,
+    ResourceConflictError,
+    build_lease,
+)
 from actentra_core.envelope import (
     ActionEnvelope,
     EnvelopeError,
@@ -224,6 +229,32 @@ class AppServices:
         # Update session taint tracker if this action is untrusted (Finding 5)
         if envelope.max_taint == "untrusted":
             self.boundary.set_session_taint("untrusted", session_id=envelope.session_id)
+
+        # Multi-agent coordination conflict check:
+        # mutating operations check for active lease conflicts
+        if envelope.action.verb in ("write", "delete", "exec", "admin"):
+            conflict = self.boundary.receipt_store.find_resource_conflict(
+                resource=envelope.action.resource,
+                agent_id=envelope.agent.id,
+                mode="exclusive",
+            )
+            if conflict is not None:
+                conflict_decision = Decision(
+                    verdict=Verdict.DENY,
+                    rule_id="coordination:resource-locked",
+                    reason=(
+                        f"Resource '{envelope.action.resource}' is locked by agent "
+                        f"'{conflict.owner_agent_id}' under lease '{conflict.lease_id}' "
+                        f"until {conflict.expires_at}"
+                    ),
+                    policy_version=self.boundary.engine.policy.policy_version,
+                    canonical_hash=envelope.canonical_hash,
+                )
+                self.boundary.receipt_store.record_decision(envelope, conflict_decision)
+                conflict_resp: dict[str, Any] = conflict_decision.to_dict()
+                conflict_resp["crossing_id"] = envelope.crossing_id
+                conflict_resp["error"] = conflict_decision.reason
+                return conflict_resp
 
         decision = self.boundary.engine.evaluate(envelope)
 
@@ -753,6 +784,9 @@ class AppServices:
             "evidence_records": [
                 ev.to_dict() for ev in self.boundary.receipt_store.list_evidence(limit=500)
             ],
+            "resource_leases": [
+                lease.to_dict() for lease in self.boundary.receipt_store.list_leases(limit=500)
+            ],
         }
         if out_path is not None:
             dest = Path(out_path)
@@ -1116,3 +1150,70 @@ class AppServices:
             "contradictions": [],
             "observations": observed_records,
         }
+
+    # --- 8. Multi-Agent Resource Coordination & Leases ---
+
+    def acquire_resource_lease(
+        self,
+        resource: str,
+        *,
+        owner_agent_id: str,
+        session_id: str,
+        mode: LeaseMode = "exclusive",
+        ttl_seconds: float = 60.0,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Acquire a durable resource lease for an agent."""
+        try:
+            lease = build_lease(
+                resource=resource,
+                owner_agent_id=owner_agent_id,
+                session_id=session_id,
+                mode=mode,
+                ttl_seconds=ttl_seconds,
+                metadata=metadata,
+            )
+            saved = self.boundary.receipt_store.acquire_lease(lease)
+            return {"status": "acquired", "lease": saved.to_dict()}
+        except ResourceConflictError as exc:
+            return {"status": "conflict", "error": str(exc)}
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+
+    def release_resource_lease(
+        self,
+        lease_id: str,
+        *,
+        owner_agent_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Release an acquired resource lease."""
+        released = self.boundary.receipt_store.release_lease(
+            lease_id, owner_agent_id=owner_agent_id
+        )
+        if not released:
+            return {"status": "not_found_or_unauthorized", "released": False}
+        return {"status": "released", "released": True, "lease_id": lease_id}
+
+    def get_resource_lease(self, lease_id: str) -> dict[str, Any] | None:
+        """Get detail for a specific resource lease."""
+        lease = self.boundary.receipt_store.get_lease(lease_id)
+        return lease.to_dict() if lease is not None else None
+
+    def list_resource_leases(
+        self,
+        *,
+        resource: str | None = None,
+        owner_agent_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List resource leases with optional filtering."""
+        leases = self.boundary.receipt_store.list_leases(
+            resource=resource,
+            owner_agent_id=owner_agent_id,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+        return [lease_obj.to_dict() for lease_obj in leases]

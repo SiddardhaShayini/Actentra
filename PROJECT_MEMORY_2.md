@@ -250,3 +250,34 @@ This guidance does not imply that Actentra’s authorization or first demonstrat
   * Full test suite: 154 passed, 4 skipped in 7.96s (`pytest`).
   * Code quality: 0 errors on `ruff check` and `ruff format --check`.
   * Type safety: 0 issues on `mypy core executors gateway sdk cli tests/unit/test_evidence.py`.
+
+### 2026-11-17 17:15 IST
+
+- Implemented Stage 2 & Stage 3 of ACTENTRA_MASTER_ROADMAP.md / PLAN_V5.md:
+  * Multi-Agent Resource Coordination & Leases (`spec/lease.v1.schema.json`, `core/actentra_core/coordination.py`).
+  * Durable lease persistence and conflict detection in SQLite WAL (`core/actentra_core/receipts.py`).
+  * Gated mutation execution in Boundary SDK and Gateway (`sdk/python/actentra/boundary.py`, `gateway/actentra_gateway/services.py`).
+  * Automatic postcondition state verification in Boundary SDK linking `WorkspaceFileVerifier`, `ObservationRecord`, `EvidenceRecord` (`externally_verified`), and causal trace DAG references (`verifies`).
+  * REST API endpoints (`POST /v1/leases`, `GET /v1/leases`, `GET /v1/leases/{id}`, `POST /v1/leases/{id}/release`).
+  * CLI subcommands (`actentra lease acquire`, `actentra lease release`, `actentra lease list`, `actentra lease show`).
+  * Advanced verification UX in Operator Console (`gateway/actentra_gateway/console.html`): Evidence tier badges (LOCAL, VERIFIED, REPORTED, STALE, UNKNOWN), receipts filter by evidence tier, and live Active Multi-Agent Resource Leases feed.
+- Files modified/created:
+  * `spec/lease.v1.schema.json`: Formal JSON Schema Draft 2020-12 defining `ResourceLease` record structure, mode (`exclusive`, `shared`), status (`active`, `released`, `expired`), Crockford base32 ID, and SHA-256 canonical lease hash.
+  * `core/actentra_core/coordination.py`: Core coordination logic, `ResourceLease`, `ResourceConflictError`, `resource_pattern_matches` (wildcards, Windows path normalization), `build_lease`, and `compute_lease_hash`.
+  * `core/actentra_core/receipts.py`: Added `resource_leases` SQLite table and indexes; added `acquire_lease` (with atomic conflict checking), `release_lease`, `get_lease`, `list_leases`, `count_leases`, and `find_resource_conflict`.
+  * `sdk/python/actentra/boundary.py`: Added lease acquisition/release methods, conflict gating on mutating verbs (`write`, `delete`, `exec`, `admin`), verifier injection, and automatic postcondition verification (`verify_postcondition=True`) with causal DAG linkage.
+  * `gateway/actentra_gateway/services.py`: Added `acquire_resource_lease`, `release_resource_lease`, `get_resource_lease`, `list_resource_leases`; enforced lease conflicts on mutating crossings in `submit_crossing`; included `resource_leases` in `export_audit_bundle`.
+  * `gateway/actentra_gateway/http_service.py`: Added REST routes `POST /v1/leases`, `GET /v1/leases`, `GET /v1/leases/{id}`, `POST /v1/leases/{id}/release`.
+  * `cli/actentra_cli/main.py`: Added `actentra lease` command group (`acquire`, `release`, `list`, `show`).
+  * `gateway/actentra_gateway/console.html`: Added visual badges for evidence tiers, evidence filter on receipts explorer, and live active resource leases widget on Overview dashboard.
+  * `tests/unit/test_coordination.py`: 9 comprehensive unit tests covering schema conformance, hash integrity, pattern matching, exclusivity conflicts, shared leases, expiration TTL, Boundary SDK gating, automatic postconditions, AppServices coordination, and CLI commands.
+  * `docs/lifecycle-contract.md`: Documented Section 3.5 on Multi-Agent Coordination & Resource Leases.
+  * `docs/product-status.md`: Updated capability matrix and invariant evidence matrix to mark Multi-Agent Coordination and Automatic Postcondition Verification as Supported.
+- Key decisions & rationale:
+  * Conflict protection at the boundary: Mutating operations on locked resources fail closed (`rule_id="coordination:resource-locked"`), preventing race conditions and silent state corruption between autonomous agents.
+  * Non-blocking reads & shared leases: Read-only operations and shared leases allow concurrent inspection without artificial locking bottlenecks.
+  * Ground-truth postcondition binding: Automatic postcondition verification immediately checks on-disk state after mutation, ensuring epistemic integrity (`externally_verified`) without relying on agent claims.
+- Validation:
+  * Full test suite: 163 passed, 4 skipped in 8.61s (`pytest`).
+  * Code quality: 0 errors on `ruff check` and `ruff format --check`.
+  * Type safety: 0 issues on `mypy` across all 38 source and test files.
