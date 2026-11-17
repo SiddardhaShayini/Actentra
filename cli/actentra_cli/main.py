@@ -27,6 +27,11 @@ from actentra_core.checkpoints import (
     write_checkpoint,
 )
 from actentra_core.envelope import EnvelopeError, ProvenanceItem, build_envelope
+from actentra_core.handoffs import (
+    HandoffError,
+    UnauthorizedAgentHandoffError,
+    build_handoff,
+)
 from actentra_core.policy import (
     PolicyEngine,
     PolicyPack,
@@ -46,7 +51,7 @@ from actentra_core.warrants import (
 )
 from actentra_executors.fs import LocalFSExecutor, ScopedFSTools
 from actentra_executors.verifiers import WorkspaceFileVerifier
-from actentra_gateway.demo import run_gateway_demonstration
+from actentra_gateway.demo import run_gateway_demonstration, run_handoff_demonstration
 from actentra_gateway.http_service import serve_http
 from actentra_gateway.mcp_proxy import serve_stdio
 from actentra_gateway.services import AppServices, ExecutorRegistry
@@ -70,6 +75,8 @@ observation_app = typer.Typer(help="Inspect and verify real-world state observat
 app.add_typer(observation_app, name="observation")
 trace_app = typer.Typer(help="Trace and inspect causal dependency graphs and timelines.")
 app.add_typer(trace_app, name="trace")
+handoff_app = typer.Typer(help="Manage and verify cross-agent task handoffs.")
+app.add_typer(handoff_app, name="handoff")
 
 _DEFAULT_STARTER_POLICY = """\
 version: 1
@@ -568,10 +575,20 @@ def demo(
             help="Run full restart-safe HTTP gateway and approval demonstration.",
         ),
     ] = False,
+    handoff: Annotated[
+        bool,
+        typer.Option(
+            "--handoff",
+            help="Run full Phase 4 cross-agent continuity and handoff demonstration.",
+        ),
+    ] = False,
 ) -> None:
     """Run a self-contained local demo showing allow, block, and receipt verification."""
     if gateway:
         run_gateway_demonstration(echo=typer.echo)
+        return
+    if handoff:
+        run_handoff_demonstration(echo_fn=typer.echo)
         return
 
     policy = load_policy_yaml(_DEFAULT_STARTER_POLICY)
@@ -638,6 +655,25 @@ def demo_gateway_cmd(
         workspace_dir=workspace,
         db_path=db_path,
         echo=typer.echo,
+    )
+
+
+@app.command("demo-handoff")
+def demo_handoff_cmd(
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Custom workspace directory for demo fixtures."),
+    ] = None,
+    db_path: Annotated[
+        Path | None,
+        typer.Option("--db", help="Path to SQLite receipt database."),
+    ] = None,
+) -> None:
+    """Run the Phase 4 constrained cross-agent handoff demonstration."""
+    run_handoff_demonstration(
+        workspace_root=workspace,
+        db_file=db_path,
+        echo_fn=typer.echo,
     )
 
 
@@ -1031,6 +1067,186 @@ def trace_delete_cmd(
     else:
         typer.echo(f"Causal link '{link_id}' not found", err=True)
         raise typer.Exit(code=1)
+
+
+@handoff_app.command("create")
+def handoff_create_cmd(
+    task_id: Annotated[str, typer.Argument(help="Task ID for the handoff workflow.")],
+    initiator_agent: Annotated[
+        str, typer.Argument(help="Initiator agent ID (e.g. 'agent_planner').")
+    ],
+    assigned_agent: Annotated[
+        str, typer.Argument(help="Assigned agent ID (e.g. 'agent_builder').")
+    ],
+    verifier_agent: Annotated[
+        str, typer.Argument(help="Verifier agent ID (e.g. 'agent_auditor').")
+    ],
+    allowed_verbs: Annotated[
+        str | None, typer.Option("--verbs", "-v", help="Comma-separated allowed verbs.")
+    ] = None,
+    allowed_resources: Annotated[
+        str | None,
+        typer.Option("--resources", "-r", help="Comma-separated allowed resource patterns."),
+    ] = None,
+    assertions_json: Annotated[
+        str | None, typer.Option("--assertions", "-a", help="JSON string of state assertions.")
+    ] = None,
+    ttl: Annotated[float, typer.Option("--ttl", help="Validity duration in seconds.")] = 3600.0,
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+) -> None:
+    """Create a new cross-agent task handoff record."""
+    verbs = tuple(v.strip() for v in allowed_verbs.split(",")) if allowed_verbs else ()
+    resources = (
+        tuple(r.strip() for r in allowed_resources.split(",")) if allowed_resources else ()
+    )
+    try:
+        asserts = json.loads(assertions_json) if assertions_json else {}
+    except Exception as exc:
+        typer.echo(f"Invalid JSON assertions: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    store = ReceiptStore(db_path)
+    hnd = build_handoff(
+        task_id=task_id,
+        initiator_agent_id=initiator_agent,
+        assigned_agent_id=assigned_agent,
+        verifier_agent_id=verifier_agent,
+        allowed_verbs=verbs,
+        allowed_resources=resources,
+        assertions=asserts,
+        ttl_seconds=ttl,
+    )
+    store.record_handoff(hnd)
+    typer.echo(
+        f"Created Task Handoff {hnd.handoff_id} for {task_id} (assigned to '{assigned_agent}')"
+    )
+
+
+@handoff_app.command("advance")
+def handoff_advance_cmd(
+    handoff_id: Annotated[str, typer.Argument(help="Handoff ID to advance.")],
+    caller_agent: Annotated[str, typer.Argument(help="Current caller agent ID.")],
+    next_agent: Annotated[str, typer.Argument(help="Next assigned agent ID.")],
+    crossing_id: Annotated[
+        str | None, typer.Option("--crossing-id", help="Crossing ID to link.")
+    ] = None,
+    observation_id: Annotated[
+        str | None, typer.Option("--observation-id", help="Observation ID to link.")
+    ] = None,
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+) -> None:
+    """Advance handoff step to the next agent."""
+    store = ReceiptStore(db_path)
+    boundary = Boundary(policy=load_policy_yaml(_DEFAULT_STARTER_POLICY), receipt_store=store)
+    services = AppServices(boundary)
+
+    try:
+        next_hnd = services.advance_task_handoff(
+            handoff_id,
+            caller_agent_id=caller_agent,
+            next_agent_id=next_agent,
+            crossing_id=crossing_id,
+            observation_id=observation_id,
+        )
+        typer.echo(
+            f"Advanced handoff to Step {next_hnd['current_step']} "
+            f"({next_hnd['handoff_id']}), assigned to '{next_agent}'"
+        )
+    except UnauthorizedAgentHandoffError as exc:
+        typer.echo(f"Unauthorized: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except HandoffError as exc:
+        typer.echo(f"Handoff error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@handoff_app.command("verify")
+def handoff_verify_cmd(
+    handoff_id: Annotated[str, typer.Argument(help="Handoff ID to verify.")],
+    verifier_agent: Annotated[str, typer.Argument(help="Verifier agent ID.")],
+    workspace: Annotated[
+        Path, typer.Option("--workspace", "-w", help="Workspace root directory.")
+    ] = Path("."),
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+) -> None:
+    """Perform independent verification of handoff assertions."""
+    store = ReceiptStore(db_path)
+    verifier = WorkspaceFileVerifier(workspace)
+    boundary = Boundary(policy=load_policy_yaml(_DEFAULT_STARTER_POLICY), receipt_store=store)
+    services = AppServices(boundary, file_verifier=verifier)
+
+    try:
+        res = services.verify_task_handoff(handoff_id, verifier_agent_id=verifier_agent)
+        if res.get("verified"):
+            typer.echo(f"[VERIFIED] Task handoff '{handoff_id}' assertions independently verified!")
+        else:
+            typer.echo(
+                f"[CONTRADICTED] Contradictions detected in handoff '{handoff_id}':",
+                err=True,
+            )
+            for c in res.get("contradictions", []):
+                typer.echo(f"  * {c}", err=True)
+            raise typer.Exit(code=1)
+    except UnauthorizedAgentHandoffError as exc:
+        typer.echo(f"Unauthorized: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@handoff_app.command("show")
+def handoff_show_cmd(
+    handoff_id: Annotated[str, typer.Argument(help="Handoff ID or task ID to show.")],
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+) -> None:
+    """Show details of a specific task handoff."""
+    store = ReceiptStore(db_path)
+    hnd = store.get_handoff(handoff_id)
+    if hnd is None:
+        hnd = store.get_active_handoff_by_task(handoff_id)
+    if hnd is None:
+        typer.echo(f"Handoff '{handoff_id}' not found", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(json.dumps(hnd.to_dict(), indent=2))
+
+
+@handoff_app.command("list")
+def handoff_list_cmd(
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to SQLite receipt database.")
+    ] = Path(".actentra/gateway-receipts.db"),
+    task_id: Annotated[
+        str | None, typer.Option("--task-id", help="Filter by task ID.")
+    ] = None,
+    agent_id: Annotated[
+        str | None, typer.Option("--agent-id", help="Filter by assigned agent ID.")
+    ] = None,
+    status: Annotated[
+        str | None, typer.Option("--status", help="Filter by status.")
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", help="Max handoffs to return.")] = 50,
+) -> None:
+    """List recorded task handoffs from SQLite store."""
+    store = ReceiptStore(db_path)
+    records = store.list_handoffs(
+        task_id=task_id, assigned_agent_id=agent_id, status=status, limit=limit
+    )
+    if not records:
+        typer.echo("No task handoffs found matching criteria.")
+        return
+    for h in records:
+        fresh_tag = "FRESH" if h.is_fresh() else "EXPIRED"
+        typer.echo(
+            f"[{h.status.upper()} / {fresh_tag}] id={h.handoff_id} task={h.task_id} "
+            f"step={h.current_step} assigned={h.assigned_agent_id} "
+            f"verifier={h.verifier_agent_id}"
+        )
 
 
 @checkpoint_app.command("keygen")

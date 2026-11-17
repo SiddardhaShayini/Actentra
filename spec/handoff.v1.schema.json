@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://actentra.dev/spec/handoff.v1.schema.json",
+  "title": "Actentra Task Handoff Record v1",
+  "description": "Durable cross-agent task handoff record binding agent identities, scoped permissions, prior crossings/observations, and verifiable assertions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "handoff_id",
+    "handoff_version",
+    "task_id",
+    "status",
+    "current_step",
+    "initiator_agent_id",
+    "assigned_agent_id",
+    "verifier_agent_id",
+    "allowed_verbs",
+    "allowed_resources",
+    "prior_crossings",
+    "prior_observations",
+    "assertions",
+    "contradictions",
+    "created_at",
+    "handoff_hash"
+  ],
+  "properties": {
+    "handoff_id": { "type": "string", "pattern": "^hnd_[0-9A-HJKMNP-TV-Z]{26}$" },
+    "handoff_version": { "type": "string", "enum": ["1"] },
+    "task_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "status": {
+      "type": "string",
+      "enum": ["active", "completed", "revoked", "expired", "contradicted"]
+    },
+    "current_step": { "type": "integer", "minimum": 1 },
+    "initiator_agent_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "assigned_agent_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "verifier_agent_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "allowed_verbs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "allowed_resources": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "prior_crossings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "prior_observations": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "assertions": { "type": "object" },
+    "contradictions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": ["string", "null"], "format": "date-time" },
+    "handoff_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

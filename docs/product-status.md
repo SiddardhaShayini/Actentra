@@ -1,7 +1,7 @@
 # Actentra — Product Status & Feature Matrix
 
 **Status:** Official Reference  
-**Last Updated:** 2026-11-16  
+**Last Updated:** 2026-11-17  
 
 ---
 
@@ -35,6 +35,7 @@ Each capability in Actentra is explicitly labeled under one of three tiers:
 | **Restart-Safe Gateway Demo** | **Supported** | `actentra_gateway.demo` | Automated demonstration of allowed read, ASK delete, pending restart, approval grant, approved restart, execution, and verification (`actentra demo-gateway`). |
 | **Verifiable World State Observation** | **Supported** | `actentra_core.observations`<br>`actentra_executors.verifiers` | Additive read-only verifier for workspace file state, hash-chained records in SQLite, freshness bounds, REST/CLI inspection. |
 | **Causal Graph / Reference Trace** | **Supported** | `actentra_core.causal`<br>`actentra_core.receipts` | Typed directional relationships, DAG cycle detection, timeline reconstruction, and REST/CLI trace inspection. |
+| **Cross-Agent Task Continuity & Handoffs** | **Supported** | `actentra_core.handoffs`<br>`actentra_gateway.services` | Scope-limited task handoffs across agent boundaries with assertion claims, causal DAG linkage, independent verification, and drift contradiction detection (`actentra handoff`, `actentra demo-handoff`). |
 | **Enterprise Remote Control Plane / SSO** | **Planned** | — | Non-goal for local-first architecture. |
 | **Native Desktop Shell / Installer** | **Planned** | — | Deferred to post-beta based on user adoption. |
 
@@ -61,6 +62,7 @@ Every claimed core guarantee and invariant is directly verified by automated tes
 | **Gateway: Restart-safe approvals** | Approved crossings in SQLite execute after restart with atomic claim | `tests/unit/test_app_services.py`<br>`tests/unit/test_gateway_demo.py` | Approvals in SQLite survive restart; unexecuted approved crossings execute in new process; double-dispatch rejected. |
 | **Observations: Verifiable state** | Read-only verifier captures subject digest, claim, trust domain, and freshness | `tests/unit/test_observations.py` | Verifies workspace file claims (exists, absent, digest_match), bounds freshness, chains observation hash, fails closed outside workspace. |
 | **Causal Trace: Provenance DAG** | Typed references link proposals, decisions, approvals, outcomes, and observations | `tests/unit/test_causal_trace.py` | Verifies acyclic DAG integrity, detects cycles, reconstructs chronological and causal role timeline, exposes REST and CLI trace inspection. |
+| **Handoffs: Cross-agent continuity** | Scope-restricted handoffs with independent verification and drift contradiction detection | `tests/unit/test_handoffs.py` | Enforces caller identity authorization, verb/resource bounds, independent third-party verification of state assertions, catches out-of-band drift, and persists through process restarts. |
 
 ---
 

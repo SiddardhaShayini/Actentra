@@ -194,3 +194,28 @@ This guidance does not imply that Actentra’s authorization or first demonstrat
   * All 137 tests passing with 0 failures (`uv run pytest -m "not slow"`).
   * `uv run ruff check core executors gateway sdk cli tests examples` passes with 0 issues.
   * `uv run mypy core executors gateway sdk cli tests/unit/test_causal_trace.py tests/unit/test_observations.py` passes with 0 issues.
+
+### 2026-11-17 15:30 IST
+
+- Implemented Phase 4 (Constrained Cross-Agent Handoff Experiment) according to PLAN_V4.md.
+- Files modified/created:
+  * `spec/handoff.v1.schema.json`: Formal JSON Schema for version 1 task handoff records with initiator, assigned, verifier agent IDs, allowed verbs/resources, assertion claims, and prior crossings.
+  * `core/actentra_core/handoffs.py`: Implemented `TaskHandoffRecord`, canonical `compute_handoff_hash`, `build_handoff`, caller authorization validation (`validate_caller`), scope permission checking (`is_action_permitted`), and error types (`UnauthorizedAgentHandoffError`, `ExpiredHandoffError`, `ContradictionDetectedError`).
+  * `core/actentra_core/receipts.py`: Added `task_handoffs` table with indexes on `task_id`, `(assigned_agent_id, status)`, and `status`; added `record_handoff`, `get_handoff`, `get_active_handoff_by_task`, `list_handoffs`, `update_handoff_status`, and `count_handoffs`.
+  * `core/actentra_core/causal.py`: Enhanced causal trace builder to recognize `task_handoffs` as first-class nodes in the causal DAG and timeline.
+  * `core/actentra_core/__init__.py`: Exported handoff models, functions, and exceptions.
+  * `gateway/actentra_gateway/services.py`: Added `create_task_handoff`, `get_task_handoff`, `list_task_handoffs`, `advance_task_handoff`, and `verify_task_handoff` to `AppServices`; populated `executed` and `outcome` status on dispatched crossings; exported handoffs in `export_audit_bundle`.
+  * `gateway/actentra_gateway/http_service.py`: Added REST endpoints (`POST /v1/handoffs`, `GET /v1/handoffs`, `GET /v1/handoffs/{id}`, `POST /v1/handoffs/{id}/advance`, `POST /v1/handoffs/{id}/verify`).
+  * `cli/actentra_cli/main.py`: Added `handoff` CLI command group (`actentra handoff create`, `advance`, `verify`, `show`, `list`) with JSON support and `actentra demo-handoff` (`actentra demo --handoff`).
+  * `gateway/actentra_gateway/demo.py`: Implemented 7-step cross-agent handoff demonstration `run_handoff_demonstration()` simulating Planner (Agent A), Builder (Agent B), Auditor (Agent C), unauthorized interloper rejection, drift contradiction detection, and gateway restart survival.
+  * `tests/unit/test_handoffs.py`: Added 8 comprehensive unit tests covering record validation, hash integrity, caller authorization, scope checking, advancement lifecycle, independent verification and drift detection, REST APIs, and end-to-end demonstration.
+  * `docs/product-status.md`: Updated capability matrix and invariant evidence matrix to reflect Cross-Agent Task Continuity & Handoffs as Supported.
+- Key decisions & rationale:
+  * Principle of Least Authority across agents: downstream agents operate strictly within the bounded verbs and resources granted by the predecessor handoff.
+  * Independent verification (Verifier role): handoff assertions are verified against real disk state by an independent verifier agent (`agent_auditor`) using `WorkspaceFileVerifier` rather than trusting predecessor claims.
+  * Explicit drift contradiction detection: if state changes out-of-band or hashes drift, status updates to `contradicted` and handoff is blocked.
+  * Restart-safe persistence: all handoffs, advances, and contradictions are stored in SQLite and survive complete gateway process restarts.
+- Validation:
+  * All 145 tests passing with 0 failures (`uv run pytest -m "not slow"`).
+  * `uv run ruff check core executors gateway sdk cli tests examples` passes with 0 issues.
+  * `uv run mypy core executors gateway sdk cli tests/unit/test_handoffs.py tests/unit/test_causal_trace.py tests/unit/test_observations.py` passes with 0 issues.

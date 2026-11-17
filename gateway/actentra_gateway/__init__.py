@@ -1,6 +1,11 @@
 """Actentra gateway adapters (MCP stdio proxy and future local endpoints)."""
 
-from actentra_gateway.demo import GatewayDemoResult, run_gateway_demonstration
+from actentra_gateway.demo import (
+    GatewayDemoResult,
+    HandoffDemoResult,
+    run_gateway_demonstration,
+    run_handoff_demonstration,
+)
 from actentra_gateway.http_service import (
     ActentraHTTPHandler,
     ActentraHTTPServer,
@@ -13,10 +18,12 @@ __all__ = [
     "ActentraHTTPHandler",
     "ActentraHTTPServer",
     "GatewayDemoResult",
+    "HandoffDemoResult",
     "MCPStdioProxy",
     "MCPToolMapping",
     "create_gateway_server",
     "default_mcp_tool_mapper",
     "run_gateway_demonstration",
+    "run_handoff_demonstration",
     "serve_http",
 ]

@@ -27,6 +27,11 @@ from actentra_core.envelope import (
     build_envelope,
     compute_action_hash,
 )
+from actentra_core.handoffs import (
+    HandoffError,
+    UnauthorizedAgentHandoffError,
+    build_handoff,
+)
 from actentra_core.policy import lint_policy, load_policy_yaml
 from actentra_core.receipts import GENESIS_HASH, verify_log
 from actentra_core.verdict import Decision, Verdict
@@ -214,10 +219,13 @@ class AppServices:
             if executor is not None:
                 try:
                     exec_result = self._dispatch_and_record(envelope, decision, executor)
+                    resp["executed"] = True
                     resp["outcome"] = {"status": "success", "result": exec_result}
                 except Exception as exc:
+                    resp["executed"] = False
                     resp["outcome"] = {"status": "failure", "error": type(exc).__name__}
             else:
+                resp["executed"] = False
                 resp["outcome"] = {
                     "status": "unexecuted",
                     "message": f"No registered executor for tool '{envelope.action.tool}'",
@@ -687,6 +695,10 @@ class AppServices:
                 lnk.to_dict()
                 for lnk in self.boundary.receipt_store.list_causal_links(limit=500)
             ],
+            "task_handoffs": [
+                hnd.to_dict()
+                for hnd in self.boundary.receipt_store.list_handoffs(limit=500)
+            ],
         }
         if out_path is not None:
             dest = Path(out_path)
@@ -810,3 +822,204 @@ class AppServices:
     def delete_causal_link(self, link_id: str) -> bool:
         """Delete an explicit causal link."""
         return self.boundary.receipt_store.delete_causal_link(link_id)
+
+    # --- 10. Cross-Agent Continuity and Task Handoffs (Phase 4) ---
+
+    def create_task_handoff(
+        self,
+        *,
+        task_id: str,
+        initiator_agent_id: str,
+        assigned_agent_id: str,
+        verifier_agent_id: str,
+        allowed_verbs: list[str] | tuple[str, ...] = (),
+        allowed_resources: list[str] | tuple[str, ...] = (),
+        prior_crossings: list[str] | tuple[str, ...] = (),
+        prior_observations: list[str] | tuple[str, ...] = (),
+        assertions: dict[str, Any] | None = None,
+        ttl_seconds: float = 3600.0,
+    ) -> dict[str, Any]:
+        """Create a durable cross-agent task handoff record."""
+        handoff = build_handoff(
+            task_id=task_id,
+            initiator_agent_id=initiator_agent_id,
+            assigned_agent_id=assigned_agent_id,
+            verifier_agent_id=verifier_agent_id,
+            allowed_verbs=allowed_verbs,
+            allowed_resources=allowed_resources,
+            prior_crossings=prior_crossings,
+            prior_observations=prior_observations,
+            assertions=assertions,
+            ttl_seconds=ttl_seconds,
+        )
+        saved = self.boundary.receipt_store.record_handoff(handoff)
+        return saved.to_dict()
+
+    def get_task_handoff(self, handoff_id: str) -> dict[str, Any] | None:
+        """Fetch detail for a specific task handoff (or active handoff by task_id)."""
+        hnd = self.boundary.receipt_store.get_handoff(handoff_id)
+        if hnd is None:
+            hnd = self.boundary.receipt_store.get_active_handoff_by_task(handoff_id)
+        return hnd.to_dict() if hnd is not None else None
+
+    def list_task_handoffs(
+        self,
+        *,
+        task_id: str | None = None,
+        assigned_agent_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """List task handoffs matching criteria."""
+        handoffs = self.boundary.receipt_store.list_handoffs(
+            task_id=task_id,
+            assigned_agent_id=assigned_agent_id,
+            status=status,
+            limit=limit,
+        )
+        return [h.to_dict() for h in handoffs]
+
+    def advance_task_handoff(
+        self,
+        handoff_id: str,
+        *,
+        caller_agent_id: str,
+        next_agent_id: str,
+        crossing_id: str | None = None,
+        observation_id: str | None = None,
+        new_assertions: dict[str, Any] | None = None,
+        allowed_verbs: list[str] | tuple[str, ...] | None = None,
+        allowed_resources: list[str] | tuple[str, ...] | None = None,
+        ttl_seconds: float = 3600.0,
+    ) -> dict[str, Any]:
+        """Advance handoff to the next agent in the task workflow."""
+        current = self.boundary.receipt_store.get_handoff(handoff_id)
+        if current is None:
+            raise HandoffError(f"Handoff '{handoff_id}' not found")
+
+        current.validate_caller(caller_agent_id)
+        self.boundary.receipt_store.update_handoff_status(handoff_id, "completed")
+
+        crossings = list(current.prior_crossings)
+        if crossing_id and crossing_id not in crossings:
+            crossings.append(crossing_id)
+
+        observations = list(current.prior_observations)
+        if observation_id and observation_id not in observations:
+            observations.append(observation_id)
+
+        merged_assertions = dict(current.assertions)
+        if new_assertions:
+            merged_assertions.update(new_assertions)
+
+        next_verbs = allowed_verbs if allowed_verbs is not None else current.allowed_verbs
+        next_resources = (
+            allowed_resources if allowed_resources is not None else current.allowed_resources
+        )
+
+        next_handoff = build_handoff(
+            task_id=current.task_id,
+            initiator_agent_id=current.initiator_agent_id,
+            assigned_agent_id=next_agent_id,
+            verifier_agent_id=current.verifier_agent_id,
+            allowed_verbs=next_verbs,
+            allowed_resources=next_resources,
+            prior_crossings=crossings,
+            prior_observations=observations,
+            assertions=merged_assertions,
+            current_step=current.current_step + 1,
+            ttl_seconds=ttl_seconds,
+        )
+        saved = self.boundary.receipt_store.record_handoff(next_handoff)
+
+        with contextlib.suppress(Exception):
+            self.record_causal_link(
+                source_id=saved.handoff_id,
+                source_type="task",
+                relation="derived_from",
+                target_id=current.handoff_id,
+                target_type="task",
+                metadata={"step": saved.current_step},
+            )
+
+        return saved.to_dict()
+
+    def verify_task_handoff(
+        self,
+        handoff_id: str,
+        *,
+        verifier_agent_id: str,
+    ) -> dict[str, Any]:
+        """Perform independent verification of handoff assertions using configured verifiers."""
+        hnd = self.boundary.receipt_store.get_handoff(handoff_id)
+        if hnd is None:
+            raise HandoffError(f"Handoff '{handoff_id}' not found")
+
+        if verifier_agent_id != hnd.verifier_agent_id:
+            raise UnauthorizedAgentHandoffError(
+                f"Agent '{verifier_agent_id}' is not the designated verifier for handoff "
+                f"'{handoff_id}'. Designated verifier is '{hnd.verifier_agent_id}'"
+            )
+
+        if not self.file_verifier:
+            return {
+                "error": "No verifier configured to inspect state assertions",
+                "verified": False,
+            }
+
+        contradictions: list[str] = []
+        observed_records: list[dict[str, Any]] = []
+
+        assertions = hnd.assertions
+        for res_key, claim_spec in assertions.items():
+            expected_claim = (
+                claim_spec.get("claim", "exists")
+                if isinstance(claim_spec, dict)
+                else str(claim_spec)
+            )
+            expected_digest = (
+                claim_spec.get("digest") if isinstance(claim_spec, dict) else None
+            )
+
+            obs = self.file_verifier.verify(
+                resource=res_key,
+                claim=expected_claim,
+                expected_digest=expected_digest,
+                ttl_seconds=60.0,
+            )
+            self.boundary.receipt_store.record_observation(obs)
+            observed_records.append(obs.to_dict())
+
+            if obs.status != "verified":
+                contradictions.append(
+                    f"Assertion failed for {res_key}: expected '{expected_claim}', "
+                    f"observed '{obs.status}' (error={obs.error})"
+                )
+            elif expected_digest and obs.observed_digest != expected_digest:
+                contradictions.append(
+                    f"Digest drift detected for {res_key}: expected {expected_digest}, "
+                    f"observed {obs.observed_digest}"
+                )
+
+        if contradictions:
+            self.boundary.receipt_store.update_handoff_status(
+                handoff_id, "contradicted", contradictions=contradictions
+            )
+            return {
+                "handoff_id": handoff_id,
+                "task_id": hnd.task_id,
+                "status": "contradicted",
+                "verified": False,
+                "contradictions": contradictions,
+                "observations": observed_records,
+            }
+
+        self.boundary.receipt_store.update_handoff_status(handoff_id, "completed")
+        return {
+            "handoff_id": handoff_id,
+            "task_id": hnd.task_id,
+            "status": "completed",
+            "verified": True,
+            "contradictions": [],
+            "observations": observed_records,
+        }

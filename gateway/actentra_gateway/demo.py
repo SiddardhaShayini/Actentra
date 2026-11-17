@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 from actentra.boundary import Boundary
+from actentra_core.canonicalize import canonicalize_windows_path
+from actentra_core.handoffs import UnauthorizedAgentHandoffError
 from actentra_core.policy import load_policy_yaml
 from actentra_core.receipts import ReceiptStore, VerificationResult, verify_log
 from actentra_core.verdict import Verdict
@@ -359,3 +361,304 @@ def run_gateway_demonstration(
     finally:
         if temp_ctx is not None:
             pass
+
+
+@dataclass(frozen=True, slots=True)
+class HandoffDemoResult:
+    """Result of the cross-agent continuity handoff demonstration."""
+
+    ok: bool
+    workspace_dir: str
+    db_path: str
+    task_id: str
+    handoff_step1_id: str
+    handoff_step2_id: str
+    write_crossing_id: str
+    read_crossing_id: str
+    unauthorized_blocked: bool
+    independent_verified: bool
+    drift_detected: bool
+    steps_executed: int
+    causal_trace: dict[str, Any]
+
+
+_HANDOFF_DEMO_POLICY_YAML = """\
+version: 1
+policy_id: handoff-demonstration-policy
+mode: enforce
+
+defaults:
+  verdict: deny
+  reason: "Denied by default: unpermitted action"
+
+rules:
+  - id: allow-fs-reads
+    match:
+      tool: "fs.read"
+      verb: read
+    verdict: allow
+    reason: "Allow workspace file reads"
+
+  - id: allow-fs-writes
+    match:
+      tool: "fs.write"
+      verb: write
+    verdict: allow
+    reason: "Allow workspace file writes"
+"""
+
+
+def run_handoff_demonstration(
+    *,
+    workspace_root: str | Path | None = None,
+    db_file: str | Path | None = None,
+    verbose: bool = True,
+    echo_fn: Callable[[str], None] | None = None,
+) -> HandoffDemoResult:
+    """Execute the Phase 4 constrained cross-agent handoff demonstration."""
+    echo = echo_fn or print
+    temp_ctx = None
+    if workspace_root is None:
+        temp_ctx = tempfile.TemporaryDirectory(prefix="actentra_handoff_demo_")
+        workspace_dir = Path(temp_ctx.name).resolve()
+    else:
+        workspace_dir = Path(workspace_root).resolve()
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    db_path = (
+        Path(db_file).resolve()
+        if db_file is not None
+        else (workspace_dir / "handoff_demo.db").resolve()
+    )
+
+    steps = 0
+    try:
+        if verbose:
+            echo("=== Actentra Phase 4 Cross-Agent Continuity Demonstration ===")
+            echo(f"Workspace: {workspace_dir}")
+            echo(f"Database:  {db_path}")
+
+        policy = load_policy_yaml(_HANDOFF_DEMO_POLICY_YAML)
+        task_id = "task_release_pipeline_001"
+
+        def _make_services(active_store: ReceiptStore) -> AppServices:
+            b = Boundary(
+                policy=policy,
+                receipt_store=active_store,
+                session_id="handoff-session",
+                agent_id="agent_planner",
+                framework="handoff-demo",
+            )
+            reg = ExecutorRegistry()
+            reg.register_fs(workspace_dir)
+            return AppServices(b, executor_registry=reg)
+
+        store1 = ReceiptStore(db_path)
+        services1 = _make_services(store1)
+
+        # --- STEP 1: Agent A (Initiator) writes release manifest and creates handoff ---
+        if verbose:
+            echo("\n[Step 1] Agent A ('agent_planner') initiates task and writes manifest...")
+        manifest_file = workspace_dir / "release_manifest.json"
+        manifest_canon = canonicalize_windows_path(str(manifest_file))
+        manifest_res = f"path:{manifest_canon}"
+        manifest_text = '{"version": "1.0.0", "target": "release"}\n'
+
+        submit_resp1 = services1.submit_crossing(
+            {
+                "tool": "fs.write",
+                "verb": "write",
+                "resource": manifest_res,
+                "params": {"content": manifest_text},
+                "agent_id": "agent_planner",
+            },
+            execute=True,
+        )
+        assert submit_resp1.get("verdict") == "allow"
+        assert submit_resp1.get("executed") is True
+        write_cid = str(submit_resp1["crossing_id"])
+        steps += 1
+
+        import hashlib
+        manifest_digest = f"sha256:{hashlib.sha256(manifest_text.encode('utf-8')).hexdigest()}"
+
+        hnd1 = services1.create_task_handoff(
+            task_id=task_id,
+            initiator_agent_id="agent_planner",
+            assigned_agent_id="agent_builder",
+            verifier_agent_id="agent_auditor",
+            allowed_verbs=["read", "write"],
+            allowed_resources=[manifest_res, f"path:{workspace_dir.as_posix().lower()}/*"],
+            prior_crossings=[write_cid],
+            assertions={manifest_res: {"claim": "exists", "digest": manifest_digest}},
+        )
+        hnd1_id = hnd1["handoff_id"]
+        steps += 1
+        if verbose:
+            echo(f"  -> Crossing {write_cid} ALLOWED and executed.")
+            echo(
+                f"  -> Created Task Handoff {hnd1_id} for {task_id} (assigned to 'agent_builder')."
+            )
+
+        # --- STEP 2: Gateway Restart Simulation ---
+        if verbose:
+            echo("\n[Step 2] Simulating process restart: recreating AppServices from SQLite...")
+        del services1
+        del store1
+
+        store2 = ReceiptStore(db_path)
+        services2 = _make_services(store2)
+        hnd1_reloaded = services2.get_task_handoff(hnd1_id)
+        assert hnd1_reloaded is not None
+        assert hnd1_reloaded["status"] == "active"
+        assert hnd1_reloaded["assigned_agent_id"] == "agent_builder"
+        steps += 1
+        if verbose:
+            echo("  -> Process restart successful: task handoff persisted in SQLite WAL.")
+
+        # --- STEP 3: Unauthorized Agent Attempt ---
+        if verbose:
+            echo("\n[Step 3] Unauthorized Agent X ('agent_rogue') attempts to advance handoff...")
+        unauth_blocked = False
+        try:
+            services2.advance_task_handoff(
+                hnd1_id,
+                caller_agent_id="agent_rogue",
+                next_agent_id="agent_auditor",
+            )
+        except UnauthorizedAgentHandoffError:
+            unauth_blocked = True
+        assert unauth_blocked, "Expected UnauthorizedAgentHandoffError for unassigned caller"
+        steps += 1
+        if verbose:
+            echo("  -> Unauthorized agent rejected fail-closed (UnauthorizedAgentHandoffError)!")
+
+        # --- STEP 4: Authorized Agent B continues and advances handoff ---
+        if verbose:
+            echo(
+                "\n[Step 4] Authorized Agent B ('agent_builder') "
+                "reads manifest and builds output..."
+            )
+        read_resp = services2.submit_crossing(
+            {
+                "tool": "fs.read",
+                "verb": "read",
+                "resource": manifest_res,
+                "agent_id": "agent_builder",
+            },
+            execute=True,
+        )
+        assert read_resp.get("executed") is True
+        read_cid = str(read_resp["crossing_id"])
+
+        output_file = workspace_dir / "build_output.txt"
+        output_canon = canonicalize_windows_path(str(output_file))
+        output_res = f"path:{output_canon}"
+        output_text = "BUILD SUCCESS: version 1.0.0 release packages compiled\n"
+
+        write_resp2 = services2.submit_crossing(
+            {
+                "tool": "fs.write",
+                "verb": "write",
+                "resource": output_res,
+                "params": {"content": output_text},
+                "agent_id": "agent_builder",
+            },
+            execute=True,
+        )
+        assert write_resp2.get("executed") is True
+        output_cid = str(write_resp2["crossing_id"])
+        output_digest = f"sha256:{hashlib.sha256(output_text.encode('utf-8')).hexdigest()}"
+
+        hnd2 = services2.advance_task_handoff(
+            hnd1_id,
+            caller_agent_id="agent_builder",
+            next_agent_id="agent_auditor",
+            crossing_id=output_cid,
+            new_assertions={output_res: {"claim": "exists", "digest": output_digest}},
+        )
+        hnd2_id = hnd2["handoff_id"]
+        assert hnd2["current_step"] == 2
+        steps += 1
+        if verbose:
+            echo(f"  -> Agent B read crossing: {read_cid}")
+            echo(f"  -> Agent B write crossing: {output_cid}")
+            echo(f"  -> Advanced handoff to Step 2 ({hnd2_id}), assigned to 'agent_auditor'.")
+
+        # --- STEP 5: Independent Verification by Agent C ---
+        if verbose:
+            echo("\n[Step 5] Verifier Agent C ('agent_auditor') independently checks state...")
+        verify_res1 = services2.verify_task_handoff(
+            hnd2_id,
+            verifier_agent_id="agent_auditor",
+        )
+        assert verify_res1["verified"] is True
+        assert verify_res1["status"] == "completed"
+        assert len(verify_res1["contradictions"]) == 0
+        steps += 1
+        if verbose:
+            echo(
+                "  -> Independent verification PASSED: "
+                "WorkspaceFileVerifier observed digests match."
+            )
+
+        # --- STEP 6: Evidence Drift & Contradiction Detection ---
+        if verbose:
+            echo("\n[Step 6] Simulating out-of-band tampering / drift on build_output.txt...")
+        output_file.write_text("TAMPERED CONTENT: unofficial modification\n", encoding="utf-8")
+
+        # Create a fresh step to verify with stale/tampered assertion
+        hnd3 = services2.create_task_handoff(
+            task_id=task_id,
+            initiator_agent_id="agent_builder",
+            assigned_agent_id="agent_auditor",
+            verifier_agent_id="agent_auditor",
+            assertions={output_res: {"claim": "exists", "digest": output_digest}},
+        )
+        verify_res2 = services2.verify_task_handoff(
+            hnd3["handoff_id"],
+            verifier_agent_id="agent_auditor",
+        )
+        assert verify_res2["verified"] is False
+        assert verify_res2["status"] == "contradicted"
+        assert len(verify_res2["contradictions"]) > 0
+        steps += 1
+        if verbose:
+            echo(
+                "  -> DRIFT DETECTED: Verifier refused corrupt state "
+                "and marked status 'contradicted'!"
+            )
+            for c in verify_res2["contradictions"]:
+                echo(f"     * {c}")
+
+        # --- STEP 7: Inspect Complete Causal Trace ---
+        if verbose:
+            echo("\n[Step 7] Reconstructing complete causal trace for task...")
+        trace = services2.get_causal_trace(task_id)
+        assert trace["dag_verified"] is True
+        steps += 1
+        if verbose:
+            echo(f"  -> DAG Verified: {trace['dag_verified']}")
+            echo(f"  -> Total causal nodes: {len(trace['nodes'])}")
+            echo(f"  -> Total timeline events: {len(trace['timeline'])}")
+
+        return HandoffDemoResult(
+            ok=True,
+            workspace_dir=str(workspace_dir),
+            db_path=str(db_path),
+            task_id=task_id,
+            handoff_step1_id=hnd1_id,
+            handoff_step2_id=hnd2_id,
+            write_crossing_id=write_cid,
+            read_crossing_id=read_cid,
+            unauthorized_blocked=unauth_blocked,
+            independent_verified=True,
+            drift_detected=True,
+            steps_executed=steps,
+            causal_trace=trace,
+        )
+
+    finally:
+        if temp_ctx is not None:
+            temp_ctx.cleanup()
+

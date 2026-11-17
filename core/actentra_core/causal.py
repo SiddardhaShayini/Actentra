@@ -486,7 +486,46 @@ def build_causal_trace(
                     )
 
     # Begin expansion from root
-    if resolved_root_type == "crossing":
+    if root_id.startswith("hnd_"):
+        hnd = store.get_handoff(root_id)
+        if hnd:
+            nodes[root_id] = CausalTraceNode(
+                node_id=root_id,
+                entity_type="task",
+                role="task",
+                label=f"Handoff step {hnd.current_step}",
+                timestamp=hnd.created_at,
+                status=hnd.status,
+                summary=(
+                    f"Handoff step {hnd.current_step}: {hnd.initiator_agent_id} -> "
+                    f"{hnd.assigned_agent_id} (verifier: {hnd.verifier_agent_id})"
+                ),
+            )
+            for cid in hnd.prior_crossings:
+                _expand_crossing(cid, 0)
+                edges.append(
+                    CausalTraceEdge(
+                        source_id=f"{cid}:outcome",
+                        target_id=root_id,
+                        relation="continues_from",
+                        edge_type="intrinsic",
+                    )
+                )
+            for oid in hnd.prior_observations:
+                obs_rec = store.get_observation(oid)
+                if obs_rec:
+                    _expand_observation_record(obs_rec, None)
+                    edges.append(
+                        CausalTraceEdge(
+                            source_id=oid,
+                            target_id=root_id,
+                            relation="asserts_state",
+                            edge_type="intrinsic",
+                        )
+                    )
+        else:
+            missing_refs.append(root_id)
+    elif resolved_root_type == "crossing":
         _expand_crossing(root_id, 0)
     elif resolved_root_type == "observation":
         obs = store.get_observation(root_id)
@@ -507,9 +546,57 @@ def build_causal_trace(
             status="active",
             summary=f"Task Workflow ({root_id})",
         )
+        # Check explicit links
         task_links = store.list_causal_links(root_id)
         for link in task_links:
             _process_explicit_link(link, 0)
+
+        # Check task handoffs
+        handoffs = store.list_handoffs(task_id=root_id)
+        for hnd in handoffs:
+            hnd_node_id = hnd.handoff_id
+            nodes[hnd_node_id] = CausalTraceNode(
+                node_id=hnd_node_id,
+                entity_type="task",
+                role="task",
+                label=f"Handoff step {hnd.current_step}",
+                timestamp=hnd.created_at,
+                status=hnd.status,
+                summary=(
+                    f"Handoff step {hnd.current_step}: {hnd.initiator_agent_id} -> "
+                    f"{hnd.assigned_agent_id} (verifier: {hnd.verifier_agent_id})"
+                ),
+            )
+            edges.append(
+                CausalTraceEdge(
+                    source_id=root_id,
+                    target_id=hnd_node_id,
+                    relation="delegates_to",
+                    edge_type="intrinsic",
+                )
+            )
+            for cid in hnd.prior_crossings:
+                _expand_crossing(cid, 0)
+                edges.append(
+                    CausalTraceEdge(
+                        source_id=f"{cid}:outcome",
+                        target_id=hnd_node_id,
+                        relation="continues_from",
+                        edge_type="intrinsic",
+                    )
+                )
+            for oid in hnd.prior_observations:
+                obs_rec = store.get_observation(oid)
+                if obs_rec:
+                    _expand_observation_record(obs_rec, None)
+                    edges.append(
+                        CausalTraceEdge(
+                            source_id=oid,
+                            target_id=hnd_node_id,
+                            relation="asserts_state",
+                            edge_type="intrinsic",
+                        )
+                    )
 
     # Cycle check
     has_cycles = detect_cycles(edges)

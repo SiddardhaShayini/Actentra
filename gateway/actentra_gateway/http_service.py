@@ -17,6 +17,11 @@ from urllib.parse import parse_qs, urlsplit
 
 from actentra.boundary import Boundary
 from actentra_core.causal import CycleDetectedError
+from actentra_core.handoffs import (
+    ExpiredHandoffError,
+    HandoffError,
+    UnauthorizedAgentHandoffError,
+)
 from actentra_gateway.services import AppServices, ExecutorRegistry
 
 _MAX_BODY_BYTES = 2 * 1024 * 1024  # 2 MiB bound on HTTP request body
@@ -294,6 +299,31 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, trace_data)
             return
 
+        if path == "/v1/handoffs":
+            task_f = query.get("task_id", [None])[0]
+            agent_f = query.get("assigned_agent_id", [None])[0]
+            stat_f = query.get("status", [None])[0]
+            lim_f = int(query.get("limit", [50])[0])
+            hnds = services.list_task_handoffs(
+                task_id=task_f,
+                assigned_agent_id=agent_f,
+                status=stat_f,
+                limit=lim_f,
+            )
+            self._send_json(HTTPStatus.OK, hnds)
+            return
+
+        if path.startswith("/v1/handoffs/") and not path.endswith(("/advance", "/verify")):
+            hnd_id = path[len("/v1/handoffs/") :]
+            hnd = services.get_task_handoff(hnd_id)
+            if hnd is None:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND, {"error": f"Handoff '{hnd_id}' not found"}
+                )
+            else:
+                self._send_json(HTTPStatus.OK, hnd)
+            return
+
         if path in ("/ui", "/"):
             self._send_html(HTTPStatus.OK, self._render_dashboard_html())
             return
@@ -525,6 +555,131 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 )
             except Exception as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Failed to record link: {exc}"})
+            return
+
+        if path == "/v1/handoffs":
+            try:
+                data = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid body: {exc}"})
+                return
+
+            handoff_req_fields = (
+                "task_id",
+                "initiator_agent_id",
+                "assigned_agent_id",
+                "verifier_agent_id",
+            )
+            missing = [f for f in handoff_req_fields if not data.get(f)]
+            if missing:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": f"Missing required fields: {', '.join(missing)}"},
+                )
+                return
+
+            try:
+                hnd = services.create_task_handoff(
+                    task_id=str(data["task_id"]),
+                    initiator_agent_id=str(data["initiator_agent_id"]),
+                    assigned_agent_id=str(data["assigned_agent_id"]),
+                    verifier_agent_id=str(data["verifier_agent_id"]),
+                    allowed_verbs=data.get("allowed_verbs", ()),
+                    allowed_resources=data.get("allowed_resources", ()),
+                    prior_crossings=data.get("prior_crossings", ()),
+                    prior_observations=data.get("prior_observations", ()),
+                    assertions=data.get("assertions"),
+                    ttl_seconds=float(data.get("ttl_seconds", 3600.0)),
+                )
+                self._send_json(HTTPStatus.CREATED, hnd)
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST, {"error": f"Failed to create handoff: {exc}"}
+                )
+            return
+
+        if path.startswith("/v1/handoffs/") and path.endswith("/advance"):
+            hnd_id = path[len("/v1/handoffs/") : -len("/advance")]
+            try:
+                data = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid body: {exc}"})
+                return
+
+            caller_id = data.get("caller_agent_id")
+            next_id = data.get("next_agent_id")
+            if not caller_id or not next_id:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "Fields 'caller_agent_id' and 'next_agent_id' are required"},
+                )
+                return
+
+            try:
+                advanced = services.advance_task_handoff(
+                    hnd_id,
+                    caller_agent_id=str(caller_id),
+                    next_agent_id=str(next_id),
+                    crossing_id=data.get("crossing_id"),
+                    observation_id=data.get("observation_id"),
+                    new_assertions=data.get("new_assertions"),
+                    allowed_verbs=data.get("allowed_verbs"),
+                    allowed_resources=data.get("allowed_resources"),
+                    ttl_seconds=float(data.get("ttl_seconds", 3600.0)),
+                )
+                self._send_json(HTTPStatus.OK, advanced)
+            except UnauthorizedAgentHandoffError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_agent"},
+                )
+            except ExpiredHandoffError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": str(exc), "code": "expired_handoff"},
+                )
+            except HandoffError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": str(exc), "code": "handoff_error"},
+                )
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST, {"error": f"Failed to advance handoff: {exc}"}
+                )
+            return
+
+        if path.startswith("/v1/handoffs/") and path.endswith("/verify"):
+            hnd_id = path[len("/v1/handoffs/") : -len("/verify")]
+            try:
+                data = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid body: {exc}"})
+                return
+
+            verifier_id = data.get("verifier_agent_id")
+            if not verifier_id:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "Field 'verifier_agent_id' is required"},
+                )
+                return
+
+            try:
+                result = services.verify_task_handoff(
+                    hnd_id,
+                    verifier_agent_id=str(verifier_id),
+                )
+                self._send_json(HTTPStatus.OK, result)
+            except UnauthorizedAgentHandoffError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_agent"},
+                )
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST, {"error": f"Failed to verify handoff: {exc}"}
+                )
             return
 
         if path == "/v1/freeze":

@@ -24,6 +24,7 @@ from actentra_core.envelope import (
     compute_action_hash,
     utc_now_iso,
 )
+from actentra_core.handoffs import TaskHandoffRecord
 from actentra_core.observations import ObservationRecord
 from actentra_core.verdict import Decision
 
@@ -315,6 +316,43 @@ class ReceiptStore:
                 CREATE INDEX IF NOT EXISTS idx_causal_links_target
                 ON causal_links(target_type, target_id);
                 """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_handoffs (
+                    handoff_id TEXT PRIMARY KEY,
+                    handoff_version TEXT NOT NULL DEFAULT '1',
+                    task_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('active', 'completed', 'revoked', 'expired', 'contradicted')
+                    ),
+                    current_step INTEGER NOT NULL DEFAULT 1,
+                    initiator_agent_id TEXT NOT NULL,
+                    assigned_agent_id TEXT NOT NULL,
+                    verifier_agent_id TEXT NOT NULL,
+                    allowed_verbs_json TEXT NOT NULL DEFAULT '[]',
+                    allowed_resources_json TEXT NOT NULL DEFAULT '[]',
+                    prior_crossings_json TEXT NOT NULL DEFAULT '[]',
+                    prior_observations_json TEXT NOT NULL DEFAULT '[]',
+                    assertions_json TEXT NOT NULL DEFAULT '{}',
+                    contradictions_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    handoff_hash TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_handoff_task ON task_handoffs(task_id);"
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_handoff_assigned
+                ON task_handoffs(assigned_agent_id);
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_handoff_status ON task_handoffs(status);"
             )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to initialize receipt store: {exc}") from exc
@@ -1600,6 +1638,225 @@ class ReceiptStore:
             target_type=row[6],
             created_at=str(row[7]),
             metadata=meta,
+        )
+
+    # --- 10. Task Handoffs and Cross-Agent Continuity (Phase 4) ---
+
+    def record_handoff(self, handoff: TaskHandoffRecord) -> TaskHandoffRecord:
+        """Persist a task handoff record."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO task_handoffs (
+                    handoff_id, handoff_version, task_id, status, current_step,
+                    initiator_agent_id, assigned_agent_id, verifier_agent_id,
+                    allowed_verbs_json, allowed_resources_json, prior_crossings_json,
+                    prior_observations_json, assertions_json, contradictions_json,
+                    created_at, expires_at, handoff_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    handoff.handoff_id,
+                    handoff.handoff_version,
+                    handoff.task_id,
+                    handoff.status,
+                    handoff.current_step,
+                    handoff.initiator_agent_id,
+                    handoff.assigned_agent_id,
+                    handoff.verifier_agent_id,
+                    json.dumps(list(handoff.allowed_verbs), ensure_ascii=False),
+                    json.dumps(list(handoff.allowed_resources), ensure_ascii=False),
+                    json.dumps(list(handoff.prior_crossings), ensure_ascii=False),
+                    json.dumps(list(handoff.prior_observations), ensure_ascii=False),
+                    json.dumps(handoff.assertions, ensure_ascii=False),
+                    json.dumps(list(handoff.contradictions), ensure_ascii=False),
+                    handoff.created_at,
+                    handoff.expires_at,
+                    handoff.handoff_hash,
+                ),
+            )
+            conn.execute("COMMIT;")
+            return handoff
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to record handoff: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_handoff(self, handoff_id: str) -> TaskHandoffRecord | None:
+        """Fetch a specific handoff by ID."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """
+                SELECT handoff_id, handoff_version, task_id, status, current_step,
+                       initiator_agent_id, assigned_agent_id, verifier_agent_id,
+                       allowed_verbs_json, allowed_resources_json, prior_crossings_json,
+                       prior_observations_json, assertions_json, contradictions_json,
+                       created_at, expires_at, handoff_hash
+                FROM task_handoffs WHERE handoff_id = ?;
+                """,
+                (handoff_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return self._row_to_handoff(row)
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch handoff: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_active_handoff_by_task(self, task_id: str) -> TaskHandoffRecord | None:
+        """Fetch the active handoff for a task."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """
+                SELECT handoff_id, handoff_version, task_id, status, current_step,
+                       initiator_agent_id, assigned_agent_id, verifier_agent_id,
+                       allowed_verbs_json, allowed_resources_json, prior_crossings_json,
+                       prior_observations_json, assertions_json, contradictions_json,
+                       created_at, expires_at, handoff_hash
+                FROM task_handoffs
+                WHERE task_id = ? AND status = 'active'
+                ORDER BY current_step DESC, rowid DESC LIMIT 1;
+                """,
+                (task_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return self._row_to_handoff(row)
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch active handoff: {exc}") from exc
+        finally:
+            conn.close()
+
+    def list_handoffs(
+        self,
+        *,
+        task_id: str | None = None,
+        assigned_agent_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[TaskHandoffRecord]:
+        """List task handoffs matching criteria."""
+        conn = self._connect()
+        try:
+            query = [
+                "SELECT handoff_id, handoff_version, task_id, status, current_step,",
+                "initiator_agent_id, assigned_agent_id, verifier_agent_id,",
+                "allowed_verbs_json, allowed_resources_json, prior_crossings_json,",
+                "prior_observations_json, assertions_json, contradictions_json,",
+                "created_at, expires_at, handoff_hash FROM task_handoffs WHERE 1=1",
+            ]
+            params: list[Any] = []
+            if task_id is not None:
+                query.append("AND task_id = ?")
+                params.append(task_id)
+            if assigned_agent_id is not None:
+                query.append("AND assigned_agent_id = ?")
+                params.append(assigned_agent_id)
+            if status is not None:
+                query.append("AND status = ?")
+                params.append(status)
+            query.append("ORDER BY created_at DESC, rowid DESC LIMIT ?;")
+            params.append(limit)
+
+            cur = conn.execute(" ".join(query), params)
+            rows = cur.fetchall()
+            return [self._row_to_handoff(row) for row in rows]
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to list handoffs: {exc}") from exc
+        finally:
+            conn.close()
+
+    def update_handoff_status(
+        self,
+        handoff_id: str,
+        status: str,
+        *,
+        contradictions: tuple[str, ...] | list[str] | None = None,
+    ) -> bool:
+        """Update handoff status and optional contradiction notes."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            if contradictions is not None:
+                cur = conn.execute(
+                    """
+                    UPDATE task_handoffs
+                    SET status = ?, contradictions_json = ?
+                    WHERE handoff_id = ?;
+                    """,
+                    (status, json.dumps(list(contradictions), ensure_ascii=False), handoff_id),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE task_handoffs SET status = ? WHERE handoff_id = ?;",
+                    (status, handoff_id),
+                )
+            updated = cur.rowcount > 0
+            conn.execute("COMMIT;")
+            return updated
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to update handoff: {exc}") from exc
+        finally:
+            conn.close()
+
+    def count_handoffs(self, *, task_id: str | None = None) -> int:
+        """Return total count of handoffs, optionally for a specific task."""
+        conn = self._connect()
+        try:
+            if task_id is not None:
+                cur = conn.execute(
+                    "SELECT COUNT(*) FROM task_handoffs WHERE task_id = ?;", (task_id,)
+                )
+            else:
+                cur = conn.execute("SELECT COUNT(*) FROM task_handoffs;")
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _row_to_handoff(row: tuple[Any, ...]) -> TaskHandoffRecord:
+        def _parse_list(raw: Any) -> tuple[str, ...]:
+            try:
+                res = json.loads(raw) if isinstance(raw, str) else list(raw)
+                return tuple(str(x) for x in res)
+            except Exception:
+                return ()
+
+        try:
+            asserts = json.loads(row[12]) if isinstance(row[12], str) else dict(row[12])
+        except Exception:
+            asserts = {}
+
+        return TaskHandoffRecord(
+            handoff_id=str(row[0]),
+            handoff_version=str(row[1]),
+            task_id=str(row[2]),
+            status=row[3],
+            current_step=int(row[4]),
+            initiator_agent_id=str(row[5]),
+            assigned_agent_id=str(row[6]),
+            verifier_agent_id=str(row[7]),
+            allowed_verbs=_parse_list(row[8]),
+            allowed_resources=_parse_list(row[9]),
+            prior_crossings=_parse_list(row[10]),
+            prior_observations=_parse_list(row[11]),
+            assertions=asserts,
+            contradictions=_parse_list(row[13]),
+            created_at=str(row[14]),
+            expires_at=str(row[15]) if row[15] is not None else None,
+            handoff_hash=str(row[16]),
         )
 
 
