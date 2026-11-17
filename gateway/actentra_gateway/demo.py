@@ -480,6 +480,7 @@ def run_handoff_demonstration(
         steps += 1
 
         import hashlib
+
         manifest_digest = f"sha256:{hashlib.sha256(manifest_text.encode('utf-8')).hexdigest()}"
 
         hnd1 = services1.create_task_handoff(
@@ -661,4 +662,3 @@ def run_handoff_demonstration(
     finally:
         if temp_ctx is not None:
             temp_ctx.cleanup()
-

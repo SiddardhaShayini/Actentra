@@ -370,8 +370,7 @@ def test_gateway_session_taint_propagation(tmp_path: Path) -> None:
     raw_env2 = store.get_envelope(res2["crossing_id"])
     assert raw_env2 is not None
     assert any(
-        p["source"] == "session" and p["trust"] == "untrusted"
-        for p in raw_env2["provenance"]
+        p["source"] == "session" and p["trust"] == "untrusted" for p in raw_env2["provenance"]
     )
 
 
@@ -550,8 +549,7 @@ def test_concurrent_external_outcome_reports_yields_at_most_one(tmp_path: Path) 
 
     # Verify store has exactly 1 outcome record
     outcomes = [
-        r for r in store.iter_records()
-        if r.record_type == "outcome" and r.crossing_id == cid
+        r for r in store.iter_records() if r.record_type == "outcome" and r.crossing_id == cid
     ]
     assert len(outcomes) == 1
 
@@ -606,9 +604,7 @@ def test_stored_envelope_context_integrity_verification(tmp_path: Path) -> None:
     boundary = Boundary(policy=policy, receipt_store=store, session_id="sess-integrity")
     services = AppServices(boundary)
 
-    sub = services.submit_crossing(
-        {"tool": "dummy.run", "verb": "read", "resource": "res-intact"}
-    )
+    sub = services.submit_crossing({"tool": "dummy.run", "verb": "read", "resource": "res-intact"})
     cid = sub["crossing_id"]
 
     # Retrieval of untampered envelope succeeds
@@ -623,10 +619,12 @@ def test_stored_envelope_context_integrity_verification(tmp_path: Path) -> None:
 
     # Tamper with the envelope in SQLite (change resource)
     import sqlite3
+
     conn = sqlite3.connect(db_path)
     cur = conn.execute("SELECT envelope_json FROM action_envelopes WHERE crossing_id = ?;", (cid,))
     raw_json = cur.fetchone()[0]
     import json
+
     data = json.loads(raw_json)
     data["action"]["resource"] = "res-TAMPERED"
     conn.execute(

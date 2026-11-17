@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://actentra.dev/spec/evidence.v1.schema.json",
+  "title": "Actentra Evidence Record v1",
+  "description": "Typed evidence taxonomy record establishing evidence quality, provenance, freshness, and trust domain.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evidence_id",
+    "crossing_id",
+    "tier",
+    "trust_domain",
+    "collector",
+    "observed_at",
+    "evidence_hash"
+  ],
+  "properties": {
+    "evidence_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 64
+    },
+    "crossing_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 64
+    },
+    "tier": {
+      "type": "string",
+      "enum": [
+        "locally_observed",
+        "caller_reported",
+        "externally_verified",
+        "stale",
+        "unknown"
+      ]
+    },
+    "trust_domain": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "collector": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "details": {
+      "type": "object"
+    },
+    "evidence_hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

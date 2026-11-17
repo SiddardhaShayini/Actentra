@@ -185,9 +185,7 @@ class CausalTrace:
 
     def render_ascii(self) -> str:
         """Render trace as human-readable ASCII timeline and DAG."""
-        missing_desc = (
-            ", ".join(self.missing_references) if self.missing_references else "None"
-        )
+        missing_desc = ", ".join(self.missing_references) if self.missing_references else "None"
         lines: list[str] = [
             f"=== Actentra Causal Trace [{self.root_type}: {self.root_id}] ===",
             f"DAG Verified: {self.dag_verified} (Acyclic)",
@@ -372,8 +370,7 @@ def build_causal_trace(
                 timestamp=outcome_rec.ts,
                 status=status,
                 summary=(
-                    f"Execution outcome: {status.upper()}"
-                    + (f" ({reason})" if reason else "")
+                    f"Execution outcome: {status.upper()}" + (f" ({reason})" if reason else "")
                 ),
                 metadata={
                     "status": status,

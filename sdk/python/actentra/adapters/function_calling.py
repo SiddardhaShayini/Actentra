@@ -34,9 +34,8 @@ def _default_resource_extractor(args: dict[str, Any], fallback_tool: str) -> str
     for key in ("resource", "path", "file_path", "target_path", "filepath", "url", "endpoint"):
         val = args.get(key)
         if isinstance(val, str) and val.strip():
-            if (
-                key in ("path", "file_path", "target_path", "filepath")
-                and not val.startswith("path:")
+            if key in ("path", "file_path", "target_path", "filepath") and not val.startswith(
+                "path:"
             ):
                 return f"path:{val}"
             return val
@@ -152,9 +151,7 @@ class FunctionCallAdapter:
                 user_goal=user_goal,
             )
             content_str = (
-                canonicalize_json(result)
-                if isinstance(result, (dict, list))
-                else str(result)
+                canonicalize_json(result) if isinstance(result, (dict, list)) else str(result)
             )
             return {
                 "role": "tool",

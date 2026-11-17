@@ -144,9 +144,7 @@ def parse_policy_dict(raw: Any) -> PolicyPack:
     except ValueError as exc:
         raise PolicyValidationError(f"Invalid defaults.verdict: {raw_default_verdict!r}") from exc
     if default_verdict not in _VALID_DEFAULT_VERDICTS:
-        raise PolicyValidationError(
-            "defaults.verdict must fail closed ('deny' or 'hold')"
-        )
+        raise PolicyValidationError("defaults.verdict must fail closed ('deny' or 'hold')")
     default_reason = str(defaults_raw.get("reason", "Denied by default policy"))
 
     limits_raw = raw.get("limits", [])
@@ -383,9 +381,7 @@ class PolicyEngine:
                 shadow=False,
             )
 
-        limit_hit = self._check_rate_limits(
-            envelope, record=record_rate_limit, timestamp=timestamp
-        )
+        limit_hit = self._check_rate_limits(envelope, record=record_rate_limit, timestamp=timestamp)
         if limit_hit is not None:
             return self._finalize_decision(
                 evaluated_verdict=limit_hit.verdict,

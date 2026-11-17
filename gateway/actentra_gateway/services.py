@@ -27,10 +27,18 @@ from actentra_core.envelope import (
     build_envelope,
     compute_action_hash,
 )
+from actentra_core.evidence import (
+    EvidenceTier,
+    build_evidence_record,
+)
 from actentra_core.handoffs import (
     HandoffError,
     UnauthorizedAgentHandoffError,
     build_handoff,
+)
+from actentra_core.identity import (
+    CallerContext,
+    IdentitySecurityError,
 )
 from actentra_core.policy import lint_policy, load_policy_yaml
 from actentra_core.receipts import GENESIS_HASH, verify_log
@@ -146,8 +154,31 @@ class AppServices:
         data: dict[str, Any],
         *,
         execute: bool = False,
+        caller_context: CallerContext | None = None,
     ) -> dict[str, Any]:
         """Propose, canonicalize, evaluate, and conditionally execute an action."""
+        # Enforce authenticated identity and principal constraints (Stage 0 Task 2)
+        agent_id_claim = str(data.get("agent_id", "http-client"))
+        prov_raw = data.get("provenance", [])
+        claimed_trust = None
+        if isinstance(prov_raw, list):
+            for p in prov_raw:
+                if isinstance(p, dict) and p.get("trust") == "trusted":
+                    claimed_trust = "trusted"
+                    break
+
+        if caller_context is not None:
+            try:
+                caller_context.validate_identity_claims(agent_id_claim, claimed_trust)
+            except IdentitySecurityError as exc:
+                return {
+                    "verdict": Verdict.DENY.value,
+                    "error": str(exc),
+                    "rule_id": "identity:unauthorized-principal",
+                    "canonical_hash": "sha256:" + ("0" * 64),
+                    "risk_tags": ["spoofing-attempt"],
+                }
+
         session_id = str(data.get("session_id", "default")).strip() or "default"
         if len(session_id) > 128:
             return {
@@ -255,6 +286,7 @@ class AppServices:
                 policy_version=decision.policy_version,
                 status="failure",
                 error="Canonical hash mismatch before execution",
+                evidence_status="locally_observed",
             )
             raise ActionBlockedError(
                 Decision(
@@ -280,6 +312,7 @@ class AppServices:
                 policy_version=decision.policy_version,
                 status="failure",
                 error=err_label,
+                evidence_status="locally_observed",
             )
             raise
 
@@ -296,7 +329,17 @@ class AppServices:
             policy_version=decision.policy_version,
             status="success",
             result_hash=res_hash,
+            evidence_status="locally_observed",
         )
+        with contextlib.suppress(Exception):
+            ev = build_evidence_record(
+                crossing_id=envelope.crossing_id,
+                tier=EvidenceTier.LOCALLY_OBSERVED,
+                trust_domain="local_boundary",
+                collector=f"executor:{envelope.action.tool}",
+                details={"result_hash": res_hash, "executed": True},
+            )
+            self.boundary.receipt_store.record_evidence(ev)
         # Update session cumulative budgets for gateway execution (Finding 6)
         self.boundary.engine.budget_tracker.record_usage(envelope)
         return result
@@ -360,9 +403,7 @@ class AppServices:
                 "error": f"Crossing '{crossing_id}' is not in approved state (status={p.status})"
             }
         if p.expires_at <= time.time():
-            return {
-                "error": f"Crossing '{crossing_id}' approval has expired"
-            }
+            return {"error": f"Crossing '{crossing_id}' approval has expired"}
 
         raw_env = self.boundary.receipt_store.get_envelope(crossing_id)
         if raw_env is None:
@@ -483,9 +524,20 @@ class AppServices:
                 result_hash=result_hash,
                 error=error,
                 reason="caller-reported",
+                evidence_status="caller_reported",
             )
         except Exception as exc:
             return {"error": str(exc)}
+
+        with contextlib.suppress(Exception):
+            ev = build_evidence_record(
+                crossing_id=crossing_id,
+                tier=EvidenceTier.CALLER_REPORTED,
+                trust_domain="external_caller",
+                collector="http_client",
+                details={"reported_status": status, "result_hash": result_hash, "error": error},
+            )
+            self.boundary.receipt_store.record_evidence(ev)
 
         # Update session cumulative budgets for successful external execution
         if status == "success":
@@ -514,6 +566,8 @@ class AppServices:
             "outcome_seq": rec.seq,
             "entry_hash": rec.entry_hash,
             "reported_by": "caller",
+            "evidence_tier": "caller_reported",
+            "externally_verified": False,
         }
 
     # --- 4. Policy, Linting, & Canary ---
@@ -688,16 +742,16 @@ class AppServices:
             },
             "receipts": records,
             "observations": [
-                obs.to_dict()
-                for obs in self.boundary.receipt_store.list_observations(limit=500)
+                obs.to_dict() for obs in self.boundary.receipt_store.list_observations(limit=500)
             ],
             "causal_links": [
-                lnk.to_dict()
-                for lnk in self.boundary.receipt_store.list_causal_links(limit=500)
+                lnk.to_dict() for lnk in self.boundary.receipt_store.list_causal_links(limit=500)
             ],
             "task_handoffs": [
-                hnd.to_dict()
-                for hnd in self.boundary.receipt_store.list_handoffs(limit=500)
+                hnd.to_dict() for hnd in self.boundary.receipt_store.list_handoffs(limit=500)
+            ],
+            "evidence_records": [
+                ev.to_dict() for ev in self.boundary.receipt_store.list_evidence(limit=500)
             ],
         }
         if out_path is not None:
@@ -733,6 +787,23 @@ class AppServices:
             ttl_seconds=ttl_seconds,
         )
         self.boundary.receipt_store.record_observation(obs)
+        if obs.status == "verified" and crossing_id:
+            with contextlib.suppress(Exception):
+                ev = build_evidence_record(
+                    crossing_id=crossing_id,
+                    tier=EvidenceTier.EXTERNALLY_VERIFIED,
+                    trust_domain="verifier:workspace",
+                    collector=obs.verifier_id,
+                    details={
+                        "observation_id": obs.observation_id,
+                        "resource": obs.subject_resource,
+                        "claim": obs.claim,
+                        "status": obs.status,
+                        "observed_digest": obs.observed_digest,
+                    },
+                    expires_at=obs.expires_at,
+                )
+                self.boundary.receipt_store.record_evidence(ev)
         return obs.to_dict()
 
     def get_observation(self, observation_id: str) -> dict[str, Any] | None:
@@ -761,6 +832,30 @@ class AppServices:
         records = self.boundary.receipt_store.list_observations(
             crossing_id=crossing_id,
             subject_resource=subject_resource,
+            limit=limit,
+            offset=offset,
+        )
+        return [r.to_dict() for r in records]
+
+    # --- Evidence Records Management (Phase 5) ---
+
+    def get_evidence(self, evidence_id: str) -> dict[str, Any] | None:
+        """Fetch detail for a specific evidence record."""
+        ev = self.boundary.receipt_store.get_evidence(evidence_id)
+        return ev.to_dict() if ev is not None else None
+
+    def list_evidence(
+        self,
+        *,
+        crossing_id: str | None = None,
+        tier: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List persisted evidence records."""
+        records = self.boundary.receipt_store.list_evidence(
+            crossing_id=crossing_id,
+            tier=tier,
             limit=limit,
             offset=offset,
         )
@@ -977,9 +1072,7 @@ class AppServices:
                 if isinstance(claim_spec, dict)
                 else str(claim_spec)
             )
-            expected_digest = (
-                claim_spec.get("digest") if isinstance(claim_spec, dict) else None
-            )
+            expected_digest = claim_spec.get("digest") if isinstance(claim_spec, dict) else None
 
             obs = self.file_verifier.verify(
                 resource=res_key,

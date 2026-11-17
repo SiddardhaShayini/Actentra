@@ -77,6 +77,8 @@ trace_app = typer.Typer(help="Trace and inspect causal dependency graphs and tim
 app.add_typer(trace_app, name="trace")
 handoff_app = typer.Typer(help="Manage and verify cross-agent task handoffs.")
 app.add_typer(handoff_app, name="handoff")
+evidence_app = typer.Typer(help="Inspect and verify execution evidence records.")
+app.add_typer(evidence_app, name="evidence")
 
 _DEFAULT_STARTER_POLICY = """\
 version: 1
@@ -121,12 +123,10 @@ rules:
 
 @app.command()
 def init(
-    directory: Annotated[
-        Path, typer.Argument(help="Target directory for starter policy.")
-    ] = Path("."),
-    force: Annotated[
-        bool, typer.Option("--force", help="Overwrite existing policy file.")
-    ] = False,
+    directory: Annotated[Path, typer.Argument(help="Target directory for starter policy.")] = Path(
+        "."
+    ),
+    force: Annotated[bool, typer.Option("--force", help="Overwrite existing policy file.")] = False,
 ) -> None:
     """Create a starter actentra.policy.yaml in the target directory."""
     target = directory / "actentra.policy.yaml"
@@ -162,9 +162,7 @@ def policy_canary_cmd(
     candidate_policy_path: Annotated[
         Path, typer.Argument(help="Candidate policy YAML file to test.")
     ],
-    receipts_db: Annotated[
-        Path, typer.Argument(help="Historical SQLite receipt database.")
-    ],
+    receipts_db: Annotated[Path, typer.Argument(help="Historical SQLite receipt database.")],
     limit: Annotated[
         int | None,
         typer.Option("--limit", "-n", help="Limit number of decisions to replay."),
@@ -334,9 +332,7 @@ def report_cmd(
 
 @app.command("dry-run")
 def dry_run_cmd(
-    policy_path: Annotated[
-        Path, typer.Option("--policy", "-p", help="Path to YAML policy file.")
-    ],
+    policy_path: Annotated[Path, typer.Option("--policy", "-p", help="Path to YAML policy file.")],
     tool: Annotated[str, typer.Option("--tool", "-t", help="Tool identifier.")],
     resource: Annotated[str, typer.Option("--resource", "-r", help="Canonical resource target.")],
     verb: Annotated[str, typer.Option("--verb", "-v", help="Action verb.")] = "read",
@@ -393,9 +389,7 @@ def dry_run_cmd(
 @app.command()
 def replay(
     corpus_path: Annotated[Path, typer.Argument(help="Path to JSONL action corpus.")],
-    policy_path: Annotated[
-        Path, typer.Option("--policy", "-p", help="Path to YAML policy file.")
-    ],
+    policy_path: Annotated[Path, typer.Option("--policy", "-p", help="Path to YAML policy file.")],
 ) -> None:
     """Replay a JSONL corpus of actions against a policy and check expectations."""
     try:
@@ -421,8 +415,7 @@ def replay(
         total += 1
         item = json.loads(line)
         prov = [
-            ProvenanceItem(source=p["source"], trust=p["trust"])
-            for p in item.get("provenance", [])
+            ProvenanceItem(source=p["source"], trust=p["trust"]) for p in item.get("provenance", [])
         ]
         try:
             env = build_envelope(
@@ -515,9 +508,7 @@ def run(
             help="Receipt SQLite DB path (defaults inside temp dir if workspace omitted).",
         ),
     ] = None,
-    shadow: Annotated[
-        bool, typer.Option("--shadow", help="Run policy in shadow mode.")
-    ] = False,
+    shadow: Annotated[bool, typer.Option("--shadow", help="Run policy in shadow mode.")] = False,
 ) -> None:
     """Run an end-to-end toy agent scenario through LocalFSExecutor + Boundary."""
     with tempfile.TemporaryDirectory(prefix="actentra-run-") as tmpdir:
@@ -683,12 +674,10 @@ def mcp_proxy_cmd(
         list[str],
         typer.Argument(help="Downstream MCP server command and arguments (after --)."),
     ],
-    policy_path: Annotated[
-        Path, typer.Option("--policy", "-p", help="Path to YAML policy file.")
-    ],
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/mcp-receipts.db"),
+    policy_path: Annotated[Path, typer.Option("--policy", "-p", help="Path to YAML policy file.")],
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/mcp-receipts.db"
+    ),
     session_id: Annotated[
         str, typer.Option("--session", help="Session ID for receipts and rate limits.")
     ] = "mcp-session",
@@ -714,12 +703,10 @@ def mcp_proxy_cmd(
 
 @app.command("serve")
 def serve_cmd(
-    policy_path: Annotated[
-        Path, typer.Option("--policy", "-p", help="Path to YAML policy file.")
-    ],
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
+    policy_path: Annotated[Path, typer.Option("--policy", "-p", help="Path to YAML policy file.")],
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
     host: Annotated[str, typer.Option("--host", "-h", help="Bind host.")] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port", help="Bind port.")] = 8080,
     session_id: Annotated[
@@ -735,9 +722,7 @@ def serve_cmd(
             help="Explicitly permit non-loopback network binding.",
         ),
     ] = False,
-    ttl: Annotated[
-        float, typer.Option("--ttl", help="Approval TTL in seconds.")
-    ] = 300.0,
+    ttl: Annotated[float, typer.Option("--ttl", help="Approval TTL in seconds.")] = 300.0,
     workspace: Annotated[
         Path | None,
         typer.Option("--workspace", "-w", help="Mount local filesystem executor at path."),
@@ -775,9 +760,9 @@ def serve_cmd(
 
 @approvals_app.command("list")
 def approvals_list_cmd(
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
     status: Annotated[
         str,
         typer.Option(
@@ -804,9 +789,9 @@ def approvals_list_cmd(
 @approvals_app.command("resolve")
 def approvals_resolve_cmd(
     crossing_id: Annotated[str, typer.Argument(help="Crossing ID to resolve.")],
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
     deny: Annotated[
         bool,
         typer.Option("--deny", help="Deny/reject the crossing instead of approving."),
@@ -828,15 +813,15 @@ def approvals_resolve_cmd(
 
 @bundle_app.command("export")
 def bundle_export_cmd(
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
     policy_path: Annotated[
         Path | None, typer.Option("--policy", "-p", help="Path to active YAML policy file.")
     ] = None,
-    out_path: Annotated[
-        Path, typer.Option("--out", "-o", help="Output JSON bundle file.")
-    ] = Path("audit-bundle.json"),
+    out_path: Annotated[Path, typer.Option("--out", "-o", help="Output JSON bundle file.")] = Path(
+        "audit-bundle.json"
+    ),
 ) -> None:
     """Export an offline audit bundle with policy, receipts, and verification metadata."""
     if policy_path is not None:
@@ -862,9 +847,9 @@ def observation_verify_cmd(
         Path,
         typer.Option("--workspace", "-w", help="Workspace root directory."),
     ] = Path("."),
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
     crossing_id: Annotated[
         str | None, typer.Option("--crossing-id", help="Optional crossing ID to link.")
     ] = None,
@@ -897,9 +882,9 @@ def observation_verify_cmd(
 
 @observation_app.command("list")
 def observation_list_cmd(
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
     crossing_id: Annotated[
         str | None, typer.Option("--crossing-id", help="Filter by crossing ID.")
     ] = None,
@@ -929,9 +914,9 @@ def observation_list_cmd(
 @observation_app.command("show")
 def observation_show_cmd(
     observation_id: Annotated[str, typer.Argument(help="Observation ID to show.")],
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
 ) -> None:
     """Show details of a specific state observation."""
     store = ReceiptStore(db_path)
@@ -946,19 +931,13 @@ def observation_show_cmd(
 def trace_show_cmd(
     entity_id: Annotated[
         str,
-        typer.Argument(
-            help="Root entity ID to trace (crossing_id, observation_id, or task_id)."
-        ),
+        typer.Argument(help="Root entity ID to trace (crossing_id, observation_id, or task_id)."),
     ],
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
-    as_json: Annotated[
-        bool, typer.Option("--json", help="Output trace in JSON format.")
-    ] = False,
-    max_depth: Annotated[
-        int, typer.Option("--max-depth", help="Maximum traversal depth.")
-    ] = 10,
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
+    as_json: Annotated[bool, typer.Option("--json", help="Output trace in JSON format.")] = False,
+    max_depth: Annotated[int, typer.Option("--max-depth", help="Maximum traversal depth.")] = 10,
 ) -> None:
     """Show the causal trace DAG and chronological timeline for an entity."""
     store = ReceiptStore(db_path)
@@ -985,9 +964,9 @@ def trace_link_cmd(
     target_type: Annotated[
         str, typer.Option("--target-type", "-t", help="Target type (crossing, observation, task).")
     ] = "crossing",
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
 ) -> None:
     """Create an explicit directional causal link between entities."""
     valid_relations = ("caused_by", "verifies", "derived_from", "triggers", "part_of")
@@ -1031,9 +1010,9 @@ def trace_link_cmd(
 
 @trace_app.command("list")
 def trace_list_cmd(
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
     entity_id: Annotated[
         str | None, typer.Option("--entity-id", "-e", help="Filter by entity ID.")
     ] = None,
@@ -1055,9 +1034,9 @@ def trace_list_cmd(
 @trace_app.command("delete")
 def trace_delete_cmd(
     link_id: Annotated[str, typer.Argument(help="Link ID to delete.")],
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
 ) -> None:
     """Delete an explicit causal link."""
     store = ReceiptStore(db_path)
@@ -1092,15 +1071,13 @@ def handoff_create_cmd(
         str | None, typer.Option("--assertions", "-a", help="JSON string of state assertions.")
     ] = None,
     ttl: Annotated[float, typer.Option("--ttl", help="Validity duration in seconds.")] = 3600.0,
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
 ) -> None:
     """Create a new cross-agent task handoff record."""
     verbs = tuple(v.strip() for v in allowed_verbs.split(",")) if allowed_verbs else ()
-    resources = (
-        tuple(r.strip() for r in allowed_resources.split(",")) if allowed_resources else ()
-    )
+    resources = tuple(r.strip() for r in allowed_resources.split(",")) if allowed_resources else ()
     try:
         asserts = json.loads(assertions_json) if assertions_json else {}
     except Exception as exc:
@@ -1135,9 +1112,9 @@ def handoff_advance_cmd(
     observation_id: Annotated[
         str | None, typer.Option("--observation-id", help="Observation ID to link.")
     ] = None,
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
 ) -> None:
     """Advance handoff step to the next agent."""
     store = ReceiptStore(db_path)
@@ -1171,9 +1148,9 @@ def handoff_verify_cmd(
     workspace: Annotated[
         Path, typer.Option("--workspace", "-w", help="Workspace root directory.")
     ] = Path("."),
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
 ) -> None:
     """Perform independent verification of handoff assertions."""
     store = ReceiptStore(db_path)
@@ -1201,9 +1178,9 @@ def handoff_verify_cmd(
 @handoff_app.command("show")
 def handoff_show_cmd(
     handoff_id: Annotated[str, typer.Argument(help="Handoff ID or task ID to show.")],
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
 ) -> None:
     """Show details of a specific task handoff."""
     store = ReceiptStore(db_path)
@@ -1218,18 +1195,14 @@ def handoff_show_cmd(
 
 @handoff_app.command("list")
 def handoff_list_cmd(
-    db_path: Annotated[
-        Path, typer.Option("--db", help="Path to SQLite receipt database.")
-    ] = Path(".actentra/gateway-receipts.db"),
-    task_id: Annotated[
-        str | None, typer.Option("--task-id", help="Filter by task ID.")
-    ] = None,
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
+    task_id: Annotated[str | None, typer.Option("--task-id", help="Filter by task ID.")] = None,
     agent_id: Annotated[
         str | None, typer.Option("--agent-id", help="Filter by assigned agent ID.")
     ] = None,
-    status: Annotated[
-        str | None, typer.Option("--status", help="Filter by status.")
-    ] = None,
+    status: Annotated[str | None, typer.Option("--status", help="Filter by status.")] = None,
     limit: Annotated[int, typer.Option("--limit", help="Max handoffs to return.")] = 50,
 ) -> None:
     """List recorded task handoffs from SQLite store."""
@@ -1249,23 +1222,73 @@ def handoff_list_cmd(
         )
 
 
+@evidence_app.command("list")
+def evidence_list_cmd(
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/receipts.db"
+    ),
+    crossing_id: Annotated[
+        str | None, typer.Option("--crossing-id", "-c", help="Filter by crossing ID.")
+    ] = None,
+    tier: Annotated[
+        str | None, typer.Option("--tier", "-t", help="Filter by evidence tier.")
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", "-l", help="Max records.")] = 50,
+    as_json: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    """List execution evidence records."""
+    if not db_path.exists():
+        typer.echo(f"Database not found: {db_path}", err=True)
+        raise typer.Exit(code=1)
+    store = ReceiptStore(db_path)
+    records = store.list_evidence(crossing_id=crossing_id, tier=tier, limit=limit)
+    if as_json:
+        typer.echo(json.dumps([r.to_dict() for r in records], indent=2))
+        return
+    if not records:
+        typer.echo("No evidence records found matching criteria.")
+        return
+    for ev in records:
+        fresh_tag = "FRESH" if ev.is_fresh() else "STALE"
+        typer.echo(
+            f"[{ev.tier.upper()} / {fresh_tag}] id={ev.evidence_id} "
+            f"crossing={ev.crossing_id} collector={ev.collector} "
+            f"domain={ev.trust_domain} observed={ev.observed_at}"
+        )
+
+
+@evidence_app.command("show")
+def evidence_show_cmd(
+    evidence_id: Annotated[str, typer.Argument(help="Evidence ID to inspect.")],
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/receipts.db"
+    ),
+) -> None:
+    """Show details of a specific evidence record."""
+    if not db_path.exists():
+        typer.echo(f"Database not found: {db_path}", err=True)
+        raise typer.Exit(code=1)
+    store = ReceiptStore(db_path)
+    ev = store.get_evidence(evidence_id)
+    if ev is None:
+        typer.echo(f"Evidence '{evidence_id}' not found.", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(json.dumps(ev.to_dict(), indent=2))
+
+
 @checkpoint_app.command("keygen")
 def checkpoint_keygen(
-    out_dir: Annotated[
-        Path, typer.Argument(help="Directory to write Ed25519 keypair.")
-    ] = Path(".actentra/keys"),
-    force: Annotated[
-        bool, typer.Option("--force", help="Overwrite existing key files.")
-    ] = False,
+    out_dir: Annotated[Path, typer.Argument(help="Directory to write Ed25519 keypair.")] = Path(
+        ".actentra/keys"
+    ),
+    force: Annotated[bool, typer.Option("--force", help="Overwrite existing key files.")] = False,
 ) -> None:
     """Generate an Ed25519 keypair for signing receipt checkpoints."""
     out_dir.mkdir(parents=True, exist_ok=True)
     priv_path = out_dir / "checkpoint.key.pem"
     pub_path = out_dir / "checkpoint.pub.pem"
     if (priv_path.exists() or pub_path.exists()) and not force:
-        typer.echo(
-            f"Key files already exist in {out_dir} (use --force to overwrite)", err=True
-        )
+        typer.echo(f"Key files already exist in {out_dir} (use --force to overwrite)", err=True)
         raise typer.Exit(code=1)
     priv_pem, pub_pem = generate_ed25519_keypair()
     priv_path.write_bytes(priv_pem)
@@ -1295,9 +1318,7 @@ def checkpoint_sign_cmd(
 @checkpoint_app.command("verify")
 def checkpoint_verify_cmd(
     checkpoint_path: Annotated[Path, typer.Argument(help="Path to checkpoint JSON file.")],
-    pubkey_path: Annotated[
-        Path, typer.Option("--pubkey", "-p", help="Ed25519 public key PEM.")
-    ],
+    pubkey_path: Annotated[Path, typer.Option("--pubkey", "-p", help="Ed25519 public key PEM.")],
     db_path: Annotated[
         Path | None, typer.Option("--db", help="Optional receipt DB to verify against.")
     ] = None,

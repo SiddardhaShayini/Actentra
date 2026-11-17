@@ -7,6 +7,7 @@ Defends against:
 
 from __future__ import annotations
 
+import contextlib
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -57,17 +58,19 @@ class SessionUsage:
 
 
 class SessionBudgetTracker:
-    """Memory-bounded cumulative session budget tracker."""
+    """Memory-bounded cumulative session budget tracker with optional SQLite persistence."""
 
     def __init__(
         self,
         config: SessionBudgetConfig | None = None,
         *,
         max_sessions: int = _DEFAULT_MAX_TRACKED_SESSIONS,
+        receipt_store: Any | None = None,
     ) -> None:
         self._config = config
         self._max_sessions = max_sessions
         self._sessions: OrderedDict[str, SessionUsage] = OrderedDict()
+        self._receipt_store = receipt_store
 
     @property
     def config(self) -> SessionBudgetConfig | None:
@@ -75,6 +78,10 @@ class SessionBudgetTracker:
 
     def set_config(self, config: SessionBudgetConfig | None) -> None:
         self._config = config
+
+    def set_receipt_store(self, store: Any | None) -> None:
+        """Attach receipt store for durable budget persistence across restarts."""
+        self._receipt_store = store
 
     def _get_usage(self, session_id: str) -> SessionUsage:
         if session_id in self._sessions:
@@ -85,6 +92,13 @@ class SessionBudgetTracker:
             self._sessions.popitem(last=False)
 
         usage = SessionUsage()
+        if self._receipt_store is not None:
+            with contextlib.suppress(Exception):
+                persisted = self._receipt_store.get_session_usage(session_id)
+                usage.actions_count = persisted.get("actions_count", 0)
+                usage.external_calls_count = persisted.get("external_calls_count", 0)
+                usage.write_bytes_count = persisted.get("write_bytes_count", 0)
+
         self._sessions[session_id] = usage
         return usage
 
@@ -166,13 +180,30 @@ class SessionBudgetTracker:
     def record_usage(self, envelope: ActionEnvelope, *, bytes_written: int = 0) -> None:
         """Increment cumulative counters upon successful action evaluation/execution."""
         usage = self._get_usage(envelope.session_id)
+        delta_actions = 1
+        delta_ext = 0
+        delta_bytes = 0
+
         usage.actions_count += 1
         tool = envelope.action.tool
         if tool.startswith(("http.", "net.http", "webhook.", "api.")):
             usage.external_calls_count += 1
+            delta_ext = 1
         if bytes_written > 0:
             usage.write_bytes_count += bytes_written
+            delta_bytes = bytes_written
         elif isinstance(envelope.action.params, dict):
             raw_data = envelope.action.params.get("content") or envelope.action.params.get("data")
             if isinstance(raw_data, (str, bytes)):
-                usage.write_bytes_count += len(raw_data)
+                wb = len(raw_data)
+                usage.write_bytes_count += wb
+                delta_bytes = wb
+
+        if self._receipt_store is not None:
+            with contextlib.suppress(Exception):
+                self._receipt_store.record_session_usage(
+                    envelope.session_id,
+                    delta_actions=delta_actions,
+                    delta_external=delta_ext,
+                    delta_bytes=delta_bytes,
+                )

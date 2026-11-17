@@ -14,9 +14,7 @@ from actentra_core.canonicalize import (
     hash_canonical,
 )
 
-_VALID_STATUSES: frozenset[str] = frozenset(
-    {"verified", "refuted", "unknown", "error", "stale"}
-)
+_VALID_STATUSES: frozenset[str] = frozenset({"verified", "refuted", "unknown", "error", "stale"})
 _VALID_TRUST_DOMAINS: frozenset[str] = frozenset(
     {"local_host", "remote_service", "external_witness"}
 )
@@ -169,9 +167,7 @@ class ObservationRecord:
             subject_resource=str(data["subject_resource"]),
             claim=str(data["claim"]),
             status=data["status"],
-            observed_digest=(
-                str(data["observed_digest"]) if data.get("observed_digest") else None
-            ),
+            observed_digest=(str(data["observed_digest"]) if data.get("observed_digest") else None),
             observed_at=str(data["observed_at"]),
             expires_at=str(data["expires_at"]) if data.get("expires_at") else None,
             verifier_id=str(data["verifier_id"]),

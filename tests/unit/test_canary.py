@@ -267,6 +267,7 @@ rules:
 
     # Delete an envelope to simulate missing context
     import sqlite3
+
     conn = sqlite3.connect(db_path)
     conn.execute("DELETE FROM action_envelopes WHERE crossing_id = ?;", (env1.crossing_id,))
     conn.commit()

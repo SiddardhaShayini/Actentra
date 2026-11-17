@@ -149,9 +149,7 @@ def run_policy_canary(
         user_goal = intent_data.get("user_goal")
         raw_declared_by = intent_data.get("declared_by", "agent")
         declared_by: Literal["human", "agent", "system"] = (
-            raw_declared_by
-            if raw_declared_by in ("human", "agent", "system")
-            else "agent"
+            raw_declared_by if raw_declared_by in ("human", "agent", "system") else "agent"
         )
 
         prov_items = [

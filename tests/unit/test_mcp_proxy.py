@@ -164,30 +164,36 @@ def test_mcp_serve_stdio_subprocess_roundtrip(tmp_path: Path) -> None:
         "  sys.stdout.flush()\n"
     )
 
-    client_requests = "\n".join(
-        [
-            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/call",
-                    "params": {"name": "read_file", "arguments": {"path": r"C:\work\hello.txt"}},
-                }
-            ),
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "execute_command",
-                        "arguments": {"cmd": "whoami"},
-                    },
-                }
-            ),
-        ]
-    ) + "\n"
+    client_requests = (
+        "\n".join(
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "read_file",
+                            "arguments": {"path": r"C:\work\hello.txt"},
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "execute_command",
+                            "arguments": {"cmd": "whoami"},
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
 
     client_in = io.StringIO(client_requests)
     client_out = io.StringIO()

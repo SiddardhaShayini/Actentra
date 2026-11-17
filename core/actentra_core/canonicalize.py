@@ -206,9 +206,7 @@ def _assert_within_base(path: str, base: str) -> None:
         return
     prefix = base if base.endswith("/") else f"{base}/"
     if not path.startswith(prefix):
-        raise CanonicalizationError(
-            f"Path {path!r} escapes allowed base directory {base!r}"
-        )
+        raise CanonicalizationError(f"Path {path!r} escapes allowed base directory {base!r}")
 
 
 def canonicalize_resource(resource: str) -> str:

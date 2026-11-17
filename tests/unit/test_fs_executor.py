@@ -104,7 +104,7 @@ def test_scoped_fs_enforces_constraints(tmp_path: Path) -> None:
     constraints = (
         "      max_read_bytes: 20\n"
         "      max_write_bytes: 10\n"
-        "      allowed_extensions: [\".txt\", \".md\"]\n"
+        '      allowed_extensions: [".txt", ".md"]\n'
     )
     policy = load_policy_yaml(_workspace_policy(ws, constraints_yaml=constraints))
     db_path = tmp_path / "r.db"

@@ -38,6 +38,10 @@
       "type": ["string", "null"],
       "enum": ["success", "failure", "unknown", null]
     },
+    "evidence_status": {
+      "type": ["string", "null"],
+      "enum": ["locally_observed", "caller_reported", "externally_verified", "stale", "unknown", null]
+    },
     "result_hash": {
       "type": ["string", "null"],
       "pattern": "^sha256:[0-9a-f]{64}$"

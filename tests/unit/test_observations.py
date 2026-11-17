@@ -152,9 +152,7 @@ def test_workspace_file_verifier_claims(tmp_path: Path) -> None:
 
     # 5. Claim: digest_match matching digest -> verified
     expected_dig = obs_exists.observed_digest
-    obs_match = verifier.verify(
-        "path:artifact.txt", "digest_match", expected_digest=expected_dig
-    )
+    obs_match = verifier.verify("path:artifact.txt", "digest_match", expected_digest=expected_dig)
     assert obs_match.status == "verified"
 
     # 6. Claim: digest_match wrong digest -> refuted
@@ -239,7 +237,7 @@ def test_state_drift_detection(tmp_path: Path) -> None:
     # All three chronological observations are persisted
     history = store.list_observations(subject_resource=obs1.subject_resource)
     assert len(history) == 3
-    assert history[0].status == "refuted"   # Latest
+    assert history[0].status == "refuted"  # Latest
     assert history[1].status == "verified"  # Middle (version 2)
     assert history[2].status == "verified"  # First (version 1)
 

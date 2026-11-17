@@ -85,9 +85,7 @@ def test_warrant_expiration() -> None:
     assert ok is True
 
     # Expired when checked against a future timestamp
-    ok_exp, msg_exp = verify_warrant(
-        warrant, pub, current_time_iso="2035-01-01T00:00:00Z"
-    )
+    ok_exp, msg_exp = verify_warrant(warrant, pub, current_time_iso="2035-01-01T00:00:00Z")
     assert ok_exp is False
     assert "expired" in msg_exp.lower()
 
@@ -341,4 +339,3 @@ rules:
             warrant=warrant,
         )
     assert exc_info.value.decision.rule_id == "warrant:scope-denied"
-

@@ -40,9 +40,7 @@ _SAFE_SEGMENT = st.text(
     segs=st.lists(_SAFE_SEGMENT, min_size=1, max_size=5),
     sep=st.sampled_from(["/", "\\"]),
 )
-def test_windows_path_canonicalization_is_idempotent(
-    drive: str, segs: list[str], sep: str
-) -> None:
+def test_windows_path_canonicalization_is_idempotent(drive: str, segs: list[str], sep: str) -> None:
     raw = f"{drive}:{sep}{sep.join(segs)}"
     once = canonicalize_windows_path(raw)
     twice = canonicalize_windows_path(once)
@@ -85,9 +83,7 @@ def test_canonical_json_key_order_independent(pairs: list[tuple[str, object]]) -
     verb=st.sampled_from(["read", "write", "delete"]),
     tool=st.sampled_from(["fs.read", "fs.write", "fs.delete", "http.post"]),
 )
-def test_policy_evaluation_is_deterministic(
-    segs: list[str], verb: str, tool: str
-) -> None:
+def test_policy_evaluation_is_deterministic(segs: list[str], verb: str, tool: str) -> None:
     policy = load_policy_file(REPO_ROOT / "policies" / "examples" / "starter.yaml")
     resource = f"path:C:/work/{'/'.join(segs)}.txt"
     env1 = build_envelope(tool=tool, verb=verb, resource=resource, session_id="prop-s1")

@@ -34,8 +34,7 @@ def test_phase1_exit_criteria_incident_block_rate_and_benign_fp_rate() -> None:
     stopped = 0
     for item in incidents:
         prov = [
-            ProvenanceItem(source=p["source"], trust=p["trust"])
-            for p in item.get("provenance", [])
+            ProvenanceItem(source=p["source"], trust=p["trust"]) for p in item.get("provenance", [])
         ]
         try:
             env = build_envelope(

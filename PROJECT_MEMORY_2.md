@@ -219,3 +219,34 @@ This guidance does not imply that Actentra’s authorization or first demonstrat
   * All 145 tests passing with 0 failures (`uv run pytest -m "not slow"`).
   * `uv run ruff check core executors gateway sdk cli tests examples` passes with 0 issues.
   * `uv run mypy core executors gateway sdk cli tests/unit/test_handoffs.py tests/unit/test_causal_trace.py tests/unit/test_observations.py` passes with 0 issues.
+
+### 2026-11-17 16:45 IST
+
+- Implemented Stage 0 & Stage 1 of ACTENTRA_MASTER_ROADMAP.md / PLAN_V5.md:
+  * Formal Evidence Quality Taxonomy (`spec/evidence.v1.schema.json`, `core/actentra_core/evidence.py`).
+  * Durable Budgets & Session Taints across cold restarts (`core/actentra_core/budgets.py`, `actentra.boundary`).
+  * Identity Context & Principal Anti-Spoofing boundaries (`core/actentra_core/identity.py`, `actentra_gateway.services`).
+  * Receipt Store schema extensions and typed evidence records (`core/actentra_core/receipts.py`).
+  * REST API endpoints (`GET /v1/evidence`, `GET /v1/evidence/{id}`) and CLI subcommands (`actentra evidence list`, `actentra evidence show`).
+- Files modified/created:
+  * `spec/evidence.v1.schema.json`: JSON Schema Draft 2020-12 defining `EvidenceRecord` structure and 5 tiers: `locally_observed`, `caller_reported`, `externally_verified`, `stale`, `unknown`.
+  * `spec/receipt.v1.schema.json`: Extended receipt schema with optional `evidence_status`.
+  * `core/actentra_core/evidence.py`: `EvidenceTier`, `EvidenceRecord`, `compute_evidence_hash`, and freshness validation (`is_fresh`).
+  * `core/actentra_core/identity.py`: `PrincipalType`, `CallerContext`, `IdentitySecurityError`, `make_local_caller_context`, and `resolve_http_caller_context`. Rejects unauthenticated callers attempting to claim system/admin IDs or `trusted` provenance.
+  * `core/actentra_core/receipts.py`: Added `evidence_status` column migration on `receipts`; created `evidence_records`, `session_budgets`, and `session_taints` tables; added evidence persistence/querying and session budget/taint durable storage.
+  * `core/actentra_core/budgets.py`: Extended `SessionBudgetTracker` to initialize and flush cumulative usage into SQLite `session_budgets` across restarts.
+  * `sdk/python/actentra/boundary.py`: Connected `Boundary.get_session_taint` and `set_session_taint` to SQLite `session_taints`; tagged local execution outcomes with `evidence_status="locally_observed"`.
+  * `gateway/actentra_gateway/services.py`: Integrated `CallerContext` into `submit_crossing` to block spoofing; attached `EvidenceRecord` on local executions, external reports, and observations; exported evidence records in audit bundle.
+  * `gateway/actentra_gateway/http_service.py`: Added REST routes `GET /v1/evidence` and `GET /v1/evidence/{id}`.
+  * `cli/actentra_cli/main.py`: Added `actentra evidence list` and `actentra evidence show` CLI commands.
+  * `tests/unit/test_evidence.py`: 9 comprehensive unit tests covering schema validation, freshness expiry, evidence hash determinism, SQLite storage, cold restart budget/taint persistence, identity context validation, caller outcome tagging, and canary replay compatibility.
+  * `docs/lifecycle-contract.md`: Documented Evidence Quality Taxonomy, Identity Boundaries, and Durable State in the operational contract.
+  * `docs/product-status.md`: Updated capability matrix and invariant evidence matrix to mark Evidence Quality, Durable Budgets/Taint, and Identity Boundaries as Supported.
+- Key decisions & rationale:
+  * Epistemic humility & evidence tiers: Actentra does not conflate caller claims with physical execution. Actions dispatched through local executors are `locally_observed`; caller reports are explicitly tagged `caller_reported`; external file checks are `externally_verified`.
+  * Zero-daemon persistence: Budgets and taints persist in SQLite WAL alongside receipts and approvals, preserving zero-daemon local-first execution on 8 GB RAM / i5 Windows 11.
+  * Anti-spoofing identity boundary: Untrusted callers cannot declare `trusted` provenance or claim administrative identities to bypass taint and rate-limit policies.
+- Validation:
+  * Full test suite: 154 passed, 4 skipped in 7.96s (`pytest`).
+  * Code quality: 0 errors on `ruff check` and `ruff format --check`.
+  * Type safety: 0 issues on `mypy core executors gateway sdk cli tests/unit/test_evidence.py`.

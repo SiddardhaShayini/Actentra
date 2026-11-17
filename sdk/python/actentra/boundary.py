@@ -99,6 +99,7 @@ class Boundary:
     ) -> None:
         self._engine = PolicyEngine(policy)
         self._store = receipt_store
+        self._engine.budget_tracker.set_receipt_store(self._store)
         self._session_id = session_id
         self._agent_id = agent_id
         self._framework = framework
@@ -288,20 +289,27 @@ class Boundary:
             return self._approvals.pop((sid, canonical_hash), None) is not None
 
     def get_session_taint(self, session_id: str | None = None) -> str | None:
-        """Return the cumulative taint level for a session."""
+        """Return cumulative session taint level (checked from memory or durable SQLite)."""
         sid = session_id or self._session_id
         with self._lock:
-            return self._session_taints.get(sid)
+            if sid in self._session_taints:
+                return self._session_taints[sid]
+            persisted = self._store.get_session_taint(sid)
+            if persisted is not None:
+                self._session_taints[sid] = persisted
+            return persisted
 
     def set_session_taint(self, taint: str, session_id: str | None = None) -> None:
-        """Explicitly set or clear session-level taint."""
+        """Explicitly set or clear session-level taint in memory and durable SQLite."""
         sid = session_id or self._session_id
         clean = taint.strip().lower()
         with self._lock:
             if clean in ("trusted", "clean", ""):
                 self._session_taints.pop(sid, None)
+                self._store.set_session_taint(sid, "trusted")
             else:
                 self._session_taints[sid] = clean
+                self._store.set_session_taint(sid, clean)
 
     def dry_run(
         self,
@@ -495,6 +503,7 @@ class Boundary:
                     policy_version=decision.policy_version,
                     status="failure",
                     error=str(exc),
+                    evidence_status="locally_observed",
                 )
                 raise ActionBlockedError(exhausted_decision, envelope.crossing_id) from exc
 
@@ -513,6 +522,7 @@ class Boundary:
                 policy_version=decision.policy_version,
                 status="failure",
                 error="Canonical hash mismatch before execution",
+                evidence_status="locally_observed",
             )
             raise ActionBlockedError(
                 Decision(
@@ -538,6 +548,7 @@ class Boundary:
                 policy_version=decision.policy_version,
                 status="failure",
                 error=err_label,
+                evidence_status="locally_observed",
             )
             raise
 
@@ -555,6 +566,7 @@ class Boundary:
             policy_version=decision.policy_version,
             status="success",
             result_hash=result_hash,
+            evidence_status="locally_observed",
         )
         # Update session cumulative budgets
         self._engine.budget_tracker.record_usage(envelope)

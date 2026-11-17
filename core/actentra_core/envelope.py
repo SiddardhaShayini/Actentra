@@ -146,10 +146,7 @@ def _canonicalize_params(value: Any) -> Any:
     if isinstance(value, str):
         return canonicalize_unicode(value, allow_newlines=True)
     if isinstance(value, dict):
-        return {
-            canonicalize_unicode(str(k)): _canonicalize_params(v)
-            for k, v in value.items()
-        }
+        return {canonicalize_unicode(str(k)): _canonicalize_params(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_canonicalize_params(item) for item in value]
     return value
@@ -200,9 +197,7 @@ def build_envelope(
         clean_resource = canonicalize_resource(resource)
         clean_params = _canonicalize_params(params or {})
         clean_idem = (
-            canonicalize_unicode(idempotency_key).strip()
-            if idempotency_key is not None
-            else None
+            canonicalize_unicode(idempotency_key).strip() if idempotency_key is not None else None
         )
     except CanonicalizationError as exc:
         raise EnvelopeError(f"Canonicalization failed: {exc}") from exc

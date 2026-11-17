@@ -97,34 +97,45 @@ Every supported integration path adheres to the following linear lifecycle:
 Actentra maintains a strict boundary between what is durable across restarts and what is process-local:
 
 - **Persisted in SQLite WAL (survives restart & power cycle):**
-  1. `receipts` table: Append-only hash chain of decision and outcome records (`seq`, `crossing_id`, `session_id`, `canonical_hash`, `policy_version`, `verdict`/`status`, `result_hash`, `error`, `prev_hash`, `entry_hash`).
+  1. `receipts` table: Append-only hash chain of decision and outcome records (`seq`, `crossing_id`, `session_id`, `canonical_hash`, `policy_version`, `verdict`/`status`, `result_hash`, `error`, `evidence_status`, `prev_hash`, `entry_hash`).
   2. `action_envelopes` table: Full canonical action envelope JSON indexed by `crossing_id`.
   3. `pending_approvals` table: Human approval requests (`crossing_id`, `session_id`, `canonical_hash`, `tool`, `verb`, `resource`, `params`, `risk_tags`, `status`, `expires_at`, `resolution_ts`). Survives in `pending`, `approved`, `rejected`, `expired`, or `consumed` status.
+  4. `session_budgets` table: Durable cumulative session counters (`actions_count`, `external_calls_count`, `write_bytes_count`, `updated_at`) surviving process restarts.
+  5. `session_taints` table: Durable session taint level (`trusted`, `untrusted`, `unknown`) surviving process restarts.
+  6. `evidence_records` table: Cryptographically hashed evidential observation records binding crossings to verification tiers.
 - **Process-Local State (reset upon process restart):**
-  1. `Boundary` session taint tracking (`_session_taints` dictionary).
-  2. In-memory policy rate-limit token buckets (`RateLimiter._buckets`).
-  3. Cumulative session budget counters (`BudgetTracker._usage`).
-  4. Emergency freeze state (`PolicyEngine._frozen`).
-  5. Cryptographic capability warrant in-memory quota tracking (`WarrantRegistry._use_counts`).
+  1. In-memory policy rate-limit token buckets (`RateLimiter._buckets`).
+  2. Emergency freeze state (`PolicyEngine._frozen`).
+  3. Cryptographic capability warrant in-memory quota tracking (`WarrantRegistry._use_counts`).
 
 ### 3.2 Identity & Provenance Authority
 
-1. **Caller-Asserted Identity:** Over the local HTTP gateway (`/v1/crossings`), caller-supplied `session_id`, `agent_id`, and declared `provenance` are **caller assertions**, not authenticated principals.
-2. **Untrusted Declaration Boundary:** An agent model or untrusted remote caller must never be permitted to authorize itself or elevate its trust classification via self-declared provenance.
+1. **Principal Types & Caller Context:** Actentra validates all incoming callers via `CallerContext` and `PrincipalType`:
+   - `LOCAL_PROCESS`: Direct in-process or loopback caller without token auth (untrusted agent default, trusted operator if explicitly configured).
+   - `AUTHENTICATED_OPERATOR`: Bearer token authenticated operator.
+   - `UNAUTHENTICATED_CALLER`: Remote or unverified HTTP caller.
+   - `DELEGATED_AGENT`: Downstream AI agent acting on behalf of a principal.
+2. **Untrusted Declaration Boundary:** An unauthenticated caller or agent model cannot claim reserved system or admin identities, and cannot self-declare `trusted` provenance to bypass taint rules. Attempts fail closed (`403 Forbidden` / `IdentitySecurityError`).
 3. **Trusted Integration Harness:** In multi-agent or production workflows, principal identity and session bindings must be injected by the trusted integration wrapper (e.g., authenticated proxy, server-side harness, or DPAPI credentials), not extracted from untrusted model outputs.
 4. **Envelope Action Hash Scope:** The canonical action hash binds `envelope_version`, `session_id`, `agent_id`, and the canonical `ActionSpec`. It does not cover unstructured intent or subjective claims.
 
-### 3.3 Outcome Evidence Classes
+### 3.3 Evidence Quality Taxonomy & Tiers
 
-Actentra categorizes outcomes into two strictly distinct evidential tiers:
+Actentra classifies evidence into 5 formal tiers (`spec/evidence.v1.schema.json`, `EvidenceRecord`):
 
-1. **Executor-Observed Outcome (`reported_by: None` / first-party):**
+1. **`locally_observed` (First-Party Execution):**
    - Dispatched through Actentra's registered scoped executors (`LocalFSExecutor`, `ScopedSQLiteExecutor`, `ScopedHTTPExecutor`).
    - The executor runs within the local boundary and computes the result hash directly from execution return data before recording the outcome receipt.
-2. **Caller-Reported Outcome (`reported_by: "caller"`):**
+2. **`caller_reported` (External Agent Claims):**
    - For externally managed executions, recorded via `POST /v1/crossings/{id}/outcome`.
-   - The receipt explicitly records `reason: "caller-reported"` and returns `reported_by: "caller"`.
+   - The receipt explicitly records `reason: "caller-reported"` and `evidence_status: "caller_reported"`.
    - **Crucial Distinction:** A caller-reported outcome receipt proves that an external agent reported an outcome to Actentra; it does **not** constitute independent proof of real-world state or proof that a remote system performed the requested effect.
+3. **`externally_verified` (Ground-Truth Observation):**
+   - Corroborated by deterministic, out-of-band ground-truth probes (e.g. `ObservationRecord` file sha256 check matching claimed outcome).
+4. **`stale`:**
+   - Evidential claim whose TTL (`expires_at`) has elapsed.
+5. **`unknown`:**
+   - Default or crash-recovered evidence status when verification could not be performed or completed.
 
 ### 3.4 Restart, Crash, and Recovery Semantics
 

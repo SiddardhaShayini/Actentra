@@ -22,6 +22,7 @@ from actentra_core.handoffs import (
     HandoffError,
     UnauthorizedAgentHandoffError,
 )
+from actentra_core.identity import resolve_http_caller_context
 from actentra_gateway.services import AppServices, ExecutorRegistry
 
 _MAX_BODY_BYTES = 2 * 1024 * 1024  # 2 MiB bound on HTTP request body
@@ -317,11 +318,30 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             hnd_id = path[len("/v1/handoffs/") :]
             hnd = services.get_task_handoff(hnd_id)
             if hnd is None:
-                self._send_json(
-                    HTTPStatus.NOT_FOUND, {"error": f"Handoff '{hnd_id}' not found"}
-                )
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Handoff '{hnd_id}' not found"})
             else:
                 self._send_json(HTTPStatus.OK, hnd)
+            return
+
+        if path == "/v1/evidence":
+            query = parse_qs(parts.query)
+            cid_f = query.get("crossing_id", [None])[0]
+            tier_f = query.get("tier", [None])[0]
+            try:
+                lim_f = int(query.get("limit", ["50"])[0])
+            except ValueError:
+                lim_f = 50
+            evs = services.list_evidence(crossing_id=cid_f, tier=tier_f, limit=lim_f)
+            self._send_json(HTTPStatus.OK, evs)
+            return
+
+        if path.startswith("/v1/evidence/"):
+            ev_id = path[len("/v1/evidence/") :]
+            ev = services.get_evidence(ev_id)
+            if ev is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Evidence '{ev_id}' not found"})
+            else:
+                self._send_json(HTTPStatus.OK, ev)
             return
 
         if path in ("/ui", "/"):
@@ -362,7 +382,23 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 )
                 return
             execute = raw_execute
-            resp = services.submit_crossing(data, execute=execute)
+            headers_dict = (
+                {k.lower(): v for k, v in self.headers.items()}
+                if hasattr(self, "headers") and self.headers
+                else {}
+            )
+            client_addr = getattr(self, "client_address", None)
+            remote_ip = (
+                client_addr[0] if isinstance(client_addr, tuple) and client_addr else "127.0.0.1"
+            )
+            server_obj = getattr(self, "server", None)
+            token = getattr(server_obj, "token", None) if server_obj else None
+            caller_ctx = resolve_http_caller_context(
+                headers=headers_dict,
+                expected_token=token,
+                remote_addr=remote_ip,
+            )
+            resp = services.submit_crossing(data, execute=execute, caller_context=caller_ctx)
             status_code = HTTPStatus.OK if "error" not in resp else HTTPStatus.BAD_REQUEST
             self._send_json(status_code, resp)
             return

@@ -33,10 +33,7 @@ def test_windows_path_case_and_slash_equivalence() -> None:
 
 
 def test_windows_path_base_dir_containment() -> None:
-    assert (
-        windows_path_join_safe(r"C:\work", r"sub\..\notes.txt")
-        == "c:/work/notes.txt"
-    )
+    assert windows_path_join_safe(r"C:\work", r"sub\..\notes.txt") == "c:/work/notes.txt"
     # /work2 must never be treated as inside /work
     with pytest.raises(CanonicalizationError):
         canonicalize_windows_path(r"C:\work2\secret.txt", base_dir=r"C:\work")

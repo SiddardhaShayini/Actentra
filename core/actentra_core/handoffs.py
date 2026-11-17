@@ -177,9 +177,7 @@ class TaskHandoffRecord:
         if self.allowed_verbs and verb.lower() not in [v.lower() for v in self.allowed_verbs]:
             return False
         if self.allowed_resources:
-            matched = any(
-                match_resource_pattern(pat, resource) for pat in self.allowed_resources
-            )
+            matched = any(match_resource_pattern(pat, resource) for pat in self.allowed_resources)
             if not matched:
                 return False
         return True

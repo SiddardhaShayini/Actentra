@@ -24,6 +24,7 @@ from actentra_core.envelope import (
     compute_action_hash,
     utc_now_iso,
 )
+from actentra_core.evidence import EvidenceRecord, EvidenceTier
 from actentra_core.handoffs import TaskHandoffRecord
 from actentra_core.observations import ObservationRecord
 from actentra_core.verdict import Decision
@@ -31,6 +32,12 @@ from actentra_core.verdict import Decision
 GENESIS_HASH = "sha256:" + ("0" * 64)
 OutcomeStatus = Literal["success", "failure", "unknown"]
 _VALID_OUTCOMES = frozenset({"success", "failure", "unknown"})
+EvidenceStatus = Literal[
+    "locally_observed", "caller_reported", "externally_verified", "stale", "unknown"
+]
+_VALID_EVIDENCE_STATUSES = frozenset(
+    {"locally_observed", "caller_reported", "externally_verified", "stale", "unknown"}
+)
 
 
 class ReceiptError(RuntimeError):
@@ -56,9 +63,10 @@ class ReceiptRecord:
     ts: str
     prev_hash: str
     entry_hash: str
+    evidence_status: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "seq": self.seq,
             "record_type": self.record_type,
             "crossing_id": self.crossing_id,
@@ -77,6 +85,9 @@ class ReceiptRecord:
             "prev_hash": self.prev_hash,
             "entry_hash": self.entry_hash,
         }
+        if self.evidence_status is not None:
+            d["evidence_status"] = self.evidence_status
+        return d
 
 
 PendingApprovalStatus = Literal["pending", "approved", "rejected", "expired", "consumed"]
@@ -166,6 +177,32 @@ def _compute_entry_hash(
     return hash_canonical(payload)
 
 
+def _row_to_receipt_record(row: tuple[Any, ...]) -> ReceiptRecord:
+    risk_list = json.loads(str(row[9]))
+    rec_type: Literal["decision", "outcome"] = "decision" if row[1] == "decision" else "outcome"
+    evidence_status = str(row[17]) if len(row) > 17 and row[17] is not None else None
+    return ReceiptRecord(
+        seq=int(row[0]),
+        record_type=rec_type,
+        crossing_id=str(row[2]),
+        session_id=str(row[3]),
+        canonical_hash=str(row[4]),
+        policy_version=str(row[5]),
+        verdict=str(row[6]) if row[6] is not None else None,
+        rule_id=str(row[7]) if row[7] is not None else None,
+        reason=str(row[8]) if row[8] is not None else None,
+        risk_tags=tuple(str(t) for t in risk_list),
+        shadow=bool(row[10]),
+        status=str(row[11]) if row[11] is not None else None,
+        result_hash=str(row[12]) if row[12] is not None else None,
+        error=str(row[13]) if row[13] is not None else None,
+        ts=str(row[14]),
+        prev_hash=str(row[15]),
+        entry_hash=str(row[16]),
+        evidence_status=evidence_status,
+    )
+
+
 class ReceiptStore:
     """Append-only SQLite WAL receipt store with SHA-256 hash chaining."""
 
@@ -210,7 +247,13 @@ class ReceiptStore:
                     error TEXT,
                     ts TEXT NOT NULL,
                     prev_hash TEXT NOT NULL,
-                    entry_hash TEXT NOT NULL
+                    entry_hash TEXT NOT NULL,
+                    evidence_status TEXT CHECK (
+                        evidence_status IN (
+                            'locally_observed', 'caller_reported', 'externally_verified',
+                            'stale', 'unknown'
+                        ) OR evidence_status IS NULL
+                    )
                 );
                 """
             )
@@ -342,17 +385,78 @@ class ReceiptStore:
                 );
                 """
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_handoff_task ON task_handoffs(task_id);"
-            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_handoff_task ON task_handoffs(task_id);")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_handoff_assigned
                 ON task_handoffs(assigned_agent_id);
                 """
             )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_handoff_status ON task_handoffs(status);")
+
+            # Migration for evidence_status on existing receipts tables
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute(
+                    "ALTER TABLE receipts ADD COLUMN evidence_status TEXT CHECK ("
+                    "evidence_status IN ("
+                    "'locally_observed', 'caller_reported', 'externally_verified', "
+                    "'stale', 'unknown') OR evidence_status IS NULL"
+                    ");"
+                )
+
+            # Phase 5: Typed evidence records table
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_handoff_status ON task_handoffs(status);"
+                """
+                CREATE TABLE IF NOT EXISTS evidence_records (
+                    evidence_id TEXT PRIMARY KEY,
+                    crossing_id TEXT NOT NULL,
+                    tier TEXT NOT NULL CHECK (
+                        tier IN (
+                            'locally_observed', 'caller_reported', 'externally_verified',
+                            'stale', 'unknown'
+                        )
+                    ),
+                    trust_domain TEXT NOT NULL,
+                    collector TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    details_json TEXT NOT NULL,
+                    evidence_hash TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_evidence_crossing ON evidence_records(crossing_id);"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_tier ON evidence_records(tier);")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_evidence_observed ON evidence_records(observed_at);"
+            )
+
+            # Phase 5: Persistent session cumulative budgets across restarts
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_budgets (
+                    session_id TEXT PRIMARY KEY,
+                    actions_count INTEGER NOT NULL DEFAULT 0,
+                    external_calls_count INTEGER NOT NULL DEFAULT 0,
+                    write_bytes_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+
+            # Phase 5: Persistent session taints across restarts
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_taints (
+                    session_id TEXT PRIMARY KEY,
+                    taint_level TEXT NOT NULL CHECK (
+                        taint_level IN ('trusted', 'untrusted', 'unknown')
+                    ),
+                    updated_at TEXT NOT NULL
+                );
+                """
             )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to initialize receipt store: {exc}") from exc
@@ -375,6 +479,7 @@ class ReceiptStore:
         status: OutcomeStatus | None,
         result_hash: str | None,
         error: str | None,
+        evidence_status: str | None = None,
         ts: str | None = None,
         envelope: ActionEnvelope | None = None,
     ) -> ReceiptRecord:
@@ -426,8 +531,9 @@ class ReceiptStore:
                 INSERT INTO receipts (
                     seq, record_type, crossing_id, session_id, canonical_hash,
                     policy_version, verdict, rule_id, reason, risk_tags_json,
-                    shadow, status, result_hash, error, ts, prev_hash, entry_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    shadow, status, result_hash, error, ts, prev_hash, entry_hash,
+                    evidence_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     next_seq,
@@ -447,6 +553,7 @@ class ReceiptStore:
                     stamp,
                     prev_hash,
                     entry_hash,
+                    evidence_status,
                 ),
             )
             if envelope is not None:
@@ -492,11 +599,10 @@ class ReceiptStore:
             ts=stamp,
             prev_hash=prev_hash,
             entry_hash=entry_hash,
+            evidence_status=evidence_status,
         )
 
-    def record_decision(
-        self, envelope: ActionEnvelope, decision: Decision
-    ) -> ReceiptRecord:
+    def record_decision(self, envelope: ActionEnvelope, decision: Decision) -> ReceiptRecord:
         """Persist an immutable decision record and envelope atomically (I5)."""
         return self._append_record(
             record_type="decision",
@@ -572,12 +678,29 @@ class ReceiptStore:
         result_hash: str | None = None,
         error: str | None = None,
         reason: str | None = None,
+        evidence_status: str | None = None,
     ) -> ReceiptRecord:
         """Append an immutable post-execution outcome record (success, failure, or unknown)."""
         if status not in _VALID_OUTCOMES:
             raise ReceiptError(f"Invalid outcome status: {status!r}")
         safe_error = error[:1000] if error is not None else None
         safe_reason = reason[:1000] if reason is not None else None
+
+        # Derive evidence_status if not explicitly supplied
+        ev_status = evidence_status
+        if ev_status is None:
+            if status == "unknown":
+                ev_status = "unknown"
+            elif safe_reason == "caller-reported":
+                ev_status = "caller_reported"
+            else:
+                ev_status = "locally_observed"
+        elif ev_status not in _VALID_EVIDENCE_STATUSES:
+            valid_statuses = sorted(_VALID_EVIDENCE_STATUSES)
+            raise ReceiptError(
+                f"Invalid evidence status: {ev_status!r}; expected one of {valid_statuses}"
+            )
+
         return self._append_record(
             record_type="outcome",
             crossing_id=crossing_id,
@@ -592,6 +715,7 @@ class ReceiptStore:
             status=status,
             result_hash=result_hash,
             error=safe_error,
+            evidence_status=ev_status,
         )
 
     def get_decision_receipt(self, crossing_id: str) -> ReceiptRecord | None:
@@ -602,7 +726,8 @@ class ReceiptStore:
                 """
                 SELECT seq, record_type, crossing_id, session_id, canonical_hash,
                        policy_version, verdict, rule_id, reason, risk_tags_json,
-                       shadow, status, result_hash, error, ts, prev_hash, entry_hash
+                       shadow, status, result_hash, error, ts, prev_hash, entry_hash,
+                       evidence_status
                 FROM receipts
                 WHERE crossing_id = ? AND record_type = 'decision'
                 ORDER BY seq DESC LIMIT 1;
@@ -611,26 +736,7 @@ class ReceiptStore:
             ).fetchone()
             if row is None:
                 return None
-            risk_list = json.loads(str(row[9]))
-            return ReceiptRecord(
-                seq=int(row[0]),
-                record_type="decision",
-                crossing_id=str(row[2]),
-                session_id=str(row[3]),
-                canonical_hash=str(row[4]),
-                policy_version=str(row[5]),
-                verdict=str(row[6]) if row[6] is not None else None,
-                rule_id=str(row[7]) if row[7] is not None else None,
-                reason=str(row[8]) if row[8] is not None else None,
-                risk_tags=tuple(str(t) for t in risk_list),
-                shadow=bool(row[10]),
-                status=str(row[11]) if row[11] is not None else None,
-                result_hash=str(row[12]) if row[12] is not None else None,
-                error=str(row[13]) if row[13] is not None else None,
-                ts=str(row[14]),
-                prev_hash=str(row[15]),
-                entry_hash=str(row[16]),
-            )
+            return _row_to_receipt_record(row)
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to fetch decision receipt: {exc}") from exc
         finally:
@@ -644,7 +750,8 @@ class ReceiptStore:
                 """
                 SELECT seq, record_type, crossing_id, session_id, canonical_hash,
                        policy_version, verdict, rule_id, reason, risk_tags_json,
-                       shadow, status, result_hash, error, ts, prev_hash, entry_hash
+                       shadow, status, result_hash, error, ts, prev_hash, entry_hash,
+                       evidence_status
                 FROM receipts
                 WHERE crossing_id = ? AND record_type = 'outcome'
                 ORDER BY seq DESC LIMIT 1;
@@ -653,26 +760,7 @@ class ReceiptStore:
             ).fetchone()
             if row is None:
                 return None
-            risk_list = json.loads(str(row[9]))
-            return ReceiptRecord(
-                seq=int(row[0]),
-                record_type="outcome",
-                crossing_id=str(row[2]),
-                session_id=str(row[3]),
-                canonical_hash=str(row[4]),
-                policy_version=str(row[5]),
-                verdict=str(row[6]) if row[6] is not None else None,
-                rule_id=str(row[7]) if row[7] is not None else None,
-                reason=str(row[8]) if row[8] is not None else None,
-                risk_tags=tuple(str(t) for t in risk_list),
-                shadow=bool(row[10]),
-                status=str(row[11]) if row[11] is not None else None,
-                result_hash=str(row[12]) if row[12] is not None else None,
-                error=str(row[13]) if row[13] is not None else None,
-                ts=str(row[14]),
-                prev_hash=str(row[15]),
-                entry_hash=str(row[16]),
-            )
+            return _row_to_receipt_record(row)
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to fetch outcome receipt: {exc}") from exc
         finally:
@@ -745,7 +833,8 @@ class ReceiptStore:
                     """
                     SELECT seq, record_type, crossing_id, session_id, canonical_hash,
                            policy_version, verdict, rule_id, reason, risk_tags_json,
-                           shadow, status, result_hash, error, ts, prev_hash, entry_hash
+                           shadow, status, result_hash, error, ts, prev_hash, entry_hash,
+                           evidence_status
                     FROM receipts
                     WHERE seq <= ?
                     ORDER BY seq DESC;
@@ -757,7 +846,8 @@ class ReceiptStore:
                     """
                     SELECT seq, record_type, crossing_id, session_id, canonical_hash,
                            policy_version, verdict, rule_id, reason, risk_tags_json,
-                           shadow, status, result_hash, error, ts, prev_hash, entry_hash
+                           shadow, status, result_hash, error, ts, prev_hash, entry_hash,
+                           evidence_status
                     FROM receipts
                     WHERE seq >= ?
                     ORDER BY seq ASC;
@@ -770,29 +860,7 @@ class ReceiptStore:
                 if not rows:
                     break
                 for row in rows:
-                    risk_list = json.loads(str(row[9]))
-                    rec_type: Literal["decision", "outcome"] = (
-                        "decision" if row[1] == "decision" else "outcome"
-                    )
-                    yield ReceiptRecord(
-                        seq=int(row[0]),
-                        record_type=rec_type,
-                        crossing_id=str(row[2]),
-                        session_id=str(row[3]),
-                        canonical_hash=str(row[4]),
-                        policy_version=str(row[5]),
-                        verdict=str(row[6]) if row[6] is not None else None,
-                        rule_id=str(row[7]) if row[7] is not None else None,
-                        reason=str(row[8]) if row[8] is not None else None,
-                        risk_tags=tuple(str(t) for t in risk_list),
-                        shadow=bool(row[10]),
-                        status=str(row[11]) if row[11] is not None else None,
-                        result_hash=str(row[12]) if row[12] is not None else None,
-                        error=str(row[13]) if row[13] is not None else None,
-                        ts=str(row[14]),
-                        prev_hash=str(row[15]),
-                        entry_hash=str(row[16]),
-                    )
+                    yield _row_to_receipt_record(row)
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to stream receipt records: {exc}") from exc
         finally:
@@ -893,36 +961,15 @@ class ReceiptStore:
                 """
                 SELECT seq, record_type, crossing_id, session_id, canonical_hash,
                        policy_version, verdict, rule_id, reason, risk_tags_json,
-                       shadow, status, result_hash, error, ts, prev_hash, entry_hash
+                       shadow, status, result_hash, error, ts, prev_hash, entry_hash,
+                       evidence_status
                 FROM receipts
                 ORDER BY seq DESC LIMIT 1;
                 """
             ).fetchone()
             if row is None:
                 return None
-            risk_list = json.loads(str(row[9]))
-            rec_type: Literal["decision", "outcome"] = (
-                "decision" if row[1] == "decision" else "outcome"
-            )
-            return ReceiptRecord(
-                seq=int(row[0]),
-                record_type=rec_type,
-                crossing_id=str(row[2]),
-                session_id=str(row[3]),
-                canonical_hash=str(row[4]),
-                policy_version=str(row[5]),
-                verdict=str(row[6]) if row[6] is not None else None,
-                rule_id=str(row[7]) if row[7] is not None else None,
-                reason=str(row[8]) if row[8] is not None else None,
-                risk_tags=tuple(str(t) for t in risk_list),
-                shadow=bool(row[10]),
-                status=str(row[11]) if row[11] is not None else None,
-                result_hash=str(row[12]) if row[12] is not None else None,
-                error=str(row[13]) if row[13] is not None else None,
-                ts=str(row[14]),
-                prev_hash=str(row[15]),
-                entry_hash=str(row[16]),
-            )
+            return _row_to_receipt_record(row)
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to fetch latest record: {exc}") from exc
         finally:
@@ -1239,7 +1286,8 @@ class ReceiptStore:
         select_sql = (
             f"SELECT r.seq, r.record_type, r.crossing_id, r.session_id, r.canonical_hash, "
             f"r.policy_version, r.verdict, r.rule_id, r.reason, r.risk_tags_json, "
-            f"r.shadow, r.status, r.result_hash, r.error, r.ts, r.prev_hash, r.entry_hash "
+            f"r.shadow, r.status, r.result_hash, r.error, r.ts, r.prev_hash, r.entry_hash, "
+            f"r.evidence_status "
             f"{from_sql}{where_sql} ORDER BY r.seq DESC LIMIT ? OFFSET ?;"
         )
 
@@ -1253,33 +1301,7 @@ class ReceiptStore:
         finally:
             conn.close()
 
-        records: list[ReceiptRecord] = []
-        for row in rows:
-            risk_list = json.loads(str(row[9]))
-            rec_type: Literal["decision", "outcome"] = (
-                "decision" if row[1] == "decision" else "outcome"
-            )
-            records.append(
-                ReceiptRecord(
-                    seq=int(row[0]),
-                    record_type=rec_type,
-                    crossing_id=str(row[2]),
-                    session_id=str(row[3]),
-                    canonical_hash=str(row[4]),
-                    policy_version=str(row[5]),
-                    verdict=str(row[6]) if row[6] is not None else None,
-                    rule_id=str(row[7]) if row[7] is not None else None,
-                    reason=str(row[8]) if row[8] is not None else None,
-                    risk_tags=tuple(str(t) for t in risk_list),
-                    shadow=bool(row[10]),
-                    status=str(row[11]) if row[11] is not None else None,
-                    result_hash=str(row[12]) if row[12] is not None else None,
-                    error=str(row[13]) if row[13] is not None else None,
-                    ts=str(row[14]),
-                    prev_hash=str(row[15]),
-                    entry_hash=str(row[16]),
-                )
-            )
+        records = [_row_to_receipt_record(row) for row in rows]
         return records, total_count
 
     # --- 8. State Observations (Phase 2) ---
@@ -1858,6 +1880,267 @@ class ReceiptStore:
             expires_at=str(row[15]) if row[15] is not None else None,
             handoff_hash=str(row[16]),
         )
+
+    # --- 11. Evidence Records (Phase 5) ---
+
+    def record_evidence(self, evidence: EvidenceRecord) -> EvidenceRecord:
+        """Store an immutable evidence record."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO evidence_records (
+                    evidence_id, crossing_id, tier, trust_domain,
+                    collector, observed_at, expires_at, details_json, evidence_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    evidence.evidence_id,
+                    evidence.crossing_id,
+                    evidence.tier.value,
+                    evidence.trust_domain,
+                    evidence.collector,
+                    evidence.observed_at,
+                    evidence.expires_at,
+                    canonicalize_json(evidence.details),
+                    evidence.evidence_hash,
+                ),
+            )
+            return evidence
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to record evidence: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_evidence(self, evidence_id: str) -> EvidenceRecord | None:
+        """Fetch an evidence record by its ID."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT evidence_id, crossing_id, tier, trust_domain,
+                       collector, observed_at, expires_at, details_json, evidence_hash
+                FROM evidence_records
+                WHERE evidence_id = ? LIMIT 1;
+                """,
+                (evidence_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return EvidenceRecord(
+                evidence_id=str(row[0]),
+                crossing_id=str(row[1]),
+                tier=EvidenceTier(str(row[2])),
+                trust_domain=str(row[3]),
+                collector=str(row[4]),
+                observed_at=str(row[5]),
+                expires_at=str(row[6]) if row[6] is not None else None,
+                details=json.loads(str(row[7])),
+                evidence_hash=str(row[8]),
+            )
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch evidence: {exc}") from exc
+        finally:
+            conn.close()
+
+    def list_evidence(
+        self,
+        *,
+        crossing_id: str | None = None,
+        tier: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[EvidenceRecord]:
+        """List evidence records filtered by crossing_id and/or tier."""
+        conditions: list[str] = []
+        params: list[Any] = []
+        if crossing_id is not None:
+            conditions.append("crossing_id = ?")
+            params.append(crossing_id)
+        if tier is not None:
+            conditions.append("tier = ?")
+            params.append(tier)
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        sql = f"""
+            SELECT evidence_id, crossing_id, tier, trust_domain,
+                   collector, observed_at, expires_at, details_json, evidence_hash
+            FROM evidence_records
+            {where_clause}
+            ORDER BY observed_at DESC, evidence_id DESC
+            LIMIT ? OFFSET ?;
+        """  # noqa: S608
+        params.extend([max(1, limit), max(0, offset)])
+        conn = self._connect()
+        try:
+            rows = conn.execute(sql, params).fetchall()
+            return [
+                EvidenceRecord(
+                    evidence_id=str(r[0]),
+                    crossing_id=str(r[1]),
+                    tier=EvidenceTier(str(r[2])),
+                    trust_domain=str(r[3]),
+                    collector=str(r[4]),
+                    observed_at=str(r[5]),
+                    expires_at=str(r[6]) if r[6] is not None else None,
+                    details=json.loads(str(r[7])),
+                    evidence_hash=str(r[8]),
+                )
+                for r in rows
+            ]
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to list evidence records: {exc}") from exc
+        finally:
+            conn.close()
+
+    def count_evidence(self, *, crossing_id: str | None = None) -> int:
+        """Return total number of stored evidence records, optionally filtered by crossing."""
+        conn = self._connect()
+        try:
+            if crossing_id is not None:
+                cur = conn.execute(
+                    "SELECT COUNT(*) FROM evidence_records WHERE crossing_id = ?;", (crossing_id,)
+                )
+            else:
+                cur = conn.execute("SELECT COUNT(*) FROM evidence_records;")
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to count evidence records: {exc}") from exc
+        finally:
+            conn.close()
+
+    # --- 12. Persistent Session State (Budgets & Taint) ---
+
+    def get_session_usage(self, session_id: str) -> dict[str, int]:
+        """Fetch persisted cumulative session usage."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT actions_count, external_calls_count, write_bytes_count
+                FROM session_budgets
+                WHERE session_id = ? LIMIT 1;
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return {"actions_count": 0, "external_calls_count": 0, "write_bytes_count": 0}
+            return {
+                "actions_count": int(row[0]),
+                "external_calls_count": int(row[1]),
+                "write_bytes_count": int(row[2]),
+            }
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch session usage: {exc}") from exc
+        finally:
+            conn.close()
+
+    def record_session_usage(
+        self,
+        session_id: str,
+        *,
+        delta_actions: int = 0,
+        delta_external: int = 0,
+        delta_bytes: int = 0,
+    ) -> dict[str, int]:
+        """Atomically increment and persist cumulative session usage."""
+        now_ts = utc_now_iso()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            row = conn.execute(
+                """
+                SELECT actions_count, external_calls_count, write_bytes_count
+                FROM session_budgets
+                WHERE session_id = ? LIMIT 1;
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                new_actions = delta_actions
+                new_external = delta_external
+                new_bytes = delta_bytes
+                conn.execute(
+                    """
+                    INSERT INTO session_budgets (
+                        session_id, actions_count, external_calls_count,
+                        write_bytes_count, updated_at
+                    ) VALUES (?, ?, ?, ?, ?);
+                    """,
+                    (session_id, new_actions, new_external, new_bytes, now_ts),
+                )
+            else:
+                new_actions = int(row[0]) + delta_actions
+                new_external = int(row[1]) + delta_external
+                new_bytes = int(row[2]) + delta_bytes
+                conn.execute(
+                    """
+                    UPDATE session_budgets
+                    SET actions_count = ?, external_calls_count = ?,
+                        write_bytes_count = ?, updated_at = ?
+                    WHERE session_id = ?;
+                    """,
+                    (new_actions, new_external, new_bytes, now_ts, session_id),
+                )
+            conn.execute("COMMIT;")
+            return {
+                "actions_count": new_actions,
+                "external_calls_count": new_external,
+                "write_bytes_count": new_bytes,
+            }
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to record session usage: {exc}") from exc
+        finally:
+            conn.close()
+
+    def set_session_taint(self, session_id: str, taint_level: str) -> None:
+        """Persist taint status for a session."""
+        if taint_level not in ("trusted", "untrusted", "unknown"):
+            raise ReceiptError(f"Invalid taint level: {taint_level!r}")
+        now_ts = utc_now_iso()
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO session_taints (session_id, taint_level, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    taint_level = excluded.taint_level,
+                    updated_at = excluded.updated_at;
+                """,
+                (session_id, taint_level, now_ts),
+            )
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to set session taint: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_session_taint(self, session_id: str) -> str | None:
+        """Fetch persisted taint status for a session."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT taint_level FROM session_taints WHERE session_id = ? LIMIT 1;",
+                (session_id,),
+            ).fetchone()
+            return str(row[0]) if row else None
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to get session taint: {exc}") from exc
+        finally:
+            conn.close()
+
+    def list_session_taints(self) -> dict[str, str]:
+        """Return all persisted session taints."""
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT session_id, taint_level FROM session_taints;").fetchall()
+            return {str(r[0]): str(r[1]) for r in rows}
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to list session taints: {exc}") from exc
+        finally:
+            conn.close()
 
 
 def verify_log(

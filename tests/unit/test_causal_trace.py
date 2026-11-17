@@ -439,9 +439,7 @@ def test_causal_trace_http_endpoints(tmp_path: Path) -> None:
     assert len(bundle["causal_links"]) == 1
 
     # 6. DELETE /v1/trace/links/{link_id}
-    del_code, del_resp = _dispatch_handler(
-        services, f"/v1/trace/links/{link_id}", method="DELETE"
-    )
+    del_code, del_resp = _dispatch_handler(services, f"/v1/trace/links/{link_id}", method="DELETE")
     assert del_code == 200
     assert del_resp["deleted"] is True
 

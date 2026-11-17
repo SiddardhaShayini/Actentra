@@ -46,9 +46,7 @@ class AuditSummary:
     items: tuple[CrossingAuditItem, ...] = field(default_factory=tuple)
 
 
-def build_audit_summary(
-    db_path: str | Path, *, verify_envelopes: bool = False
-) -> AuditSummary:
+def build_audit_summary(db_path: str | Path, *, verify_envelopes: bool = False) -> AuditSummary:
     """Analyze an Actentra receipt database and produce an immutable AuditSummary."""
     path = Path(db_path)
     store = ReceiptStore(path)
@@ -136,20 +134,29 @@ def render_html_report(
     status_color = "#10b981" if summary.integrity_ok else "#ef4444"
     status_text = "VERIFIED (TAMPER-EVIDENT OK)" if summary.integrity_ok else "VERIFICATION FAILED"
 
-    verdict_rows = "".join(
-        f"<tr><td><code>{html.escape(k)}</code></td><td><strong>{v}</strong></td></tr>"
-        for k, v in sorted(summary.verdict_counts.items(), key=lambda x: x[1], reverse=True)
-    ) or "<tr><td colspan='2' style='color:#6b7280'>No decisions recorded</td></tr>"
+    verdict_rows = (
+        "".join(
+            f"<tr><td><code>{html.escape(k)}</code></td><td><strong>{v}</strong></td></tr>"
+            for k, v in sorted(summary.verdict_counts.items(), key=lambda x: x[1], reverse=True)
+        )
+        or "<tr><td colspan='2' style='color:#6b7280'>No decisions recorded</td></tr>"
+    )
 
-    risk_rows = "".join(
-        f"<tr><td><span class='badge risk'>{html.escape(k)}</span></td><td>{v}</td></tr>"
-        for k, v in sorted(summary.risk_tag_counts.items(), key=lambda x: x[1], reverse=True)
-    ) or "<tr><td colspan='2' style='color:#6b7280'>No risk tags triggered</td></tr>"
+    risk_rows = (
+        "".join(
+            f"<tr><td><span class='badge risk'>{html.escape(k)}</span></td><td>{v}</td></tr>"
+            for k, v in sorted(summary.risk_tag_counts.items(), key=lambda x: x[1], reverse=True)
+        )
+        or "<tr><td colspan='2' style='color:#6b7280'>No risk tags triggered</td></tr>"
+    )
 
-    rule_rows = "".join(
-        f"<tr><td><code>{html.escape(k)}</code></td><td>{v}</td></tr>"
-        for k, v in sorted(summary.rule_counts.items(), key=lambda x: x[1], reverse=True)
-    ) or "<tr><td colspan='2' style='color:#6b7280'>No rules triggered</td></tr>"
+    rule_rows = (
+        "".join(
+            f"<tr><td><code>{html.escape(k)}</code></td><td>{v}</td></tr>"
+            for k, v in sorted(summary.rule_counts.items(), key=lambda x: x[1], reverse=True)
+        )
+        or "<tr><td colspan='2' style='color:#6b7280'>No rules triggered</td></tr>"
+    )
 
     timeline_rows = []
     for it in summary.items:
@@ -182,7 +189,7 @@ def render_html_report(
                 <td>{out_badge}</td>
                 <td><code>{rule_str}</code></td>
                 <td><small>{reason_str}</small></td>
-                <td>{tags_html or '<span style=\"color:#9ca3af\">none</span>'}</td>
+                <td>{tags_html or '<span style="color:#9ca3af">none</span>'}</td>
                 <td><code title=\"{hash_title}\">{hash_short}</code></td>
             </tr>
             """

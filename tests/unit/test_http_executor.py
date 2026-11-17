@@ -299,4 +299,3 @@ rules:
             fn=executor.execute,
         )
     assert "SecretsBroker is required" in str(exc_info.value)
-

@@ -316,9 +316,7 @@ class ScopedSQLiteTools:
     ) -> dict[str, Any]:
         clean_sql = sql.strip()
         verb = _infer_verb(clean_sql) if clean_sql else "other"
-        resource = (
-            f"{self._executor.resource_id}#{table}" if table else self._executor.resource_id
-        )
+        resource = f"{self._executor.resource_id}#{table}" if table else self._executor.resource_id
         result: dict[str, Any] = self._boundary.execute(
             tool="sql.execute",
             verb=verb,

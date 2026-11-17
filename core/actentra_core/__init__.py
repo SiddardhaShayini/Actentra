@@ -45,6 +45,13 @@ from actentra_core.envelope import (
     compute_action_hash,
     generate_crossing_id,
 )
+from actentra_core.evidence import (
+    EvidenceError,
+    EvidenceRecord,
+    EvidenceTier,
+    build_evidence_record,
+    compute_evidence_hash,
+)
 from actentra_core.handoffs import (
     ContradictionDetectedError,
     ExpiredHandoffError,
@@ -54,6 +61,13 @@ from actentra_core.handoffs import (
     build_handoff,
     compute_handoff_hash,
     generate_handoff_id,
+)
+from actentra_core.identity import (
+    CallerContext,
+    IdentitySecurityError,
+    PrincipalType,
+    make_local_caller_context,
+    resolve_http_caller_context,
 )
 from actentra_core.observations import (
     ObservationError,
@@ -121,7 +135,13 @@ __all__ = [
     "CycleDetectedError",
     "Decision",
     "EnvelopeError",
+    "EvidenceError",
+    "EvidenceRecord",
+    "EvidenceTier",
     "ExpiredHandoffError",
+    "CallerContext",
+    "IdentitySecurityError",
+    "PrincipalType",
     "GENESIS_HASH",
     "HandoffError",
     "IntentInfo",
@@ -152,6 +172,7 @@ __all__ = [
     "build_audit_summary",
     "build_causal_trace",
     "build_envelope",
+    "build_evidence_record",
     "build_handoff",
     "build_observation",
     "canonicalize_json",
@@ -159,6 +180,7 @@ __all__ = [
     "canonicalize_unicode",
     "canonicalize_windows_path",
     "compute_action_hash",
+    "compute_evidence_hash",
     "compute_handoff_hash",
     "compute_key_id",
     "compute_observation_hash",
@@ -176,9 +198,11 @@ __all__ = [
     "load_checkpoint",
     "load_policy_file",
     "load_policy_yaml",
+    "make_local_caller_context",
     "match_resource_pattern",
     "parse_policy_dict",
     "render_html_report",
+    "resolve_http_caller_context",
     "run_policy_canary",
     "sign_checkpoint",
     "verify_checkpoint",

@@ -208,4 +208,3 @@ def test_cli_verify_and_archive_commands(tmp_path: Path) -> None:
     assert res_a.exit_code == 0
     assert "Archived 2 record(s)" in res_a.output
     assert len(store.iter_records()) == 0
-
