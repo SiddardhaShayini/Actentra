@@ -58,6 +58,7 @@ from actentra_executors.verifiers import WorkspaceFileVerifier
 from actentra_gateway.demo import run_gateway_demonstration, run_handoff_demonstration
 from actentra_gateway.http_service import serve_http
 from actentra_gateway.mcp_proxy import serve_stdio
+from actentra_gateway.multi_agent_realtime_sim import run_realtime_multiagent_simulation
 from actentra_gateway.services import AppServices, ExecutorRegistry
 
 app = typer.Typer(
@@ -579,6 +580,14 @@ def demo(
             help="Run full Phase 4 cross-agent continuity and handoff demonstration.",
         ),
     ] = False,
+    realtime: Annotated[
+        bool,
+        typer.Option(
+            "--realtime",
+            "-r",
+            help="Run real-time multi-agent concurrent boundary simulation.",
+        ),
+    ] = False,
 ) -> None:
     """Run a self-contained local demo showing allow, block, and receipt verification."""
     if gateway:
@@ -586,6 +595,9 @@ def demo(
         return
     if handoff:
         run_handoff_demonstration(echo_fn=typer.echo)
+        return
+    if realtime:
+        run_realtime_multiagent_simulation(echo_fn=typer.echo)
         return
 
     policy = load_policy_yaml(_DEFAULT_STARTER_POLICY)
@@ -670,6 +682,30 @@ def demo_handoff_cmd(
     run_handoff_demonstration(
         workspace_root=workspace,
         db_file=db_path,
+        echo_fn=typer.echo,
+    )
+
+
+@app.command("demo-realtime")
+def demo_realtime_cmd(
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Custom workspace directory for demo fixtures."),
+    ] = None,
+    db_path: Annotated[
+        Path | None,
+        typer.Option("--db", help="Path to SQLite receipt database."),
+    ] = None,
+    cycles: Annotated[
+        int,
+        typer.Option("--cycles", "-c", help="Number of operational cycles per agent."),
+    ] = 5,
+) -> None:
+    """Run real-time concurrent multi-agent simulation with leases and verifications."""
+    run_realtime_multiagent_simulation(
+        workspace_root=workspace,
+        db_file=db_path,
+        num_cycles=cycles,
         echo_fn=typer.echo,
     )
 

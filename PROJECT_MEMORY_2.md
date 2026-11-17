@@ -281,3 +281,24 @@ This guidance does not imply that Actentra’s authorization or first demonstrat
   * Full test suite: 163 passed, 4 skipped in 8.61s (`pytest`).
   * Code quality: 0 errors on `ruff check` and `ruff format --check`.
   * Type safety: 0 issues on `mypy` across all 38 source and test files.
+
+### 2026-11-17 17:25 IST
+
+- Implemented Real-Time Concurrent Multi-Agent Simulation Engine & Integration Verification:
+  * Created `gateway/actentra_gateway/multi_agent_realtime_sim.py`: A live multi-threaded concurrent simulation engine executing 4 distinct autonomous agents simultaneously against a shared workspace and SQLite WAL database:
+    1. `agent_ingest`: Concurrently acquires exclusive leases on batch files, writes data with automatic postcondition verification, and releases leases.
+    2. `agent_transform`: Concurrently attempts competing writes (verifying active lease locking blocks concurrent mutations in real time), waits for release, acquires output lease, reads input, writes transformed output with postconditions, and creates causal links.
+    3. `agent_auditor`: Concurrently runs non-blocking state verifications on the workspace in real time, validating file digests, freshness, and generating `externally_verified` evidence records.
+    4. `agent_adversary`: Concurrently attempts sensitive path escapes (`.env.secret`), violating lease boundaries, and executing untrusted network egress, verifying that Actentra's deterministic boundary fails closed in real time under concurrent load.
+  * Added CLI support:
+    - `actentra demo --realtime` (`-r` flag) dispatching the live multi-agent simulation.
+    - `actentra demo-realtime` command accepting `--workspace`, `--db`, and `--cycles` options.
+  * Added unit test suite `tests/unit/test_realtime_multiagent.py`:
+    - Direct simulation verification (`test_realtime_multiagent_simulation_direct`): 4 concurrent agent threads, active conflict prevention, fail-closed adversary blocking, postconditions, and unbroken SQLite WAL hash-chain integrity.
+    - CLI command execution tests (`test_realtime_multiagent_cli_command`, `test_demo_with_realtime_flag`).
+  * Updated `docs/product-status.md` with the new capability and invariant matrix entries.
+- Validation:
+  * Full test suite: **166 passed, 4 skipped in 33.73s** (`.venv\Scripts\pytest.exe`).
+  * Code formatting & linting: 0 errors on `ruff check` and `ruff format --check`.
+  * Static type checking: 0 errors on `mypy` across all 39 source and test files.
+  * Live multi-agent benchmark: 20 operations across 4 concurrent threads executed in 0.45s with 48 receipts logged, 2 lease conflicts prevented, 10 security policy denials, 25 postconditions verified, and 100% WAL hash-chain verification (`ok=True`).
