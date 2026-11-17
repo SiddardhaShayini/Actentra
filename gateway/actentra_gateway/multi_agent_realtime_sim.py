@@ -165,6 +165,10 @@ def run_realtime_multiagent_simulation(
     start_barrier = threading.Barrier(4)
     sim_start_time = time.time()
 
+    # Synchronization events ensuring deterministic conflict detection across thread scheduling
+    ingest_holding_lease = [threading.Event() for _ in range(num_cycles)]
+    conflict_checked = [threading.Event() for _ in range(num_cycles)]
+
     # --- Agent 1: Ingest Agent Thread ---
     def _ingest_worker() -> None:
         st = stats["ingest_agent"]
@@ -185,6 +189,7 @@ def run_realtime_multiagent_simulation(
             try:
                 # 1. Acquire exclusive lease on file
                 lease = b.acquire_lease(res_str, mode="exclusive", ttl_seconds=30.0)
+                ingest_holding_lease[i].set()
                 # 2. Perform write with automatic postcondition verification
                 content = f'{{"batch_id": {i}, "records": 100, "status": "raw"}}'
 
@@ -207,12 +212,13 @@ def run_realtime_multiagent_simulation(
                 )
                 st.operations_succeeded += 1
                 st.postconditions_verified += 1
-                # Small jitter while holding lease so competing agents observe the lock
-                time.sleep(0.04)
+                # Wait for transform agent to test competing write while lease is held
+                conflict_checked[i].wait(timeout=1.0)
                 # 3. Release lease
                 b.release_lease(lease.lease_id)
             except Exception as exc:
                 st.errors.append(f"Ingest cycle {i} error: {exc}")
+                ingest_holding_lease[i].set()
 
     # --- Agent 2: Transform Agent Thread ---
     def _transform_worker() -> None:
@@ -232,24 +238,27 @@ def run_realtime_multiagent_simulation(
             in_res = f"path:{canonicalize_windows_path(str(in_file))}"
             out_res = f"path:{canonicalize_windows_path(str(out_file))}"
 
-            # Step A: Attempt a competing write to the input file while ingest may hold it
-            try:
-                b.execute(
-                    tool="fs.write",
-                    verb="write",
-                    resource=in_res,
-                    fn=lambda env, dec: None,
-                )
-            except ActionBlockedError as exc:
-                if exc.decision.rule_id == "coordination:resource-locked":
-                    # Conflict successfully detected and prevented!
-                    st.conflicts_encountered += 1
-            except Exception as exc:
-                st.errors.append(f"Unexpected conflict error: {exc}")
+            # Step A: Wait for ingest agent to acquire lease, then attempt competing write
+            if ingest_holding_lease[i].wait(timeout=2.0):
+                try:
+                    b.execute(
+                        tool="fs.write",
+                        verb="write",
+                        resource=in_res,
+                        fn=lambda _env, _dec: None,
+                    )
+                except ActionBlockedError as exc:
+                    if exc.decision.rule_id == "coordination:resource-locked":
+                        # Conflict successfully detected and prevented!
+                        st.conflicts_encountered += 1
+                except Exception as exc:
+                    st.errors.append(f"Unexpected conflict error: {exc}")
+                finally:
+                    conflict_checked[i].set()
 
             # Step B: Wait for file to become available and transformed
             retries = 0
-            while not in_file.exists() and retries < 20:
+            while not in_file.exists() and retries < 50:
                 time.sleep(0.02)
                 retries += 1
 
