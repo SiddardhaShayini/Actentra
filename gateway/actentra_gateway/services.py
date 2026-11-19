@@ -163,7 +163,11 @@ class AppServices:
     ) -> dict[str, Any]:
         """Propose, canonicalize, evaluate, and conditionally execute an action."""
         # Enforce authenticated identity and principal constraints (Stage 0 Task 2)
-        agent_id_claim = str(data.get("agent_id", "http-client"))
+        raw_agent = data.get("agent_id")
+        if caller_context is not None and caller_context.authenticated and raw_agent is None:
+            agent_id_claim = caller_context.principal_id
+        else:
+            agent_id_claim = str(raw_agent or "http-client")
         prov_raw = data.get("provenance", [])
         claimed_trust = None
         if isinstance(prov_raw, list):
@@ -179,9 +183,34 @@ class AppServices:
                 return {
                     "verdict": Verdict.DENY.value,
                     "error": str(exc),
+                    "code": "unauthorized_principal",
                     "rule_id": "identity:unauthorized-principal",
                     "canonical_hash": "sha256:" + ("0" * 64),
                     "risk_tags": ["spoofing-attempt"],
+                }
+            if not caller_context.has_scope("crossings:propose"):
+                return {
+                    "verdict": Verdict.DENY.value,
+                    "error": (
+                        f"Caller '{caller_context.principal_id}' lacks "
+                        "scope 'crossings:propose'"
+                    ),
+                    "code": "unauthorized_principal",
+                    "rule_id": "identity:scope-denied",
+                    "canonical_hash": "sha256:" + ("0" * 64),
+                    "risk_tags": ["unauthorized-action"],
+                }
+            if execute and not caller_context.has_scope("crossings:execute"):
+                return {
+                    "verdict": Verdict.DENY.value,
+                    "error": (
+                        f"Caller '{caller_context.principal_id}' lacks "
+                        "scope 'crossings:execute'"
+                    ),
+                    "code": "unauthorized_principal",
+                    "rule_id": "identity:scope-denied",
+                    "canonical_hash": "sha256:" + ("0" * 64),
+                    "risk_tags": ["unauthorized-action"],
                 }
 
         session_id = str(data.get("session_id", "default")).strip() or "default"
@@ -212,7 +241,7 @@ class AppServices:
                 resource=str(data.get("resource", "")),
                 params=data.get("params") or {},
                 session_id=session_id,
-                agent_id=str(data.get("agent_id", "http-client")),
+                agent_id=agent_id_claim,
                 provenance=prov_items,
                 user_goal=data.get("user_goal"),
                 idempotency_key=data.get("idempotency_key"),
@@ -398,8 +427,24 @@ class AppServices:
         *,
         approved: bool,
         execute: bool = False,
+        caller_context: CallerContext | None = None,
     ) -> dict[str, Any]:
         """Resolve a pending crossing (approve or deny) with optional execution dispatch."""
+        if caller_context is not None:
+            if not caller_context.is_approver:
+                return {
+                    "error": (
+                        f"Principal '{caller_context.principal_id}' is not authorized to "
+                        "resolve approvals"
+                    )
+                }
+            if execute and not caller_context.has_scope("crossings:execute"):
+                return {
+                    "error": (
+                        f"Principal '{caller_context.principal_id}' lacks 'crossings:execute' scope"
+                    )
+                }
+
         res = self.boundary.receipt_store.resolve_pending_approval(crossing_id, approved=approved)
         if res is None:
             return {
@@ -419,12 +464,17 @@ class AppServices:
         }
 
         if approved and execute:
-            exec_res = self.execute_approved_crossing(crossing_id)
+            exec_res = self.execute_approved_crossing(crossing_id, caller_context=caller_context)
             resp["execution"] = exec_res
 
         return resp
 
-    def execute_approved_crossing(self, crossing_id: str) -> dict[str, Any]:
+    def execute_approved_crossing(
+        self,
+        crossing_id: str,
+        *,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any]:
         """Execute a previously approved crossing through registered executor."""
         p = self.boundary.receipt_store.get_pending_approval(crossing_id)
         if p is None:
@@ -442,6 +492,24 @@ class AppServices:
 
         action_data = raw_env.get("action") or {}
         agent_data = raw_env.get("agent") or {}
+
+        if caller_context is not None:
+            if not caller_context.has_scope("crossings:execute"):
+                return {
+                    "error": (
+                        f"Principal '{caller_context.principal_id}' lacks "
+                        "'crossings:execute' scope"
+                    )
+                }
+            if caller_context.authenticated and not caller_context.is_trusted_operator:
+                env_agent_id = str(agent_data.get("id", ""))
+                if env_agent_id and not caller_context.is_agent_allowed(env_agent_id):
+                    return {
+                        "error": (
+                            f"Principal '{caller_context.principal_id}' is not authorized to "
+                            f"execute crossing for agent '{env_agent_id}'"
+                        )
+                    }
         prov_items = [
             ProvenanceItem(source=item["source"], trust=item["trust"])
             for item in raw_env.get("provenance", [])
@@ -967,8 +1035,20 @@ class AppServices:
         prior_observations: list[str] | tuple[str, ...] = (),
         assertions: dict[str, Any] | None = None,
         ttl_seconds: float = 3600.0,
+        caller_context: CallerContext | None = None,
     ) -> dict[str, Any]:
         """Create a durable cross-agent task handoff record."""
+        if caller_context is not None:
+            if not caller_context.has_scope("handoffs:create"):
+                raise UnauthorizedAgentHandoffError(
+                    f"Principal '{caller_context.principal_id}' lacks 'handoffs:create' scope"
+                )
+            if not caller_context.is_agent_allowed(initiator_agent_id):
+                raise UnauthorizedAgentHandoffError(
+                    f"Principal '{caller_context.principal_id}' is not authorized to "
+                    f"initiate handoff as '{initiator_agent_id}'"
+                )
+
         handoff = build_handoff(
             task_id=task_id,
             initiator_agent_id=initiator_agent_id,
@@ -1020,11 +1100,23 @@ class AppServices:
         allowed_verbs: list[str] | tuple[str, ...] | None = None,
         allowed_resources: list[str] | tuple[str, ...] | None = None,
         ttl_seconds: float = 3600.0,
+        caller_context: CallerContext | None = None,
     ) -> dict[str, Any]:
         """Advance handoff to the next agent in the task workflow."""
         current = self.boundary.receipt_store.get_handoff(handoff_id)
         if current is None:
             raise HandoffError(f"Handoff '{handoff_id}' not found")
+
+        if caller_context is not None:
+            if not caller_context.has_scope("handoffs:advance"):
+                raise UnauthorizedAgentHandoffError(
+                    f"Principal '{caller_context.principal_id}' lacks 'handoffs:advance' scope"
+                )
+            if not caller_context.is_agent_allowed(caller_agent_id):
+                raise UnauthorizedAgentHandoffError(
+                    f"Principal '{caller_context.principal_id}' is not authorized to "
+                    f"advance handoff as '{caller_agent_id}'"
+                )
 
         current.validate_caller(caller_agent_id)
         self.boundary.receipt_store.update_handoff_status(handoff_id, "completed")
@@ -1078,11 +1170,23 @@ class AppServices:
         handoff_id: str,
         *,
         verifier_agent_id: str,
+        caller_context: CallerContext | None = None,
     ) -> dict[str, Any]:
         """Perform independent verification of handoff assertions using configured verifiers."""
         hnd = self.boundary.receipt_store.get_handoff(handoff_id)
         if hnd is None:
             raise HandoffError(f"Handoff '{handoff_id}' not found")
+
+        if caller_context is not None:
+            if not caller_context.has_scope("handoffs:verify"):
+                raise UnauthorizedAgentHandoffError(
+                    f"Principal '{caller_context.principal_id}' lacks 'handoffs:verify' scope"
+                )
+            if not caller_context.is_agent_allowed(verifier_agent_id):
+                raise UnauthorizedAgentHandoffError(
+                    f"Principal '{caller_context.principal_id}' is not authorized to "
+                    f"verify handoff as '{verifier_agent_id}'"
+                )
 
         if verifier_agent_id != hnd.verifier_agent_id:
             raise UnauthorizedAgentHandoffError(
@@ -1162,8 +1266,27 @@ class AppServices:
         mode: LeaseMode = "exclusive",
         ttl_seconds: float = 60.0,
         metadata: dict[str, Any] | None = None,
+        caller_context: CallerContext | None = None,
     ) -> dict[str, Any]:
         """Acquire a durable resource lease for an agent."""
+        if caller_context is not None:
+            if not caller_context.has_scope("leases:acquire"):
+                return {
+                    "status": "error",
+                    "error": (
+                        f"Principal '{caller_context.principal_id}' lacks "
+                        "'leases:acquire' scope"
+                    ),
+                }
+            if not caller_context.is_agent_allowed(owner_agent_id):
+                return {
+                    "status": "error",
+                    "error": (
+                        f"Principal '{caller_context.principal_id}' is not authorized to "
+                        f"acquire lease for '{owner_agent_id}'"
+                    ),
+                }
+
         try:
             lease = build_lease(
                 resource=resource,
@@ -1185,10 +1308,38 @@ class AppServices:
         lease_id: str,
         *,
         owner_agent_id: str | None = None,
+        caller_context: CallerContext | None = None,
     ) -> dict[str, Any]:
         """Release an acquired resource lease."""
+        if not owner_agent_id or not str(owner_agent_id).strip():
+            return {
+                "status": "not_found_or_unauthorized",
+                "released": False,
+                "error": "owner_agent_id is required to release lease",
+            }
+
+        if caller_context is not None:
+            if not caller_context.has_scope("leases:release"):
+                return {
+                    "status": "not_found_or_unauthorized",
+                    "released": False,
+                    "error": (
+                        f"Principal '{caller_context.principal_id}' lacks "
+                        "'leases:release' scope"
+                    ),
+                }
+            if not caller_context.is_agent_allowed(owner_agent_id):
+                return {
+                    "status": "not_found_or_unauthorized",
+                    "released": False,
+                    "error": (
+                        f"Principal '{caller_context.principal_id}' is not authorized to "
+                        f"release lease owned by '{owner_agent_id}'"
+                    ),
+                }
+
         released = self.boundary.receipt_store.release_lease(
-            lease_id, owner_agent_id=owner_agent_id
+            lease_id, owner_agent_id=str(owner_agent_id)
         )
         if not released:
             return {"status": "not_found_or_unauthorized", "released": False}

@@ -2307,6 +2307,9 @@ class ReceiptStore:
         owner_agent_id: str | None = None,
     ) -> bool:
         """Release an active lease. Returns True if released, False if not found/unauthorized."""
+        if owner_agent_id is None or not str(owner_agent_id).strip():
+            return False
+
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
@@ -2317,7 +2320,7 @@ class ReceiptStore:
             if not row:
                 conn.execute("ROLLBACK;")
                 return False
-            if owner_agent_id is not None and str(row[0]) != owner_agent_id:
+            if str(row[0]) != str(owner_agent_id):
                 conn.execute("ROLLBACK;")
                 return False
             conn.execute(

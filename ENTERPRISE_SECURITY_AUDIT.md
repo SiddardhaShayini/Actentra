@@ -19,26 +19,28 @@ Passing tests are treated as evidence for tested behavior, not proof of complete
 
 ## Confirmed findings
 
-| Priority | Severity | Evidence | Impact |
-|---|---|---|---|
-| P0 | HIGH | HTTP identity is caller-asserted | Cross-agent impersonation, lease/handoff misuse |
-| P0 | HIGH | HTTP DNS validation does not pin the connection peer | Public-to-private DNS rebinding/SSRF |
-| P1 | MEDIUM | Warrant use counters are process-local and evictable | Replay beyond `max_uses` after restart/eviction |
-| P1 | MEDIUM | Success receipt is recorded before postcondition verification | False success claims survive failed state verification |
-| P1 | MEDIUM | External outcome API accepts caller-reported success | Fabricated outcomes, budgets, and evidence |
+| Priority | Severity | Evidence | Impact | Status |
+|---|---|---|---|---|
+| P0 | HIGH | HTTP identity is caller-asserted | Cross-agent impersonation, lease/handoff misuse | **REMEDIATED** |
+| P0 | HIGH | HTTP DNS validation does not pin the connection peer | Public-to-private DNS rebinding/SSRF | Open |
+| P1 | MEDIUM | Warrant use counters are process-local and evictable | Replay beyond `max_uses` after restart/eviction | Open |
+| P1 | MEDIUM | Success receipt is recorded before postcondition verification | False success claims survive failed state verification | Open |
+| P1 | MEDIUM | External outcome API accepts caller-reported success | Fabricated outcomes, budgets, and evidence | Open |
 
 ### F-1. Gateway caller identity is not bound to authentication
 
 **Severity:** HIGH  
+**Status:** REMEDIATED  
+**Remediation Commit:** Finding 01 Security Hardening  
 **Affected source:** `gateway/actentra_gateway/http_service.py:623-685,748-792`; `gateway/actentra_gateway/services.py:161-177`; `core/actentra_core/identity.py:54-129`
 
-**Attack preconditions:**
+**Attack preconditions (Original):**
 
 - Network reachability to the gateway.
 - Loopback mode: no bearer token is required.
 - Remote mode: possession of the configured bearer token, or token is shared among agents.
 
-**Reproduction:**
+**Reproduction (Original):**
 
 1. Create a handoff assigned to `agent-A`.
 2. Send `/v1/handoffs/<id>/advance` with `caller_agent_id: "agent-A"` while authenticated as a different principal.
@@ -48,16 +50,22 @@ Passing tests are treated as evidence for tested behavior, not proof of complete
 
 **Actual impact:** Agent identity spoofing, unauthorized handoff advancement/verification, lease blocking, and unauthorized lease release.
 
-**Remediation:**
+**Remediation Implemented:**
 
-- Introduce authenticated principal identities derived from mTLS/OIDC/API credential, not request JSON.
-- Map principals to allowed agent/delegated-agent identities.
-- Reject conflicting identity claims.
-- Require owner/verifier/caller identity equality against the authenticated principal.
-- Remove owner-optional lease release behavior.
-- Add policy scopes for each gateway operation.
+- Hardened `CallerContext` in `core/actentra_core/identity.py` to establish granular `PrincipalType` (`AUTHENTICATED_AGENT`, `HUMAN_APPROVER`, `AUTHENTICATED_OPERATOR`, `LOCAL_PROCESS`), permission `scopes`, explicit `allowed_agents` mapping, and optional `delegated_by` provenance.
+- Updated `resolve_http_caller_context` to validate bearer tokens against per-principal credential configurations (`token_principals` mapping or structured credentials `agent:<id>`, `approver:<id>`, `operator:<id>`).
+- Enforced strict conflict checking between caller headers (`X-Actentra-Identity`) and authenticated credentials, raising `IdentitySecurityError` on mismatch.
+- Bound caller context across all mutating and sensitive endpoints in `gateway/actentra_gateway/http_service.py` and `services.py`:
+  - `/v1/crossings`: authenticated agents can only propose/execute actions within their authorized agent identity or explicit delegation; caller-controlled `agent_id` overrides for arbitrary agents return HTTP 403 `unauthorized_principal`.
+  - `/v1/crossings/{id}/approve`: restricted strictly to authenticated human approvers and operators with `crossings:approve` scope.
+  - `/v1/handoffs`: initiating a handoff requires verified authority over `initiator_agent_id`.
+  - `/v1/handoffs/{id}/advance`: caller must hold `handoffs:advance` scope and possess verified authority as the assigned agent or authorized delegate.
+  - `/v1/handoffs/{id}/verify`: caller must hold `handoffs:verify` scope and possess verified authority as the designated verifier agent.
+  - `/v1/leases`: lease acquisition requires `leases:acquire` scope and verified authority as `owner_agent_id`.
+  - `/v1/leases/{id}/release`: release requires `leases:release` scope and mandatory matching `owner_agent_id`; `ReceiptStore.release_lease()` strictly rejects `None` or blank owner IDs, failing closed.
+  - `/v1/freeze` and `/v1/unfreeze`: restricted to authenticated operators with admin scopes.
 
-**Regression test:** Authenticate as `agent-B`; attempt all handoff, lease, approval, and crossing operations against `agent-A`; assert denial and no state mutation.
+**Regression tests:** Added comprehensive test suite in `tests/unit/test_security_finding_01_identity.py` (10 passing tests verifying crossing identity spoofing, header conflicts, unauthorized handoffs, lease operations, privilege escalation, delegated authority, and thread-safe concurrent principal isolation).
 
 ### F-2. HTTP executor DNS rebinding/SSRF bypass
 

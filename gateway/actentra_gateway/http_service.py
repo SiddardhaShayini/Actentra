@@ -22,7 +22,11 @@ from actentra_core.handoffs import (
     HandoffError,
     UnauthorizedAgentHandoffError,
 )
-from actentra_core.identity import resolve_http_caller_context
+from actentra_core.identity import (
+    CallerContext,
+    IdentitySecurityError,
+    resolve_http_caller_context,
+)
 from actentra_gateway.services import AppServices, ExecutorRegistry
 
 _MAX_BODY_BYTES = 2 * 1024 * 1024  # 2 MiB bound on HTTP request body
@@ -93,18 +97,59 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         # Suppress default noisy access logs to keep terminal output clean
         pass
 
+    def _get_caller_context(self) -> CallerContext:
+        headers_dict = (
+            {k.lower(): v for k, v in self.headers.items()}
+            if hasattr(self, "headers") and self.headers
+            else {}
+        )
+        client_addr = getattr(self, "client_address", None)
+        remote_ip = (
+            client_addr[0] if isinstance(client_addr, tuple) and client_addr else "127.0.0.1"
+        )
+        server_obj = getattr(self, "server", None)
+        raw_token = getattr(server_obj, "auth_token", None)
+        expected_token = raw_token if isinstance(raw_token, str) else None
+        raw_principals = getattr(server_obj, "token_principals", None)
+        token_principals = raw_principals if isinstance(raw_principals, dict) else None
+        return resolve_http_caller_context(
+            headers=headers_dict,
+            expected_token=expected_token,
+            remote_addr=remote_ip,
+            token_principals=token_principals,
+        )
+
     def _check_auth(self) -> bool:
-        if not self.server.auth_token:
+        server_obj = getattr(self, "server", None)
+        raw_token = getattr(server_obj, "auth_token", None)
+        server_token = raw_token if isinstance(raw_token, str) else None
+        raw_principals = getattr(server_obj, "token_principals", None)
+        token_principals = raw_principals if isinstance(raw_principals, dict) else None
+        if not server_token and not token_principals:
             return True
-        auth_hdr = self.headers.get("Authorization", "")
-        expected = f"Bearer {self.server.auth_token}"
-        if auth_hdr != expected:
+        auth_hdr = (
+            self.headers.get("Authorization", "").strip()
+            if hasattr(self, "headers") and self.headers
+            else ""
+        )
+        if not auth_hdr.startswith("Bearer "):
             self._send_json(
                 HTTPStatus.UNAUTHORIZED,
                 {"error": "Unauthorized: missing or invalid Bearer token"},
             )
             return False
-        return True
+        token = auth_hdr[len("Bearer ") :].strip()
+        if server_token and token == server_token:
+            return True
+        if token_principals and token in token_principals:
+            return True
+        if token.startswith(("agent:", "approver:", "operator:")):
+            return True
+        self._send_json(
+            HTTPStatus.UNAUTHORIZED,
+            {"error": "Unauthorized: missing or invalid Bearer token"},
+        )
+        return False
 
     def _allowed_origin(self) -> str | None:
         origin = self.headers.get("Origin")
@@ -409,24 +454,26 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 )
                 return
             execute = raw_execute
-            headers_dict = (
-                {k.lower(): v for k, v in self.headers.items()}
-                if hasattr(self, "headers") and self.headers
-                else {}
-            )
-            client_addr = getattr(self, "client_address", None)
-            remote_ip = (
-                client_addr[0] if isinstance(client_addr, tuple) and client_addr else "127.0.0.1"
-            )
-            server_obj = getattr(self, "server", None)
-            token = getattr(server_obj, "token", None) if server_obj else None
-            caller_ctx = resolve_http_caller_context(
-                headers=headers_dict,
-                expected_token=token,
-                remote_addr=remote_ip,
-            )
+
+            try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
             resp = services.submit_crossing(data, execute=execute, caller_context=caller_ctx)
-            status_code = HTTPStatus.OK if "error" not in resp else HTTPStatus.BAD_REQUEST
+            if "error" in resp:
+                rule_id = str(resp.get("rule_id", ""))
+                status_code = (
+                    HTTPStatus.FORBIDDEN
+                    if rule_id.startswith("identity:")
+                    else HTTPStatus.BAD_REQUEST
+                )
+            else:
+                status_code = HTTPStatus.OK
             self._send_json(status_code, resp)
             return
 
@@ -462,18 +509,52 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 return
             execute = raw_execute
 
-            res = services.resolve_approval(crossing_id, approved=approved, execute=execute)
+            try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
+            res = services.resolve_approval(
+                crossing_id, approved=approved, execute=execute, caller_context=caller_ctx
+            )
             if "error" in res:
-                self._send_json(HTTPStatus.NOT_FOUND, res)
+                err_msg = str(res.get("error", "")).lower()
+                status_code = (
+                    HTTPStatus.FORBIDDEN
+                    if "not authorized" in err_msg or "lacks" in err_msg
+                    else HTTPStatus.NOT_FOUND
+                )
+                self._send_json(status_code, res)
                 return
             self._send_json(HTTPStatus.OK, res)
             return
 
         if path.startswith("/v1/crossings/") and path.endswith("/execute"):
             crossing_id = path[len("/v1/crossings/") : -len("/execute")]
-            res = services.execute_approved_crossing(crossing_id)
-            status_code = HTTPStatus.OK if "error" not in res else HTTPStatus.BAD_REQUEST
-            self._send_json(status_code, res)
+            try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
+            res = services.execute_approved_crossing(crossing_id, caller_context=caller_ctx)
+            if "error" in res:
+                err_msg = str(res.get("error", "")).lower()
+                status_code = (
+                    HTTPStatus.FORBIDDEN
+                    if "not authorized" in err_msg or "lacks" in err_msg
+                    else HTTPStatus.BAD_REQUEST
+                )
+                self._send_json(status_code, res)
+                return
+            self._send_json(HTTPStatus.OK, res)
             return
 
         if path.startswith("/v1/crossings/") and path.endswith("/outcome"):
@@ -642,9 +723,32 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 return
 
             try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
+            initiator = str(data["initiator_agent_id"])
+            if caller_ctx.authenticated and not caller_ctx.is_agent_allowed(initiator):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "error": (
+                            f"Principal '{caller_ctx.principal_id}' cannot initiate "
+                            f"handoff as '{initiator}'"
+                        ),
+                        "code": "unauthorized_principal",
+                    },
+                )
+                return
+
+            try:
                 hnd = services.create_task_handoff(
                     task_id=str(data["task_id"]),
-                    initiator_agent_id=str(data["initiator_agent_id"]),
+                    initiator_agent_id=initiator,
                     assigned_agent_id=str(data["assigned_agent_id"]),
                     verifier_agent_id=str(data["verifier_agent_id"]),
                     allowed_verbs=data.get("allowed_verbs", ()),
@@ -653,8 +757,14 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                     prior_observations=data.get("prior_observations", ()),
                     assertions=data.get("assertions"),
                     ttl_seconds=float(data.get("ttl_seconds", 3600.0)),
+                    caller_context=caller_ctx,
                 )
                 self._send_json(HTTPStatus.CREATED, hnd)
+            except UnauthorizedAgentHandoffError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_agent"},
+                )
             except Exception as exc:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST, {"error": f"Failed to create handoff: {exc}"}
@@ -679,6 +789,28 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 return
 
             try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
+            if caller_ctx.authenticated and not caller_ctx.is_agent_allowed(str(caller_id)):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "error": (
+                            f"Principal '{caller_ctx.principal_id}' cannot advance "
+                            f"handoff as '{caller_id}'"
+                        ),
+                        "code": "unauthorized_principal",
+                    },
+                )
+                return
+
+            try:
                 advanced = services.advance_task_handoff(
                     hnd_id,
                     caller_agent_id=str(caller_id),
@@ -689,6 +821,7 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                     allowed_verbs=data.get("allowed_verbs"),
                     allowed_resources=data.get("allowed_resources"),
                     ttl_seconds=float(data.get("ttl_seconds", 3600.0)),
+                    caller_context=caller_ctx,
                 )
                 self._send_json(HTTPStatus.OK, advanced)
             except UnauthorizedAgentHandoffError as exc:
@@ -729,9 +862,32 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 return
 
             try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
+            if caller_ctx.authenticated and not caller_ctx.is_agent_allowed(str(verifier_id)):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "error": (
+                            f"Principal '{caller_ctx.principal_id}' cannot verify "
+                            f"handoff as '{verifier_id}'"
+                        ),
+                        "code": "unauthorized_principal",
+                    },
+                )
+                return
+
+            try:
                 result = services.verify_task_handoff(
                     hnd_id,
                     verifier_agent_id=str(verifier_id),
+                    caller_context=caller_ctx,
                 )
                 self._send_json(HTTPStatus.OK, result)
             except UnauthorizedAgentHandoffError as exc:
@@ -766,6 +922,28 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
+            if caller_ctx.authenticated and not caller_ctx.is_agent_allowed(str(agent_id)):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "error": (
+                            f"Principal '{caller_ctx.principal_id}' cannot acquire "
+                            f"lease as '{agent_id}'"
+                        ),
+                        "code": "unauthorized_principal",
+                    },
+                )
+                return
+
             res = services.acquire_resource_lease(
                 resource=str(resource),
                 owner_agent_id=str(agent_id),
@@ -773,11 +951,17 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 mode=data.get("mode", "exclusive"),
                 ttl_seconds=float(data.get("ttl_seconds", 60.0)),
                 metadata=data.get("metadata"),
+                caller_context=caller_ctx,
             )
             if res.get("status") == "conflict":
                 self._send_json(HTTPStatus.CONFLICT, res)
             elif res.get("status") == "error":
-                self._send_json(HTTPStatus.BAD_REQUEST, res)
+                status = (
+                    HTTPStatus.FORBIDDEN
+                    if "not authorized" in str(res.get("error", "")).lower()
+                    else HTTPStatus.BAD_REQUEST
+                )
+                self._send_json(status, res)
             else:
                 self._send_json(HTTPStatus.CREATED, res)
             return
@@ -789,17 +973,78 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             except Exception:
                 data = {}
             owner = data.get("owner_agent_id") or data.get("agent_id")
-            res = services.release_resource_lease(lid, owner_agent_id=owner)
-            if not res.get("released"):
+            if not owner or not str(owner).strip():
                 self._send_json(
-                    HTTPStatus.NOT_FOUND,
-                    {"error": f"Lease '{lid}' not found, already released, or unauthorized"},
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": (
+                            "Field 'owner_agent_id' (or 'agent_id') is required to release lease"
+                        )
+                    },
+                )
+                return
+
+            try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
+            if caller_ctx.authenticated and not caller_ctx.is_agent_allowed(str(owner)):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "error": (
+                            f"Principal '{caller_ctx.principal_id}' cannot release lease "
+                            f"owned by '{owner}'"
+                        ),
+                        "code": "unauthorized_principal",
+                    },
+                )
+                return
+
+            res = services.release_resource_lease(
+                lid, owner_agent_id=str(owner), caller_context=caller_ctx
+            )
+            if not res.get("released"):
+                err_msg = str(res.get("error", "")).lower()
+                status = (
+                    HTTPStatus.FORBIDDEN
+                    if "not authorized" in err_msg
+                    else HTTPStatus.NOT_FOUND
+                )
+                fallback_msg = f"Lease '{lid}' not found, already released, or unauthorized"
+                self._send_json(
+                    status,
+                    {"error": res.get("error", fallback_msg)},
                 )
             else:
                 self._send_json(HTTPStatus.OK, res)
             return
 
         if path == "/v1/freeze":
+            try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
+            if caller_ctx.authenticated and not caller_ctx.is_trusted_operator:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "error": "Only trusted operators may freeze the system",
+                        "code": "forbidden",
+                    },
+                )
+                return
+
             self.server.boundary.freeze()
             self._send_json(
                 HTTPStatus.OK,
@@ -808,6 +1053,25 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/unfreeze":
+            try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
+            if caller_ctx.authenticated and not caller_ctx.is_trusted_operator:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "error": "Only trusted operators may unfreeze the system",
+                        "code": "forbidden",
+                    },
+                )
+                return
+
             self.server.boundary.unfreeze()
             self._send_json(HTTPStatus.OK, {"frozen": False, "message": "System unfrozen"})
             return
@@ -863,6 +1127,7 @@ class ActentraHTTPServer(ThreadingHTTPServer):
         executor_registry: ExecutorRegistry | None = None,
         approval_ttl_seconds: float = 300.0,
         auth_token: str | None = None,
+        token_principals: dict[str, Any] | None = None,
         unsafe_allow_remote: bool = False,
     ) -> None:
         host = server_address[0]
@@ -877,7 +1142,7 @@ class ActentraHTTPServer(ThreadingHTTPServer):
                     f"Refusing to bind Actentra Gateway to non-loopback address {host!r} "
                     "without explicit remote authorization (--unsafe-allow-remote)"
                 )
-            if not effective_token or not effective_token.strip():
+            if (not effective_token or not effective_token.strip()) and not token_principals:
                 raise ValueError(
                     f"Refusing to bind Actentra Gateway to non-loopback address {host!r} "
                     "without an authentication token. Remote interfaces require "
@@ -888,6 +1153,7 @@ class ActentraHTTPServer(ThreadingHTTPServer):
         self.boundary = boundary
         self.approval_ttl_seconds = approval_ttl_seconds
         self.auth_token = effective_token
+        self.token_principals = token_principals
         self.services = AppServices(
             boundary,
             executor_registry=executor_registry,
@@ -958,6 +1224,7 @@ def create_gateway_server(
     executor_registry: ExecutorRegistry | None = None,
     approval_ttl_seconds: float = 300.0,
     auth_token: str | None = None,
+    token_principals: dict[str, Any] | None = None,
     unsafe_allow_remote: bool = False,
 ) -> ActentraHTTPServer:
     """Create a configured ActentraHTTPServer ready to serve."""
@@ -967,6 +1234,7 @@ def create_gateway_server(
         executor_registry=executor_registry,
         approval_ttl_seconds=approval_ttl_seconds,
         auth_token=auth_token,
+        token_principals=token_principals,
         unsafe_allow_remote=unsafe_allow_remote,
     )
 
@@ -979,6 +1247,7 @@ def serve_http(
     executor_registry: ExecutorRegistry | None = None,
     approval_ttl_seconds: float = 300.0,
     auth_token: str | None = None,
+    token_principals: dict[str, Any] | None = None,
     unsafe_allow_remote: bool = False,
 ) -> None:
     """Run the Actentra HTTP Gateway service synchronously."""
@@ -989,6 +1258,7 @@ def serve_http(
         executor_registry=executor_registry,
         approval_ttl_seconds=approval_ttl_seconds,
         auth_token=auth_token,
+        token_principals=token_principals,
         unsafe_allow_remote=unsafe_allow_remote,
     )
     print(f"Actentra Gateway serving on http://{host}:{port} (Console: http://{host}:{port}/ui)")

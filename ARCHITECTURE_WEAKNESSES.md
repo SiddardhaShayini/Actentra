@@ -25,18 +25,21 @@ The architecture is coherent as a local Python SDK and alpha gateway, but it is 
 
 ## 2. Trust model
 
-The implementation defines `CallerContext`, but HTTP tokens are shared bearer secrets with no subject, role, tenant, agent, or key lifecycle. It allows loopback unauthenticated callers and trusts `X-Actentra-Identity` only as a display/claim. This means handoffs and leases are not identity-bound despite some string-equality checks.
+### Progress and Status (Finding 01 Remediation)
 
-**Needed trust hierarchy:**
+The trust model has been hardened to enforce authenticated principal identities and delegation authority:
+- `CallerContext` distinguishes `AUTHENTICATED_AGENT`, `HUMAN_APPROVER`, `AUTHENTICATED_OPERATOR`, `LOCAL_PROCESS`, and `UNAUTHENTICATED_CALLER`.
+- Operation-specific scopes (`crossings:propose`, `crossings:approve`, `handoffs:create`, `handoffs:advance`, `handoffs:verify`, `leases:acquire`, `leases:release`, `admin:freeze`, `admin:unfreeze`) enforce role separation across gateway endpoints.
+- Caller-asserted headers (`X-Actentra-Identity`) are strictly reconciled against authenticated principal credentials and rejected if conflicting.
+- Crossings, handoffs, and resource leases enforce principal authorization; callers cannot act as or release resources owned by other agents without explicit delegation authority.
 
-1. short-lived tenant principal
-2. agent/workload identity
-3. delegated warrant identity
-4. human approver identity
-5. executor identity
-6. independent verifier identity
+### Remaining Trust Hierarchy Gaps
 
-No one of these is currently cryptographically established end-to-end by the gateway.
+While per-request principal authentication, delegation validation, and lease/handoff authorization are now strictly enforced, distributed enterprise deployments still require:
+
+1. Short-lived cryptographic tenant principals (OIDC/SPIFFE/mTLS tokens rather than static bearer tokens).
+2. Cryptographic attestation of workload environments (e.g., TPM/confidential computing).
+3. Decentralized public-key infrastructure for dynamic multi-cluster agent identity federation.
 
 ## 3. Single points of failure
 
