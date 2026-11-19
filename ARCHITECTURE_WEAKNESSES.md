@@ -11,7 +11,8 @@ The architecture is coherent as a local Python SDK and alpha gateway, but it is 
 - `Boundary.execute()` centralizes envelope creation, policy evaluation, receipt persistence, hash revalidation, and outcome recording.
 - The function and LangChain adapters route calls through `Boundary.execute()`.
 - MCP stdio proxy intercepts `tools/call` and blocks unknown tools before forwarding.
-- FS/SQL executors are bound to a workspace/database and the HTTP executor validates URL policy constraints.
+- FS/SQL executors are bound to a workspace/database and the HTTP executor validates URL policy constraints with socket-level IP pinning, preventing DNS rebinding/SSRF.
+- Custom `PinningDNSResolver`, `PinnedHTTPConnection`, and `PinnedHTTPSConnection` enforce post-connect peer IP verification and preserve TLS SNI/certificate SAN hostname validation while bypassing secondary resolver queries.
 
 ### Weaknesses
 

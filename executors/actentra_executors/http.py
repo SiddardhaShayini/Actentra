@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import errno
+import functools
+import http.client
 import ipaddress
 import re
 import socket
+import ssl
+import sys
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
@@ -31,8 +36,15 @@ def _is_private_ip(ip_str: str) -> bool:
     """Check if an IP string belongs to private, loopback, link-local, or cloud metadata ranges."""
     try:
         ip = ipaddress.ip_address(ip_str)
+        if (
+            isinstance(ip, ipaddress.IPv6Address)
+            and ip.ipv4_mapped is not None
+            and _is_private_ip(str(ip.ipv4_mapped))
+        ):
+            return True
         return (
-            ip.is_private
+            not ip.is_global
+            or ip.is_private
             or ip.is_loopback
             or ip.is_link_local
             or ip.is_reserved
@@ -82,7 +94,240 @@ def canonicalize_url(raw_url: str) -> str:
     clean_path = re.sub(r"/{2,}", "/", path)
 
     query_part = f"?{parsed.query}" if parsed.query else ""
-    return f"{scheme}://{hostname}{port_part}{clean_path}{query_part}"
+    host_part = f"[{hostname}]" if ":" in hostname else hostname
+    return f"{scheme}://{host_part}{port_part}{clean_path}{query_part}"
+
+
+class PinningDNSResolver:
+    """SSRF-safe DNS resolver that resolves once, validates all IPs, and pins connections."""
+
+    def __init__(self, *, allow_private_ips: bool = False) -> None:
+        self.allow_private_ips = allow_private_ips
+        self._pinned: dict[str, str] = {}
+
+    def get_pinned_ip(self, hostname: str) -> str | None:
+        """Return previously pinned IP for hostname if resolved."""
+        return self._pinned.get(hostname.lower().strip())
+
+    def resolve_and_pin(self, host_or_url: str) -> str:
+        """Resolve destination, validate against SSRF private/metadata rules, and pin IP."""
+        candidate = host_or_url.strip()
+        try:
+            ip = ipaddress.ip_address(candidate)
+            hostname = str(ip).lower()
+        except ValueError:
+            if "://" in candidate:
+                parsed = urllib.parse.urlsplit(candidate)
+                hostname = (parsed.hostname or "").lower().strip()
+            elif ":" in candidate and not candidate.startswith("[") and candidate.count(":") > 1:
+                # IPv6 literal without brackets
+                parsed = urllib.parse.urlsplit(f"//[{candidate}]")
+                hostname = (parsed.hostname or "").lower().strip()
+            else:
+                parsed = urllib.parse.urlsplit(f"//{candidate}")
+                hostname = (parsed.hostname or "").lower().strip()
+
+        if not hostname:
+            raise ExecutorError(f"URL missing valid hostname: {host_or_url!r}")
+
+        if hostname in self._pinned:
+            return self._pinned[hostname]
+
+        if _is_private_ip(hostname):
+            if not self.allow_private_ips:
+                raise ExecutorError(
+                    f"Direct connection to private/metadata IP {hostname!r} is blocked (SSRF guard)"
+                )
+            self._pinned[hostname] = hostname
+            return hostname
+
+        try:
+            ipaddress.ip_address(hostname)
+            # Public IP literal
+            self._pinned[hostname] = hostname
+            return hostname
+        except ValueError:
+            pass
+
+        try:
+            addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            raise ExecutorError(f"DNS resolution failed for host {hostname!r}: {exc}") from exc
+
+        if not addr_info:
+            raise ExecutorError(f"DNS resolution returned no addresses for host {hostname!r}")
+
+        resolved_ips: list[str] = []
+        for _, _, _, _, sockaddr in addr_info:
+            ip_str = str(sockaddr[0])
+            if not self.allow_private_ips and _is_private_ip(ip_str):
+                raise ExecutorError(
+                    f"Host {hostname!r} resolves to private IP {ip_str!r}; blocked by SSRF defense"
+                )
+            resolved_ips.append(ip_str)
+
+        pinned = resolved_ips[0]
+        self._pinned[hostname] = pinned
+        return pinned
+
+    def get_pinned(self, hostname: str) -> str | None:
+        """Return pinned IP for hostname if resolved during request lifecycle."""
+        return self._pinned.get(hostname.lower())
+
+
+class PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection connecting directly to a pre-validated, pinned destination IP."""
+
+    def __init__(
+        self,
+        host: str,
+        *args: Any,
+        pinned_ip: str | None = None,
+        allow_private_ips: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(host, *args, **kwargs)
+        self.pinned_ip = pinned_ip
+        self.allow_private_ips = allow_private_ips
+
+    def connect(self) -> None:
+        target_ip = self.pinned_ip or self.host
+        if not self.allow_private_ips and _is_private_ip(target_ip):
+            raise ExecutorError(
+                f"Connection to private/metadata IP {target_ip!r} is blocked by SSRF defense"
+            )
+        sys.audit("http.client.connect", self, self.host, self.port)
+        source_addr = getattr(self, "source_address", None)
+        self.sock = socket.create_connection(
+            (target_ip, self.port),
+            self.timeout,
+            source_addr,
+        )
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError as e:
+            if e.errno != errno.ENOPROTOOPT:
+                raise
+        peer = self.sock.getpeername()
+        peer_ip = str(peer[0])
+        if not self.allow_private_ips and _is_private_ip(peer_ip):
+            self.sock.close()
+            raise ExecutorError(
+                f"Connected peer IP {peer_ip!r} is private/metadata; blocked by SSRF defense"
+            )
+        if self.pinned_ip and peer_ip != self.pinned_ip:
+            self.sock.close()
+            raise ExecutorError(
+                f"Connected peer IP {peer_ip!r} does not match pinned IP {self.pinned_ip!r}"
+            )
+        tunnel_host = getattr(self, "_tunnel_host", None)
+        if tunnel_host:
+            tunnel_fn = getattr(self, "_tunnel", None)
+            if callable(tunnel_fn):
+                tunnel_fn()
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection that connects to pinned IP and validates TLS certs against hostname."""
+
+    def __init__(
+        self,
+        host: str,
+        *args: Any,
+        context: ssl.SSLContext | None = None,
+        check_hostname: bool | None = None,
+        pinned_ip: str | None = None,
+        allow_private_ips: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(host, *args, context=context, **kwargs)
+        if check_hostname is not None and context is not None:
+            context.check_hostname = check_hostname
+        self.pinned_ip = pinned_ip
+        self.allow_private_ips = allow_private_ips
+        self._ssl_ctx = context
+
+    def connect(self) -> None:
+        target_ip = self.pinned_ip or self.host
+        if not self.allow_private_ips and _is_private_ip(target_ip):
+            raise ExecutorError(
+                f"Connection to private/metadata IP {target_ip!r} is blocked by SSRF defense"
+            )
+        sys.audit("http.client.connect", self, self.host, self.port)
+        source_addr = getattr(self, "source_address", None)
+        self.sock = socket.create_connection(
+            (target_ip, self.port),
+            self.timeout,
+            source_addr,
+        )
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError as e:
+            if e.errno != errno.ENOPROTOOPT:
+                raise
+        peer = self.sock.getpeername()
+        peer_ip = str(peer[0])
+        if not self.allow_private_ips and _is_private_ip(peer_ip):
+            self.sock.close()
+            raise ExecutorError(
+                f"Connected peer IP {peer_ip!r} is private/metadata; blocked by SSRF defense"
+            )
+        if self.pinned_ip and peer_ip != self.pinned_ip:
+            self.sock.close()
+            raise ExecutorError(
+                f"Connected peer IP {peer_ip!r} does not match pinned IP {self.pinned_ip!r}"
+            )
+        tunnel_host = getattr(self, "_tunnel_host", None)
+        if tunnel_host:
+            tunnel_fn = getattr(self, "_tunnel", None)
+            if callable(tunnel_fn):
+                tunnel_fn()
+        server_hostname = str(tunnel_host or self.host)
+        ctx = self._ssl_ctx or ssl.create_default_context()
+        self.sock = ctx.wrap_socket(self.sock, server_hostname=server_hostname)
+
+
+class PinnedHTTPHandler(urllib.request.HTTPHandler):
+    """urllib HTTPHandler using PinnedHTTPConnection to eliminate DNS rebinding."""
+
+    def __init__(self, resolver: PinningDNSResolver) -> None:
+        super().__init__()
+        self._resolver = resolver
+
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        parsed = urllib.parse.urlsplit(f"//{req.host}")
+        hostname = (parsed.hostname or "").lower()
+        pinned_ip = self._resolver.resolve_and_pin(hostname)
+        conn_factory = functools.partial(
+            PinnedHTTPConnection,
+            pinned_ip=pinned_ip,
+            allow_private_ips=self._resolver.allow_private_ips,
+        )
+        return self.do_open(conn_factory, req)
+
+
+class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    """urllib HTTPSHandler using PinnedHTTPSConnection with SNI and cert hostname validation."""
+
+    def __init__(
+        self,
+        resolver: PinningDNSResolver,
+        context: ssl.SSLContext | None = None,
+    ) -> None:
+        super().__init__(context=context)
+        self._resolver = resolver
+        self._ssl_context = context
+
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        parsed = urllib.parse.urlsplit(f"//{req.host}")
+        hostname = (parsed.hostname or "").lower()
+        pinned_ip = self._resolver.resolve_and_pin(hostname)
+        conn_factory = functools.partial(
+            PinnedHTTPSConnection,
+            pinned_ip=pinned_ip,
+            allow_private_ips=self._resolver.allow_private_ips,
+        )
+        return self.do_open(conn_factory, req, context=self._ssl_context)
 
 
 class SSRFSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -92,10 +337,12 @@ class SSRFSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         self,
         validator: Callable[[str], Any],
         max_redirects: int = 5,
+        resolver: PinningDNSResolver | None = None,
     ) -> None:
         super().__init__()
         self._validator = validator
         self._max_redirects = max_redirects
+        self._resolver = resolver
         self._count = 0
 
     def redirect_request(
@@ -110,9 +357,16 @@ class SSRFSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         self._count += 1
         if self._count > self._max_redirects:
             raise ExecutorError(f"HTTP redirect limit exceeded ({self._max_redirects})")
+        base_url = req.full_url if isinstance(getattr(req, "full_url", None), str) else ""
+        full_newurl = urllib.parse.urljoin(base_url, newurl) if base_url else newurl
         # Validate redirected destination before following
-        self._validator(newurl)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        self._validator(full_newurl)
+        if self._resolver is not None:
+            new_parsed = urllib.parse.urlsplit(full_newurl)
+            new_hostname = (new_parsed.hostname or "").lower()
+            if new_hostname:
+                self._resolver.resolve_and_pin(new_hostname)
+        return super().redirect_request(req, fp, code, msg, headers, full_newurl)
 
 
 class ScopedHTTPExecutor:
@@ -154,30 +408,26 @@ class ScopedHTTPExecutor:
             f"Host {hostname!r} is not in the allowed hosts list: {list(host_rules)}"
         )
 
-    def _verify_destination_ip(self, hostname: str, allow_private: bool) -> None:
+    def _verify_destination_ip(
+        self,
+        hostname: str,
+        allow_private: bool,
+        resolver: PinningDNSResolver | None = None,
+    ) -> str:
         """Resolve hostname and reject private / metadata IP ranges unless allowed."""
-        if allow_private:
-            return
-
-        if _is_private_ip(hostname):
-            raise ExecutorError(
-                f"Direct connection to private/metadata IP {hostname!r} is blocked (SSRF guard)"
-            )
-
-        try:
-            addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        except socket.gaierror as exc:
-            raise ExecutorError(f"DNS resolution failed for host {hostname!r}: {exc}") from exc
-
-        for _, _, _, _, sockaddr in addr_info:
-            ip_str = str(sockaddr[0])
-            if _is_private_ip(ip_str):
-                raise ExecutorError(
-                    f"Host {hostname!r} resolves to private IP {ip_str!r}; blocked by SSRF defense"
-                )
+        res = (
+            resolver
+            if resolver is not None
+            else PinningDNSResolver(allow_private_ips=allow_private)
+        )
+        return res.resolve_and_pin(hostname)
 
     def _validate_url_target(
-        self, target_url: str, constraints: dict[str, Any], allow_private: bool
+        self,
+        target_url: str,
+        constraints: dict[str, Any],
+        allow_private: bool,
+        resolver: PinningDNSResolver | None = None,
     ) -> str:
         """Validate destination URL against allowed schemes, host list, and private IP ranges."""
         try:
@@ -194,7 +444,7 @@ class ScopedHTTPExecutor:
             raise ExecutorError(f"URL missing valid hostname: {target_url!r}")
 
         self._check_host_allowed(hostname, constraints)
-        self._verify_destination_ip(hostname, allow_private)
+        self._verify_destination_ip(hostname, allow_private, resolver=resolver)
         return canon
 
     def execute(self, envelope: ActionEnvelope, decision: Decision) -> dict[str, Any]:
@@ -205,7 +455,10 @@ class ScopedHTTPExecutor:
 
         constraints = dict(decision.constraints)
         allow_private = bool(constraints.get("allow_private_ips", self._allow_private_ips))
-        canon_url = self._validate_url_target(envelope.action.resource, constraints, allow_private)
+        resolver = PinningDNSResolver(allow_private_ips=allow_private)
+        canon_url = self._validate_url_target(
+            envelope.action.resource, constraints, allow_private, resolver=resolver
+        )
 
         params = envelope.action.params
         method = str(params.get("method", "GET")).upper().strip()
@@ -285,13 +538,21 @@ class ScopedHTTPExecutor:
         )
 
         def redirect_validator(new_url: str) -> None:
-            self._validate_url_target(new_url, constraints, allow_private)
+            self._validate_url_target(new_url, constraints, allow_private, resolver=resolver)
 
         redirect_handler = SSRFSafeRedirectHandler(
             validator=redirect_validator,
             max_redirects=max_redirects,
+            resolver=resolver,
         )
-        opener = urllib.request.build_opener(redirect_handler)
+        pinned_http_handler = PinnedHTTPHandler(resolver)
+        pinned_https_handler = PinnedHTTPSHandler(resolver)
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            redirect_handler,
+            pinned_http_handler,
+            pinned_https_handler,
+        )
 
         try:
             with opener.open(req, timeout=timeout) as resp:  # noqa: S310

@@ -70,14 +70,15 @@ Passing tests are treated as evidence for tested behavior, not proof of complete
 ### F-2. HTTP executor DNS rebinding/SSRF bypass
 
 **Severity:** HIGH  
-**Affected source:** `executors/actentra_executors/http.py:157-177,294-297`
+**Affected source:** `executors/actentra_executors/http.py:157-177,294-297`  
+**Status:** **REMEDIATED**
 
 **Attack preconditions:**
 
 - Policy permits an attacker-controlled or attacker-manipulated hostname.
 - DNS answers differ across validation and urllib connection lookups.
 
-**Reproduction:**
+**Reproduction (Original):**
 
 1. Configure `allow_private_ips=False`.
 2. Return a public address from `_verify_destination_ip()` validation lookup.
@@ -86,9 +87,17 @@ Passing tests are treated as evidence for tested behavior, not proof of complete
 
 **Actual impact:** Loopback/private service access and cloud metadata exfiltration risk.
 
-**Remediation:** Resolve and pin once; use a custom transport socket or validated HTTP adapter that performs both DNS and peer-IP checks. Validate the peer IP before any request bytes and revalidate every redirect. Preserve TLS SNI/Host separately.
+**Remediation Implemented:**
 
-**Regression test:** Controlled DNS result returns public IP on validation lookup and private IP on connect lookup; assert no socket connection attempt and `ExecutorError`.
+- Implemented `PinningDNSResolver`: resolves destination once via `socket.getaddrinfo`, validates that ALL returned address records are public and globally routable (blocking private, loopback, link-local, carrier-grade NAT `100.64.0.0/10`, benchmark ranges, and IPv4-mapped IPv6), and pins the primary IP address for the request lifecycle.
+- Implemented `PinnedHTTPConnection` and `PinnedHTTPSConnection`: connects directly to `(pinned_ip, port)` via `socket.create_connection`, completely bypassing urllib/http.client secondary DNS resolution.
+- Enforced post-connect peer IP verification: inspects `sock.getpeername()[0]` immediately upon TCP establishment; if peer IP is non-global or deviates from the pinned IP, the socket is immediately closed and aborted with `ExecutorError` before sending any HTTP request bytes.
+- Preserved TLS SNI and Certificate Validation: for HTTPS, `ssl.wrap_socket` wraps the pinned socket with `server_hostname=self.host` (the original domain name), ensuring TLS SNI and certificate Subject Alternative Name (SAN) validation remain strict.
+- Upgraded `SSRFSafeRedirectHandler`: canonicalizes redirect targets, strictly permits only HTTP/HTTPS schemes, enforces allowed-host policies, and re-resolves and pins destination IPs for every redirect hop.
+- Isolated ambient proxies: `urllib.request.ProxyHandler({})` is explicitly injected into `build_opener`, preventing environment variables (`HTTP_PROXY`, `HTTPS_PROXY`) from acting as confused deputies to bypass SSRF controls.
+- Hardened URL canonicalization: correctly retains bracket notation `[::1]` for IPv6 address literals.
+
+**Regression tests:** Added comprehensive regression test suite in `tests/unit/test_security_finding_02_dns_rebinding.py` (25 passing tests verifying TOCTOU DNS rebinding, multi-record mixed DNS responses, post-connect peer IP verification, IMDS/CGNAT/IPv4-mapped blocks, redirect rebinding, TLS SNI preservation, and proxy isolation).
 
 ### F-3. Warrant max-use counter is neither durable nor atomic at restart
 
