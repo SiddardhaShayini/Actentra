@@ -13,6 +13,7 @@ Verifies:
 from __future__ import annotations
 
 import concurrent.futures
+import time
 from pathlib import Path
 
 import pytest
@@ -364,3 +365,194 @@ def test_in_memory_registry_protects_exhausted_quotas_from_eviction() -> None:
     assert registry.remaining_uses(target_warrant) == 0
     with pytest.raises(WarrantError, match="max uses"):
         registry.record_use(target_warrant)
+
+
+def test_adversarial_in_memory_quota_replay_via_finite_warrant_flooding() -> None:
+    """R-2 / F-3: Flooding an in-memory registry with finite-use warrants cannot evict quotas."""
+    priv, _ = generate_ed25519_keypair()
+    reg = WarrantRegistry(max_warrants=2)
+
+    target = issue_warrant(
+        holder="target",
+        allowed_tools=["fs.read"],
+        allowed_resources=["*"],
+        privkey_pem=priv,
+        issuer_id="root",
+        max_uses=1,
+    )
+    reg.record_use(target)
+    assert reg.remaining_uses(target) == 0
+    assert reg.is_exhausted(target) is True
+
+    # Flood with multiple additional finite-use warrants beyond capacity
+    blocked_count = 0
+    for i in range(4):
+        w = issue_warrant(
+            holder=f"agent-{i}",
+            allowed_tools=["fs.read"],
+            allowed_resources=["*"],
+            privkey_pem=priv,
+            issuer_id="root",
+            max_uses=1,
+        )
+        try:
+            reg.record_use(w)
+        except WarrantError as exc:
+            if "saturated" in str(exc).lower():
+                blocked_count += 1
+
+    # Capacity enforcement must have kicked in rather than evicting target
+    assert blocked_count > 0
+
+    # CRITICAL: Target warrant must remain recorded, remaining_uses MUST be 0, replay must fail
+    assert target.warrant_id in reg._uses
+    assert reg.remaining_uses(target) == 0
+    with pytest.raises(WarrantError, match="max uses .* exceeded"):
+        reg.record_use(target)
+
+
+def test_adversarial_in_memory_capacity_saturation_fails_closed() -> None:
+    """When in-memory capacity is full of active finite-use warrants, new ones fail closed."""
+    priv, _ = generate_ed25519_keypair()
+    reg = WarrantRegistry(max_warrants=3)
+
+    warrants = [
+        issue_warrant(
+            holder=f"bot-{i}",
+            allowed_tools=["calc"],
+            allowed_resources=["tool:calc"],
+            privkey_pem=priv,
+            issuer_id="root",
+            max_uses=2,
+        )
+        for i in range(3)
+    ]
+    for w in warrants:
+        reg.record_use(w)
+        assert reg.remaining_uses(w) == 1
+
+    # Attempting to record a 4th warrant must fail closed
+    fourth = issue_warrant(
+        holder="overflow-bot",
+        allowed_tools=["calc"],
+        allowed_resources=["tool:calc"],
+        privkey_pem=priv,
+        issuer_id="root",
+        max_uses=1,
+    )
+    with pytest.raises(WarrantError, match="capacity .* saturated"):
+        reg.record_use(fourth)
+
+    # Existing 3 warrants are completely undamaged
+    for w in warrants:
+        assert reg.remaining_uses(w) == 1
+
+
+def test_adversarial_in_memory_partial_quota_preservation_under_pressure() -> None:
+    """Partially consumed finite quotas are preserved and never reset to initial max_uses."""
+    priv, _ = generate_ed25519_keypair()
+    reg = WarrantRegistry(max_warrants=3)
+
+    warrant = issue_warrant(
+        holder="partial-bot",
+        allowed_tools=["calc"],
+        allowed_resources=["tool:calc"],
+        privkey_pem=priv,
+        issuer_id="root",
+        max_uses=5,
+    )
+    reg.record_use(warrant)
+    reg.record_use(warrant)
+    assert reg.remaining_uses(warrant) == 3
+
+    # Add 2 more warrants to reach max capacity
+    for i in range(2):
+        w = issue_warrant(
+            holder=f"filler-{i}",
+            allowed_tools=["calc"],
+            allowed_resources=["tool:calc"],
+            privkey_pem=priv,
+            issuer_id="root",
+            max_uses=1,
+        )
+        reg.record_use(w)
+
+    # Partial warrant quota remains exactly 3
+    assert reg.remaining_uses(warrant) == 3
+
+
+def test_adversarial_in_memory_require_durable_enforcement() -> None:
+    """When require_durable=True, finite-use warrants are rejected in in-memory mode."""
+    priv, _ = generate_ed25519_keypair()
+    reg = WarrantRegistry(max_warrants=10, require_durable=True)
+    assert reg.is_durable is False
+    assert reg.require_durable is True
+
+    finite_warrant = issue_warrant(
+        holder="bot",
+        allowed_tools=["calc"],
+        allowed_resources=["tool:calc"],
+        privkey_pem=priv,
+        issuer_id="root",
+        max_uses=1,
+    )
+    with pytest.raises(WarrantError, match="requires durable persistence"):
+        reg.record_use(finite_warrant)
+
+    # Unlimited warrant is allowed even with require_durable=True
+    unlimited_warrant = issue_warrant(
+        holder="bot",
+        allowed_tools=["calc"],
+        allowed_resources=["tool:calc"],
+        privkey_pem=priv,
+        issuer_id="root",
+        max_uses=None,
+    )
+    reg.record_use(unlimited_warrant)
+    assert reg.remaining_uses(unlimited_warrant) is None
+
+
+def test_adversarial_expired_warrant_pruning_under_pressure() -> None:
+    """Cryptographically expired warrants can be safely pruned to make room."""
+    priv, _ = generate_ed25519_keypair()
+    reg = WarrantRegistry(max_warrants=2)
+
+    expired = issue_warrant(
+        holder="expired-bot",
+        allowed_tools=["calc"],
+        allowed_resources=["tool:calc"],
+        privkey_pem=priv,
+        issuer_id="root",
+        ttl_seconds=0.01,
+        max_uses=1,
+    )
+    reg.record_use(expired)
+    time.sleep(0.05)
+
+    w1 = issue_warrant(
+        holder="w1",
+        allowed_tools=["calc"],
+        allowed_resources=["tool:calc"],
+        privkey_pem=priv,
+        issuer_id="root",
+        ttl_seconds=3600.0,
+        max_uses=1,
+    )
+    reg.record_use(w1)
+
+    # Capacity is 2. The expired warrant should be pruned to make room for w2.
+    w2 = issue_warrant(
+        holder="w2",
+        allowed_tools=["calc"],
+        allowed_resources=["tool:calc"],
+        privkey_pem=priv,
+        issuer_id="root",
+        ttl_seconds=3600.0,
+        max_uses=1,
+    )
+    reg.record_use(w2)
+
+    assert expired.warrant_id not in reg._uses
+    assert w1.warrant_id in reg._uses
+    assert w2.warrant_id in reg._uses
+

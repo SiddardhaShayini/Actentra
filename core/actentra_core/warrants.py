@@ -227,6 +227,11 @@ class WarrantRegistry:
 
     Supports durable SQLite persistence (via ReceiptStore or direct db_path)
     to enforce quota durability across process restarts and prevent eviction attacks.
+
+    When running in ephemeral in-memory mode (receipt_store is None), active and exhausted
+    finite-use warrants are non-evictable to prevent quota-resetting replay attacks.
+    If capacity is saturated with finite-use warrants, the registry fails closed rather
+    than evicting consumed quotas.
     """
 
     def __init__(
@@ -235,13 +240,16 @@ class WarrantRegistry:
         *,
         receipt_store: Any | None = None,
         db_path: str | Path | None = None,
+        require_durable: bool = False,
     ) -> None:
         self._lock = threading.Lock()
         self._max_warrants = max_warrants
         self._receipt_store = receipt_store
         self._db_path = Path(db_path) if db_path is not None else None
+        self._require_durable = require_durable
         self._uses: dict[str, int] = {}
         self._limits: dict[str, int | None] = {}
+        self._expires: dict[str, str] = {}
 
         if self._db_path is not None and self._receipt_store is None:
             from actentra_core.receipts import ReceiptStore
@@ -251,6 +259,16 @@ class WarrantRegistry:
     @property
     def receipt_store(self) -> Any | None:
         return self._receipt_store
+
+    @property
+    def is_durable(self) -> bool:
+        """Return True if backed by a persistent ReceiptStore/SQLite database."""
+        return self._receipt_store is not None
+
+    @property
+    def require_durable(self) -> bool:
+        """Return True if finite-use warrants strictly require durable persistence."""
+        return self._require_durable
 
     def set_receipt_store(self, store: Any | None) -> None:
         """Attach receipt store for durable warrant persistence across restarts."""
@@ -264,33 +282,75 @@ class WarrantRegistry:
                 self._receipt_store.record_warrant_use(warrant)
                 self._uses[warrant.warrant_id] = self._uses.get(warrant.warrant_id, 0) + 1
                 self._limits[warrant.warrant_id] = warrant.max_uses
+                self._expires[warrant.warrant_id] = warrant.expires_at
+                # When backed by receipt store, in-memory cache pruning is purely memory-bound
+                # and never resets quotas since SQLite is the authoritative durable store.
+                if len(self._uses) > self._max_warrants:
+                    oldest = next(iter(self._uses))
+                    self._uses.pop(oldest, None)
+                    self._limits.pop(oldest, None)
+                    self._expires.pop(oldest, None)
                 return
 
             # In-memory fallback
+            if self._require_durable and warrant.max_uses is not None:
+                raise WarrantError(
+                    f"Finite-use warrant '{warrant.warrant_id}' requires durable persistence "
+                    "when require_durable=True. Attach a ReceiptStore to WarrantRegistry."
+                )
+
             current = self._uses.get(warrant.warrant_id, 0)
             if warrant.max_uses is not None and current >= warrant.max_uses:
                 raise WarrantError(
                     f"Warrant '{warrant.warrant_id}' max uses ({warrant.max_uses}) exceeded"
                 )
 
-            # Never evict active exhausted warrants whose quota must be enforced
+            # In-memory capacity management:
+            # CRITICAL SECURITY RULE: Active or exhausted finite-use warrants whose quota must
+            # be enforced MUST NEVER BE EVICTED. Evicting a finite-use warrant resets its quota
+            # upon subsequent presentation, allowing replay attacks.
             if len(self._uses) >= self._max_warrants and warrant.warrant_id not in self._uses:
-                evict_candidate = None
-                for wid, limit in self._limits.items():
-                    if limit is None:  # unlimited warrant uses can safely be evicted
-                        evict_candidate = wid
-                        break
-                if evict_candidate is not None:
-                    del self._uses[evict_candidate]
-                    del self._limits[evict_candidate]
-                elif len(self._uses) >= self._max_warrants * 2:
-                    # Emergency unbounded cap only if purely in-memory
-                    oldest = next(iter(self._uses))
-                    del self._uses[oldest]
-                    self._limits.pop(oldest, None)
+                # 1. Attempt to evict cryptographically expired warrants
+                now_dt = datetime.now(UTC)
+                expired_candidate: str | None = None
+                for wid, exp_str in self._expires.items():
+                    try:
+                        exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+                        if now_dt >= exp_dt:
+                            expired_candidate = wid
+                            break
+                    except ValueError:
+                        continue
+
+                if expired_candidate is not None:
+                    self._uses.pop(expired_candidate, None)
+                    self._limits.pop(expired_candidate, None)
+                    self._expires.pop(expired_candidate, None)
+                else:
+                    # 2. Attempt to evict unlimited warrants (max_uses is None)
+                    unlimited_candidate: str | None = None
+                    for wid, limit in self._limits.items():
+                        if limit is None:
+                            unlimited_candidate = wid
+                            break
+
+                    if unlimited_candidate is not None:
+                        self._uses.pop(unlimited_candidate, None)
+                        self._limits.pop(unlimited_candidate, None)
+                        self._expires.pop(unlimited_candidate, None)
+                    else:
+                        # 3. All entries are active/exhausted non-expired finite-use warrants.
+                        # FAIL CLOSED! Never evict finite-use warrants to make room.
+                        raise WarrantError(
+                            f"In-memory warrant registry capacity ({self._max_warrants}) saturated "
+                            "with finite-use warrants. Cannot evict active or exhausted quotas "
+                            "without durable storage. Attach a ReceiptStore or increase "
+                            "max_warrants."
+                        )
 
             self._uses[warrant.warrant_id] = current + 1
             self._limits[warrant.warrant_id] = warrant.max_uses
+            self._expires[warrant.warrant_id] = warrant.expires_at
 
     def remaining_uses(self, warrant: Warrant) -> int | None:
         """Return remaining allowed uses, or None if unlimited."""
@@ -301,3 +361,17 @@ class WarrantRegistry:
                 return cast(int | None, self._receipt_store.get_warrant_remaining_uses(warrant))
             current = self._uses.get(warrant.warrant_id, 0)
             return max(0, warrant.max_uses - current)
+
+    def is_exhausted(self, warrant: Warrant) -> bool:
+        """Return True if warrant has a finite quota and all uses have been consumed."""
+        if warrant.max_uses is None:
+            return False
+        rem = self.remaining_uses(warrant)
+        return rem is not None and rem <= 0
+
+    def clear(self) -> None:
+        """Clear in-memory warrant cache."""
+        with self._lock:
+            self._uses.clear()
+            self._limits.clear()
+            self._expires.clear()

@@ -104,10 +104,11 @@ Actentra maintains a strict boundary between what is durable across restarts and
   5. `session_taints` table: Durable session taint level (`trusted`, `untrusted`, `unknown`) surviving process restarts.
   6. `evidence_records` table: Cryptographically hashed evidential observation records binding crossings to verification tiers.
   7. `resource_leases` table: Durable multi-agent coordination leases (`lease_id`, `resource`, `owner_agent_id`, `session_id`, `mode`, `status`, `expires_at`, `lease_hash`).
+  8. `warrant_usages` table: Durable capability warrant quota consumption counters (`warrant_id`, `issuer`, `holder`, `max_uses`, `consumed_uses`, `expires_at`, `created_at`, `updated_at`).
 - **Process-Local State (reset upon process restart):**
   1. In-memory policy rate-limit token buckets (`RateLimiter._buckets`).
   2. Emergency freeze state (`PolicyEngine._frozen`).
-  3. Cryptographic capability warrant in-memory quota tracking (`WarrantRegistry._use_counts`).
+  3. Standalone in-memory warrant cache fallback (when `ReceiptStore` is not attached). Active and exhausted finite-use quotas are non-evictable to prevent replay.
 
 ### 3.2 Identity & Provenance Authority
 
