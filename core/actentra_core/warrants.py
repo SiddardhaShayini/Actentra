@@ -10,9 +10,11 @@ from __future__ import annotations
 import base64
 import contextlib
 import fnmatch
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -101,6 +103,7 @@ def issue_warrant(
     issuer_id: str,
     ttl_seconds: float = 3600.0,
     max_uses: int | None = None,
+    receipt_store: Any | None = None,
 ) -> Warrant:
     """Issue and sign an Ed25519 capability warrant for a specific agent holder."""
     now = datetime.now(UTC)
@@ -134,7 +137,7 @@ def issue_warrant(
     sig_bytes = loaded_key.sign(unsigned.payload_bytes())
     sig_b64 = base64.b64encode(sig_bytes).decode("ascii")
 
-    return Warrant(
+    signed = Warrant(
         warrant_id=unsigned.warrant_id,
         issuer=unsigned.issuer,
         holder=unsigned.holder,
@@ -145,6 +148,11 @@ def issue_warrant(
         expires_at=unsigned.expires_at,
         signature=sig_b64,
     )
+
+    if receipt_store is not None:
+        receipt_store.record_warrant_issuance(signed)
+
+    return signed
 
 
 def verify_warrant(
@@ -215,29 +223,81 @@ def is_action_permitted_by_warrant(warrant: Warrant, tool: str, resource: str) -
 
 
 class WarrantRegistry:
-    """Thread-safe, memory-bounded tracker of consumed uses for scoped warrants."""
+    """Thread-safe, durable tracker of consumed uses for scoped capability warrants.
 
-    def __init__(self, max_warrants: int = 1000) -> None:
+    Supports durable SQLite persistence (via ReceiptStore or direct db_path)
+    to enforce quota durability across process restarts and prevent eviction attacks.
+    """
+
+    def __init__(
+        self,
+        max_warrants: int = 1000,
+        *,
+        receipt_store: Any | None = None,
+        db_path: str | Path | None = None,
+    ) -> None:
+        self._lock = threading.Lock()
         self._max_warrants = max_warrants
+        self._receipt_store = receipt_store
+        self._db_path = Path(db_path) if db_path is not None else None
         self._uses: dict[str, int] = {}
+        self._limits: dict[str, int | None] = {}
+
+        if self._db_path is not None and self._receipt_store is None:
+            from actentra_core.receipts import ReceiptStore
+
+            self._receipt_store = ReceiptStore(self._db_path)
+
+    @property
+    def receipt_store(self) -> Any | None:
+        return self._receipt_store
+
+    def set_receipt_store(self, store: Any | None) -> None:
+        """Attach receipt store for durable warrant persistence across restarts."""
+        with self._lock:
+            self._receipt_store = store
 
     def record_use(self, warrant: Warrant) -> None:
         """Increment consumed uses for a warrant; raises WarrantError if exceeded."""
-        current = self._uses.get(warrant.warrant_id, 0)
-        if warrant.max_uses is not None and current >= warrant.max_uses:
-            raise WarrantError(
-                f"Warrant '{warrant.warrant_id}' max uses ({warrant.max_uses}) exceeded"
-            )
+        with self._lock:
+            if self._receipt_store is not None:
+                self._receipt_store.record_warrant_use(warrant)
+                self._uses[warrant.warrant_id] = self._uses.get(warrant.warrant_id, 0) + 1
+                self._limits[warrant.warrant_id] = warrant.max_uses
+                return
 
-        if len(self._uses) >= self._max_warrants and warrant.warrant_id not in self._uses:
-            oldest = next(iter(self._uses))
-            del self._uses[oldest]
+            # In-memory fallback
+            current = self._uses.get(warrant.warrant_id, 0)
+            if warrant.max_uses is not None and current >= warrant.max_uses:
+                raise WarrantError(
+                    f"Warrant '{warrant.warrant_id}' max uses ({warrant.max_uses}) exceeded"
+                )
 
-        self._uses[warrant.warrant_id] = current + 1
+            # Never evict active exhausted warrants whose quota must be enforced
+            if len(self._uses) >= self._max_warrants and warrant.warrant_id not in self._uses:
+                evict_candidate = None
+                for wid, limit in self._limits.items():
+                    if limit is None:  # unlimited warrant uses can safely be evicted
+                        evict_candidate = wid
+                        break
+                if evict_candidate is not None:
+                    del self._uses[evict_candidate]
+                    del self._limits[evict_candidate]
+                elif len(self._uses) >= self._max_warrants * 2:
+                    # Emergency unbounded cap only if purely in-memory
+                    oldest = next(iter(self._uses))
+                    del self._uses[oldest]
+                    self._limits.pop(oldest, None)
+
+            self._uses[warrant.warrant_id] = current + 1
+            self._limits[warrant.warrant_id] = warrant.max_uses
 
     def remaining_uses(self, warrant: Warrant) -> int | None:
         """Return remaining allowed uses, or None if unlimited."""
         if warrant.max_uses is None:
             return None
-        current = self._uses.get(warrant.warrant_id, 0)
-        return max(0, warrant.max_uses - current)
+        with self._lock:
+            if self._receipt_store is not None:
+                return cast(int | None, self._receipt_store.get_warrant_remaining_uses(warrant))
+            current = self._uses.get(warrant.warrant_id, 0)
+            return max(0, warrant.max_uses - current)

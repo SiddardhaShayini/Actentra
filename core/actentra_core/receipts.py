@@ -9,7 +9,10 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from actentra_core.warrants import Warrant
 
 from actentra_core.canonicalize import canonicalize_json, hash_canonical
 from actentra_core.causal import (
@@ -224,7 +227,7 @@ class ReceiptStore:
         return self._db_path
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, timeout=5.0, isolation_level=None)
+        conn = sqlite3.connect(self._db_path, timeout=15.0, isolation_level=None)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute(f"PRAGMA synchronous={self._synchronous};")
         conn.execute("PRAGMA foreign_keys=ON;")
@@ -494,6 +497,29 @@ class ReceiptStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_lease_status_exp ON resource_leases("
                 "status, expires_at);"
+            )
+
+            # Phase 6: Durable warrant usage and quota counters across restarts (Finding 3)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS warrant_usages (
+                    warrant_id TEXT PRIMARY KEY,
+                    issuer TEXT NOT NULL,
+                    holder TEXT NOT NULL,
+                    max_uses INTEGER,
+                    consumed_uses INTEGER NOT NULL DEFAULT 0,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_warrant_usages_holder ON warrant_usages(holder);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_warrant_usages_expires "
+                "ON warrant_usages(expires_at);"
             )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to initialize receipt store: {exc}") from exc
@@ -2411,6 +2437,166 @@ class ReceiptStore:
             return int(row[0]) if row else 0
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to count leases: {exc}") from exc
+        finally:
+            conn.close()
+
+    def record_warrant_issuance(self, warrant: Warrant) -> None:
+        """Transactionally register warrant issuance in durable store."""
+        now_ts = utc_now_iso()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                INSERT INTO warrant_usages (
+                    warrant_id, issuer, holder, max_uses, consumed_uses,
+                    expires_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?)
+                ON CONFLICT(warrant_id) DO NOTHING;
+                """,
+                (
+                    warrant.warrant_id,
+                    warrant.issuer,
+                    warrant.holder,
+                    warrant.max_uses,
+                    warrant.expires_at,
+                    now_ts,
+                    now_ts,
+                ),
+            )
+            conn.execute("COMMIT;")
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to record warrant issuance: {exc}") from exc
+        finally:
+            conn.close()
+
+    def record_warrant_use(self, warrant: Warrant) -> int:
+        """Atomically increment and persist consumed uses for a warrant in SQLite.
+
+        Acquires an immediate exclusive write lock on the database (BEGIN IMMEDIATE),
+        evaluates current usage against max_uses, and increments atomically.
+        Raises WarrantError if max_uses has been reached or exceeded.
+        """
+        now_ts = utc_now_iso()
+        conn = self._connect()
+        try:
+            for attempt in range(10):
+                try:
+                    conn.execute("BEGIN IMMEDIATE;")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" in str(exc).lower() and attempt < 9:
+                        time.sleep(0.01 * (attempt + 1))
+                        continue
+                    raise
+
+            row = conn.execute(
+                """
+                SELECT consumed_uses, max_uses
+                FROM warrant_usages
+                WHERE warrant_id = ? LIMIT 1;
+                """,
+                (warrant.warrant_id,),
+            ).fetchone()
+
+            current_uses = int(row[0]) if row is not None else 0
+            limit = int(row[1]) if row is not None and row[1] is not None else warrant.max_uses
+
+            if limit is not None and current_uses >= limit:
+                conn.execute("ROLLBACK;")
+                from actentra_core.warrants import WarrantError
+
+                raise WarrantError(
+                    f"Warrant '{warrant.warrant_id}' max uses ({limit}) exceeded"
+                )
+
+            new_uses = current_uses + 1
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO warrant_usages (
+                        warrant_id, issuer, holder, max_uses, consumed_uses,
+                        expires_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        warrant.warrant_id,
+                        warrant.issuer,
+                        warrant.holder,
+                        warrant.max_uses,
+                        new_uses,
+                        warrant.expires_at,
+                        now_ts,
+                        now_ts,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE warrant_usages
+                    SET consumed_uses = ?, updated_at = ?
+                    WHERE warrant_id = ?;
+                    """,
+                    (new_uses, now_ts, warrant.warrant_id),
+                )
+            conn.execute("COMMIT;")
+            return new_uses
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to record warrant usage: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_warrant_usage(self, warrant_id: str) -> dict[str, Any] | None:
+        """Fetch durable usage record for a warrant."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT warrant_id, issuer, holder, max_uses, consumed_uses,
+                       expires_at, created_at, updated_at
+                FROM warrant_usages
+                WHERE warrant_id = ? LIMIT 1;
+                """,
+                (warrant_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "warrant_id": str(row[0]),
+                "issuer": str(row[1]),
+                "holder": str(row[2]),
+                "max_uses": int(row[3]) if row[3] is not None else None,
+                "consumed_uses": int(row[4]),
+                "expires_at": str(row[5]),
+                "created_at": str(row[6]),
+                "updated_at": str(row[7]),
+            }
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch warrant usage: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_warrant_remaining_uses(self, warrant: Warrant) -> int | None:
+        """Return remaining allowed uses for a warrant, or None if unlimited."""
+        if warrant.max_uses is None:
+            return None
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT consumed_uses, max_uses FROM warrant_usages WHERE warrant_id = ? LIMIT 1;",
+                (warrant.warrant_id,),
+            ).fetchone()
+            if row is None:
+                return warrant.max_uses
+            consumed = int(row[0])
+            limit = int(row[1]) if row[1] is not None else warrant.max_uses
+            return max(0, limit - consumed)
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch remaining warrant uses: {exc}") from exc
         finally:
             conn.close()
 

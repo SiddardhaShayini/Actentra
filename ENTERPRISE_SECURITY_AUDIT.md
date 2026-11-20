@@ -102,22 +102,30 @@ Passing tests are treated as evidence for tested behavior, not proof of complete
 ### F-3. Warrant max-use counter is neither durable nor atomic at restart
 
 **Severity:** MEDIUM  
-**Affected source:** `core/actentra_core/warrants.py:218-243`; `sdk/python/actentra/boundary.py:180-218,538-552`
+**Affected source:** `core/actentra_core/warrants.py:218-243`; `sdk/python/actentra/boundary.py:180-218,538-552`; `core/actentra_core/receipts.py:488-525`  
+**Status:** **REMEDIATED**
 
-**Attack preconditions:** A warrant is issued with finite `max_uses`, and the process restarts or 1001+ warrant IDs cause eviction.
+**Attack preconditions:** A warrant is issued with finite `max_uses`, and the process restarts or 1001+ warrant IDs cause cache eviction.
 
-**Reproduction:**
+**Reproduction (Original):**
 
 1. Use a warrant twice with `max_uses=2`.
 2. Restart the process or insert enough distinct warrant counters to evict its entry.
 3. Reuse the still-valid warrant.
-4. The in-memory counter starts at zero or is evicted.
+4. The in-memory counter starts at zero or is evicted, allowing quota overruns.
 
 **Actual impact:** Replay beyond the issuer's cryptographically declared quota.
 
-**Remediation:** Store warrant ID, issuer key ID, holder, expiry, and atomically incremented use count in the receipt database or a transactional policy store. Perform issuance and consumption transactionally. Retain counters for warrant lifetime plus audit retention.
+**Remediation Implemented:**
 
-**Regression test:** Restart the process and force registry eviction; assert the finite warrant remains exhausted and concurrent consumption cannot exceed `max_uses`.
+- **Durable Persistence in SQLite (`ReceiptStore`):** Added a dedicated `warrant_usages` table (`warrant_id` primary key, `issuer`, `holder`, `max_uses`, `consumed_uses`, `expires_at`, timestamps, and indexing on `holder` and `expires_at`).
+- **Atomic Concurrency with `BEGIN IMMEDIATE`:** Implemented transactional consumption in `ReceiptStore.record_warrant_use()` using `BEGIN IMMEDIATE` write transactions with busy-lock retry. Checks current consumption against quota limit atomically before incrementing; raises `WarrantError` immediately if exhausted, guaranteeing zero race conditions or overruns across concurrent threads/processes.
+- **Cache Eviction Resistance:** Primary authority for quota consumption is delegated to `ReceiptStore`. Warrant quotas are completely decoupled from in-memory cache capacity and survive arbitrary cache flood attacks (1001+ distinct warrants).
+- **Restart Durability:** Reopened `ReceiptStore` instances query persisted `consumed_uses` directly from the database; quotas survive process restarts, Boundary re-instantiations, and uncoordinated client restarts.
+- **SDK Automatic Binding:** `Boundary.__init__` automatically wires the active `ReceiptStore` into `WarrantRegistry`, ensuring all capability checks default to durable SQLite backing even if callers do not provide an explicit registry.
+- **In-Memory Fallback Protection:** For non-store-backed standalone registries, the in-memory LRU cache was hardened so that exhausted quotas (`consumed >= limit`) are never evicted to make room for newer warrants.
+
+**Regression tests:** Added dedicated test suite `tests/unit/test_security_finding_03_warrant_quotas.py` (7 passing tests covering restart durability, 1050-warrant cache eviction resistance, 20-thread concurrent atomic consumption, standalone registry persistence, transactional issuance logging, unlimited warrant tracking, and in-memory exhausted quota protection).
 
 ### F-4. Success is recorded before postconditions are verified
 

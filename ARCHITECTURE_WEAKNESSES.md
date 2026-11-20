@@ -44,7 +44,7 @@ While per-request principal authentication, delegation validation, and lease/han
 
 ## 3. Single points of failure
 
-In local mode, the single Python process owns policy state, freeze state, rate-limit buckets, warrant counters, and gateway executors. SQLite is the only durable control/audit store.
+In local mode, the single Python process owns policy state, freeze state, rate-limit buckets, and gateway executors. SQLite is the durable control/audit store for receipts, approvals, leases, and warrant quota counters (`warrant_usages`).
 
 Failure exposure:
 
@@ -105,7 +105,7 @@ Postcondition verifier coverage is currently filesystem-oriented. It does not va
 - approval grants are process/SQLite state, not signed authorization artifacts
 - receipt chains are tamper-evident, not tamper-resistant
 - lease/handoff hashes detect local payload substitution but are not signed
-- warrant/checkpoint signatures use Ed25519
+- warrant/checkpoint signatures use Ed25519; warrant `max_uses` quotas are durably and atomically tracked in `ReceiptStore` via `warrant_usages`
 - checkpoints prove signing key possession at a sequence/head only if the public key and checkpoint are externally anchored
 - private Ed25519 keys have no KMS/HSM or rotation model
 

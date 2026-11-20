@@ -119,7 +119,12 @@ class Boundary:
         self._approval_ttl = approval_ttl_seconds
         self._secrets_broker = secrets_broker
         self._warrant_public_key = warrant_public_key
-        self._warrant_registry = warrant_registry
+        if warrant_registry is not None:
+            self._warrant_registry = warrant_registry
+            if self._warrant_registry.receipt_store is None:
+                self._warrant_registry.set_receipt_store(self._store)
+        else:
+            self._warrant_registry = WarrantRegistry(receipt_store=self._store)
         self._verifier = verifier
         self._lock = threading.Lock()
         self._approvals: dict[tuple[str, str], ApprovalGrant] = {}
