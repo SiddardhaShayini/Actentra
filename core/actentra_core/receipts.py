@@ -545,6 +545,7 @@ class ReceiptStore:
         evidence_status: str | None = None,
         ts: str | None = None,
         envelope: ActionEnvelope | None = None,
+        observation: ObservationRecord | None = None,
     ) -> ReceiptRecord:
         stamp = ts or utc_now_iso()
         risk_json = canonicalize_json(list(risk_tags))
@@ -627,6 +628,32 @@ class ReceiptStore:
                     ) VALUES (?, ?);
                     """,
                     (envelope.crossing_id, canonicalize_json(envelope.to_dict())),
+                )
+            if observation is not None:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO observations (
+                        observation_id, crossing_id, subject_resource, claim, status,
+                        observed_digest, observed_at, expires_at, verifier_id,
+                        verifier_version, trust_domain, metadata_json, error, observation_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        observation.observation_id,
+                        observation.crossing_id,
+                        observation.subject_resource,
+                        observation.claim,
+                        observation.status,
+                        observation.observed_digest,
+                        observation.observed_at,
+                        observation.expires_at,
+                        observation.verifier_id,
+                        observation.verifier_version,
+                        observation.trust_domain,
+                        json.dumps(observation.metadata, ensure_ascii=False),
+                        observation.error,
+                        observation.observation_hash,
+                    ),
                 )
             conn.execute("COMMIT;")
         except sqlite3.Error as exc:
@@ -742,6 +769,7 @@ class ReceiptStore:
         error: str | None = None,
         reason: str | None = None,
         evidence_status: str | None = None,
+        observation: ObservationRecord | None = None,
     ) -> ReceiptRecord:
         """Append an immutable post-execution outcome record (success, failure, or unknown)."""
         if status not in _VALID_OUTCOMES:
@@ -779,6 +807,7 @@ class ReceiptStore:
             result_hash=result_hash,
             error=safe_error,
             evidence_status=ev_status,
+            observation=observation,
         )
 
     def get_decision_receipt(self, crossing_id: str) -> ReceiptRecord | None:

@@ -11,7 +11,7 @@ Actentra is an alpha/local-first execution boundary prototype. It should not be 
 | 1 | 🟠 HIGH | gateway/actentra_gateway/http_service.py; gateway/actentra_gateway/services.py; core/actentra_core/identity.py | 623-685,748-792;161-177;54-129 | HTTP agent, handoff, and lease identities are caller-asserted rather than cryptographically bound to an authenticated principal | 9/10 | **REMEDIATED** |
 | 2 | 🟠 HIGH | executors/actentra_executors/http.py | 157-177,294-297 | DNS rebinding/SSRF bypass because validation resolution is separate from urllib connection resolution | 9/10 | **REMEDIATED** |
 | 3 | 🟡 MEDIUM | core/actentra_core/warrants.py; sdk/python/actentra/boundary.py | 218-243;180-218,538-552 | Warrant `max_uses` enforcement is process-local, evictable, and reset by restart | 9/10 | **REMEDIATED** |
-| 4 | 🟡 MEDIUM | sdk/python/actentra/boundary.py | 605-617 | A success receipt is recorded before postcondition verification, allowing contradictory refuted/error observations | 9/10 | Open |
+| 4 | 🟡 MEDIUM | sdk/python/actentra/boundary.py | 605-617 | A success receipt is recorded before postcondition verification, allowing contradictory refuted/error observations | 9/10 | **REMEDIATED** |
 | 5 | 🟡 MEDIUM | gateway/actentra_gateway/services.py; gateway/actentra_gateway/http_service.py | 521-559;479-507 | External outcome reporting has no execution claim, executor identity, or one-time binding | 9/10 | Open |
 
 ## Validation

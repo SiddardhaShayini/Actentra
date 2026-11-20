@@ -130,22 +130,35 @@ Passing tests are treated as evidence for tested behavior, not proof of complete
 ### F-4. Success is recorded before postconditions are verified
 
 **Severity:** MEDIUM  
-**Affected source:** `sdk/python/actentra/boundary.py:605-617`
+**Affected source:** `sdk/python/actentra/boundary.py:605-675`; `core/actentra_core/receipts.py:530-650,733-785`  
+**Status:** **REMEDIATED**
 
 **Attack preconditions:** A caller invokes `verify_postcondition=True` and the action is followed by a refuted/error observation.
 
-**Reproduction:**
+**Reproduction (Original):**
 
 1. Execute an action claiming `exists`.
 2. Do not create the resource or delete it.
 3. The verifier returns `refuted` or `error`.
-4. The outcome record has already been inserted as `success`.
+4. The outcome record has already been inserted into the receipt log as `success`.
 
-**Actual impact:** Automation and auditors can observe contradictory evidence; success may be used as execution/transition proof.
+**Actual impact:** Automation and auditors observe contradictory evidence; premature success receipts can be used as execution/transition proof despite real-world verification failure.
 
-**Remediation:** Finalize the outcome only after verification. Map `verified` to success, `refuted`/`error` to failure/unknown as policy requires, and bind one outcome/observation transaction.
+**Remediation Implemented:**
 
-**Regression test:** Refuted and error verifiers must yield non-success outcomes and must not emit `externally_verified` evidence.
+- **Deferred Outcome Finalization:** In `Boundary.execute()`, outcome persistence is deferred until verification concludes when `verify_postcondition=True`. If `verify_postcondition=False`, outcome is recorded immediately as `status="success"` and `evidence_status="locally_observed"`.
+- **Precise Status Mapping:**
+  - `verified`: Mapped to `status="success"`, `evidence_status="externally_verified"`. Cumulative session budgets are updated, an `EvidenceRecord` (tier=`EXTERNALLY_VERIFIED`) is recorded, and a causal link (`verifies`) is bound.
+  - `refuted`: Mapped to `status="failure"`, `evidence_status="locally_observed"`, `reason="postcondition_refuted"`, with descriptive error payload. Never emits `externally_verified` evidence or causal verification links.
+  - `error`: Mapped to `status="unknown"`, `evidence_status="unknown"`, `reason="postcondition_error"`. Never emits `externally_verified` evidence.
+  - `stale`: Mapped to `status="unknown"`, `evidence_status="stale"`, `reason="postcondition_stale"`.
+  - Verifier exception / crash: Caught cleanly and mapped to `status="unknown"`, `evidence_status="unknown"`, logging an error observation.
+  - Unconfigured verifier: When `verify_postcondition=True` is requested without a verifier, mapped to `status="unknown"`, `evidence_status="unknown"`.
+- **Atomic Observation & Outcome Transaction:** Updated `ReceiptStore._append_record()` and `ReceiptStore.record_outcome()` to accept an optional `observation: ObservationRecord` parameter, committing both the verifiable state observation and the outcome receipt inside a single atomic SQLite transaction with `BEGIN IMMEDIATE`.
+- **Strict Exception Mode:** Added `raise_on_postcondition_failure: bool = False` flag to `Boundary.execute()` and defined `PostconditionFailedError(ActentraError)` to allow callers to strictly fail closed on non-verified postconditions.
+- **Parametric Digest Matching:** Added `postcondition_expected_digest: str | None = None` to `Boundary.execute()` for end-to-end `digest_match` verification.
+
+**Regression tests:** Added comprehensive regression test suite `tests/unit/test_security_finding_04_postconditions.py` (10 passing tests verifying `exists`, `absent`, and `digest_match` verified and refuted paths, verifier errors, verifier exceptions, stale observations, unconfigured verifiers, strict exception raising, and atomic SQLite transaction commit).
 
 ### F-5. External outcome reporting is unbound
 

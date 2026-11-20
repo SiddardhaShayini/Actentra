@@ -95,7 +95,7 @@ They support a local stress-test, not strong distributed mutual exclusion.
 - externally verified means a configured verifier returned an observation
 - the verifier is trusted because it runs on the same host/host identity
 
-The Boundary records success before postcondition verification. A refuted observation therefore does not change execution outcome.
+Following Finding 04 remediation, Boundary defers outcome record creation until postcondition verification completes, binding observation and outcome within a single atomic SQLite transaction. Refuted observations map to `failure`, verifier errors map to `unknown`, and `externally_verified` evidence is strictly emitted only upon verified success.
 
 Postcondition verifier coverage is currently filesystem-oriented. It does not validate HTTP mutations, SQL effects, KMS changes, SaaS APIs, or external transaction commit semantics.
 

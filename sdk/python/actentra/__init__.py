@@ -11,6 +11,7 @@ from actentra.boundary import (
     ActionBlockedError,
     ApprovalCallback,
     Boundary,
+    PostconditionFailedError,
     cli_approval_prompt,
 )
 from actentra.secrets import (
@@ -27,6 +28,7 @@ __all__ = [
     "Boundary",
     "FunctionCallAdapter",
     "LangChainToolWrapper",
+    "PostconditionFailedError",
     "ProtectedTool",
     "SecretsBroker",
     "SecretsError",

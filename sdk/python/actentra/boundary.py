@@ -28,7 +28,7 @@ from actentra_core.envelope import (
     compute_action_hash,
 )
 from actentra_core.evidence import EvidenceTier, build_evidence_record
-from actentra_core.observations import ObservationRecord
+from actentra_core.observations import ObservationRecord, build_observation
 from actentra_core.policy import PolicyEngine, PolicyPack, load_policy_file
 from actentra_core.receipts import ReceiptError, ReceiptStore
 from actentra_core.verdict import Decision, Verdict
@@ -58,6 +58,20 @@ class ActionBlockedError(ActentraError):
             f"[{decision.verdict.value.upper()}] rule={decision.rule_id} "
             f"crossing={crossing_id}: {decision.reason}"
         )
+
+
+class PostconditionFailedError(ActentraError):
+    """Raised when an action's postcondition fails verification (refuted, error, or unverified)."""
+
+    def __init__(
+        self,
+        observation: ObservationRecord | None,
+        outcome_status: str,
+        message: str,
+    ) -> None:
+        self.observation = observation
+        self.outcome_status = outcome_status
+        super().__init__(message)
 
 
 class ApprovalGrant:
@@ -420,6 +434,8 @@ class Boundary:
         idempotency_key: str | None = None,
         verify_postcondition: bool = False,
         postcondition_claim: str = "exists",
+        postcondition_expected_digest: str | None = None,
+        raise_on_postcondition_failure: bool = False,
     ) -> Any:
         """Evaluate an action, record a durable decision, enforce verdict, and record outcome."""
         warrant_obj = self._check_warrant(
@@ -607,56 +623,161 @@ class Boundary:
         except (TypeError, ValueError, CanonicalizationError):
             result_hash = None
 
-        self._store.record_outcome(
-            crossing_id=envelope.crossing_id,
-            session_id=envelope.session_id,
-            canonical_hash=envelope.canonical_hash,
-            policy_version=decision.policy_version,
-            status="success",
-            result_hash=result_hash,
-            evidence_status="locally_observed",
-        )
-        # Update session cumulative budgets
-        self._engine.budget_tracker.record_usage(envelope)
+        if not verify_postcondition:
+            self._store.record_outcome(
+                crossing_id=envelope.crossing_id,
+                session_id=envelope.session_id,
+                canonical_hash=envelope.canonical_hash,
+                policy_version=decision.policy_version,
+                status="success",
+                result_hash=result_hash,
+                evidence_status="locally_observed",
+            )
+            self._engine.budget_tracker.record_usage(envelope)
+            return result
 
-        # Postcondition verification if requested and verifier configured
-        if verify_postcondition and self._verifier is not None:
-            with contextlib.suppress(Exception):
+        # Postcondition verification requested: finalize outcome strictly after verification
+        if self._verifier is None:
+            self._store.record_outcome(
+                crossing_id=envelope.crossing_id,
+                session_id=envelope.session_id,
+                canonical_hash=envelope.canonical_hash,
+                policy_version=decision.policy_version,
+                status="unknown",
+                result_hash=result_hash,
+                error=(
+                    "Postcondition verification requested but no verifier is "
+                    "configured on Boundary"
+                ),
+                reason="postcondition_unverified",
+                evidence_status="unknown",
+            )
+            if raise_on_postcondition_failure:
+                raise PostconditionFailedError(
+                    None,
+                    "unknown",
+                    "Postcondition verification requested but no verifier is "
+                    "configured on Boundary",
+                )
+            return result
+
+        obs: ObservationRecord | None = None
+        try:
+            kwargs: dict[str, Any] = {"crossing_id": envelope.crossing_id}
+            if postcondition_expected_digest is not None:
+                kwargs["expected_digest"] = postcondition_expected_digest
+            try:
                 obs = self._verifier.verify(
                     resource=envelope.action.resource,
                     claim=postcondition_claim,
-                    crossing_id=envelope.crossing_id,
+                    **kwargs,
                 )
-                self._store.record_observation(obs)
-                if obs.status == "verified":
-                    ev = build_evidence_record(
-                        crossing_id=envelope.crossing_id,
-                        tier=EvidenceTier.EXTERNALLY_VERIFIED,
-                        trust_domain="verifier:workspace",
-                        collector=obs.verifier_id,
-                        details={
-                            "observation_id": obs.observation_id,
-                            "resource": obs.subject_resource,
-                            "claim": obs.claim,
-                            "status": obs.status,
-                            "observed_digest": obs.observed_digest,
-                        },
-                        expires_at=obs.expires_at,
-                    )
-                    self._store.record_evidence(ev)
-                    link = CausalLink(
-                        link_id=generate_link_id(),
-                        link_version="1",
-                        source_id=envelope.crossing_id,
-                        source_type="crossing",
-                        relation="verifies",
-                        target_id=obs.observation_id,
-                        target_type="observation",
-                        created_at=utc_iso(),
-                    )
-                    self._store.record_causal_link(link)
+            except TypeError:
+                obs = self._verifier.verify(
+                    resource=envelope.action.resource,
+                    claim=postcondition_claim,
+                )
+        except Exception as exc:
+            obs = build_observation(
+                subject_resource=envelope.action.resource,
+                claim=postcondition_claim,
+                status="error",
+                verifier_id=getattr(self._verifier, "verifier_id", "actentra.verifier.unknown"),
+                verifier_version=getattr(self._verifier, "verifier_version", "1.0.0"),
+                trust_domain="local_host",
+                crossing_id=envelope.crossing_id,
+                error=f"Verifier raised exception: {exc}",
+            )
 
-        return result
+        if obs.status == "verified":
+            self._store.record_outcome(
+                crossing_id=envelope.crossing_id,
+                session_id=envelope.session_id,
+                canonical_hash=envelope.canonical_hash,
+                policy_version=decision.policy_version,
+                status="success",
+                result_hash=result_hash,
+                evidence_status="externally_verified",
+                observation=obs,
+            )
+            # Update session cumulative budgets only on verified success
+            self._engine.budget_tracker.record_usage(envelope)
+
+            ev = build_evidence_record(
+                crossing_id=envelope.crossing_id,
+                tier=EvidenceTier.EXTERNALLY_VERIFIED,
+                trust_domain="verifier:workspace",
+                collector=obs.verifier_id,
+                details={
+                    "observation_id": obs.observation_id,
+                    "resource": obs.subject_resource,
+                    "claim": obs.claim,
+                    "status": obs.status,
+                    "observed_digest": obs.observed_digest,
+                },
+                expires_at=obs.expires_at,
+            )
+            self._store.record_evidence(ev)
+            link = CausalLink(
+                link_id=generate_link_id(),
+                link_version="1",
+                source_id=envelope.crossing_id,
+                source_type="crossing",
+                relation="verifies",
+                target_id=obs.observation_id,
+                target_type="observation",
+                created_at=utc_iso(),
+            )
+            self._store.record_causal_link(link)
+            return result
+
+        elif obs.status == "refuted":
+            err_msg = (
+                f"Postcondition refuted: claim '{postcondition_claim}' on resource "
+                f"'{envelope.action.resource}'"
+            )
+            if obs.error:
+                err_msg += f" ({obs.error})"
+            self._store.record_outcome(
+                crossing_id=envelope.crossing_id,
+                session_id=envelope.session_id,
+                canonical_hash=envelope.canonical_hash,
+                policy_version=decision.policy_version,
+                status="failure",
+                result_hash=result_hash,
+                error=err_msg,
+                reason="postcondition_refuted",
+                evidence_status="locally_observed",
+                observation=obs,
+            )
+            if raise_on_postcondition_failure:
+                raise PostconditionFailedError(obs, "failure", err_msg)
+            return result
+
+        else:
+            status_label = obs.status
+            err_msg = (
+                f"Postcondition verification status is '{status_label}' for claim "
+                f"'{postcondition_claim}'"
+            )
+            if obs.error:
+                err_msg += f": {obs.error}"
+            ev_status = "stale" if status_label == "stale" else "unknown"
+            self._store.record_outcome(
+                crossing_id=envelope.crossing_id,
+                session_id=envelope.session_id,
+                canonical_hash=envelope.canonical_hash,
+                policy_version=decision.policy_version,
+                status="unknown",
+                result_hash=result_hash,
+                error=err_msg,
+                reason=f"postcondition_{status_label}",
+                evidence_status=ev_status,
+                observation=obs,
+            )
+            if raise_on_postcondition_failure:
+                raise PostconditionFailedError(obs, "unknown", err_msg)
+            return result
 
     def acquire_lease(
         self,
