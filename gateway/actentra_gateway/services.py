@@ -44,7 +44,10 @@ from actentra_core.handoffs import (
 )
 from actentra_core.identity import (
     CallerContext,
+    DelegationRegistry,
     IdentitySecurityError,
+    get_default_delegation_registry,
+    make_local_caller_context,
 )
 from actentra_core.policy import lint_policy, load_policy_yaml
 from actentra_core.receipts import GENESIS_HASH, verify_log
@@ -110,10 +113,12 @@ class AppServices:
         executor_registry: ExecutorRegistry | None = None,
         file_verifier: WorkspaceFileVerifier | None = None,
         approval_ttl_seconds: float = 300.0,
+        delegation_registry: DelegationRegistry | None = None,
     ) -> None:
         self.boundary = boundary
         self.registry = executor_registry or ExecutorRegistry()
         self.approval_ttl_seconds = approval_ttl_seconds
+        self.delegation_registry = delegation_registry or get_default_delegation_registry()
         if file_verifier is not None:
             self.file_verifier: WorkspaceFileVerifier | None = file_verifier
         elif self.registry.workspace_root is not None:
@@ -122,6 +127,39 @@ class AppServices:
             self.file_verifier = None
         # Clean up expired approvals upon service startup (idempotent, restart-safe)
         self.boundary.receipt_store.recover_pending_approvals()
+
+    def _validate_caller_context(self, caller_context: CallerContext | None) -> None:
+        """Validate that caller_context does not assert forged or revoked delegation."""
+        if caller_context is None:
+            return
+        if caller_context.delegated_by is not None and not caller_context.is_trusted_operator:
+            grant = None
+            if caller_context.delegation_grant_id:
+                grant = self.delegation_registry.get_grant(caller_context.delegation_grant_id)
+            if grant is None:
+                grant = self.delegation_registry.find_active_grant(
+                    delegator_id=caller_context.delegated_by,
+                    delegatee_id=caller_context.principal_id,
+                )
+            if grant is None:
+                default_reg = get_default_delegation_registry()
+                if caller_context.delegation_grant_id:
+                    grant = default_reg.get_grant(caller_context.delegation_grant_id)
+                if grant is None:
+                    grant = default_reg.find_active_grant(
+                        delegator_id=caller_context.delegated_by,
+                        delegatee_id=caller_context.principal_id,
+                    )
+            if grant is None:
+                raise IdentitySecurityError(
+                    f"Forged delegation context: principal '{caller_context.principal_id}' "
+                    f"has no verified delegation grant from '{caller_context.delegated_by}'"
+                )
+            if not grant.is_valid():
+                raise IdentitySecurityError(
+                    f"Delegation grant from '{caller_context.delegated_by}' to "
+                    f"'{caller_context.principal_id}' is invalid or revoked"
+                )
 
     # --- 1. Health & Status ---
 
@@ -181,6 +219,36 @@ class AppServices:
 
         if caller_context is not None:
             try:
+                self._validate_caller_context(caller_context)
+            except IdentitySecurityError as exc:
+                return {
+                    "verdict": Verdict.DENY.value,
+                    "error": str(exc),
+                    "code": "unauthorized_principal",
+                    "rule_id": "identity:unauthorized-delegation",
+                    "canonical_hash": "sha256:" + ("0" * 64),
+                    "risk_tags": ["delegation-forgery"],
+                }
+
+            claimed_parent = (
+                data.get("parent_agent_id") or data.get("delegated_by") or data.get("parent")
+            )
+            if claimed_parent is not None:
+                clean_parent = str(claimed_parent).strip()
+                if not caller_context.is_agent_allowed(clean_parent):
+                    return {
+                        "verdict": Verdict.DENY.value,
+                        "error": (
+                            f"Caller-supplied parent identity '{clean_parent}' is not "
+                            f"authorized for principal '{caller_context.principal_id}'"
+                        ),
+                        "code": "unauthorized_principal",
+                        "rule_id": "identity:unauthorized-delegation",
+                        "canonical_hash": "sha256:" + ("0" * 64),
+                        "risk_tags": ["spoofing-attempt", "delegation-forgery"],
+                    }
+
+            try:
                 caller_context.validate_identity_claims(agent_id_claim, claimed_trust)
             except IdentitySecurityError as exc:
                 return {
@@ -195,8 +263,7 @@ class AppServices:
                 return {
                     "verdict": Verdict.DENY.value,
                     "error": (
-                        f"Caller '{caller_context.principal_id}' lacks "
-                        "scope 'crossings:propose'"
+                        f"Caller '{caller_context.principal_id}' lacks scope 'crossings:propose'"
                     ),
                     "code": "unauthorized_principal",
                     "rule_id": "identity:scope-denied",
@@ -207,8 +274,7 @@ class AppServices:
                 return {
                     "verdict": Verdict.DENY.value,
                     "error": (
-                        f"Caller '{caller_context.principal_id}' lacks "
-                        "scope 'crossings:execute'"
+                        f"Caller '{caller_context.principal_id}' lacks scope 'crossings:execute'"
                     ),
                     "code": "unauthorized_principal",
                     "rule_id": "identity:scope-denied",
@@ -500,8 +566,7 @@ class AppServices:
             if not caller_context.has_scope("crossings:execute"):
                 return {
                     "error": (
-                        f"Principal '{caller_context.principal_id}' lacks "
-                        "'crossings:execute' scope"
+                        f"Principal '{caller_context.principal_id}' lacks 'crossings:execute' scope"
                     )
                 }
             if caller_context.authenticated and not caller_context.is_trusted_operator:
@@ -1216,6 +1281,7 @@ class AppServices:
     ) -> dict[str, Any]:
         """Create a durable cross-agent task handoff record."""
         if caller_context is not None:
+            self._validate_caller_context(caller_context)
             if not caller_context.has_scope("handoffs:create"):
                 raise UnauthorizedAgentHandoffError(
                     f"Principal '{caller_context.principal_id}' lacks 'handoffs:create' scope"
@@ -1285,6 +1351,7 @@ class AppServices:
             raise HandoffError(f"Handoff '{handoff_id}' not found")
 
         if caller_context is not None:
+            self._validate_caller_context(caller_context)
             if not caller_context.has_scope("handoffs:advance"):
                 raise UnauthorizedAgentHandoffError(
                     f"Principal '{caller_context.principal_id}' lacks 'handoffs:advance' scope"
@@ -1355,6 +1422,7 @@ class AppServices:
             raise HandoffError(f"Handoff '{handoff_id}' not found")
 
         if caller_context is not None:
+            self._validate_caller_context(caller_context)
             if not caller_context.has_scope("handoffs:verify"):
                 raise UnauthorizedAgentHandoffError(
                     f"Principal '{caller_context.principal_id}' lacks 'handoffs:verify' scope"
@@ -1447,12 +1515,19 @@ class AppServices:
     ) -> dict[str, Any]:
         """Acquire a durable resource lease for an agent."""
         if caller_context is not None:
+            try:
+                self._validate_caller_context(caller_context)
+            except IdentitySecurityError as exc:
+                return {
+                    "status": "error",
+                    "error": str(exc),
+                    "code": "unauthorized_principal",
+                }
             if not caller_context.has_scope("leases:acquire"):
                 return {
                     "status": "error",
                     "error": (
-                        f"Principal '{caller_context.principal_id}' lacks "
-                        "'leases:acquire' scope"
+                        f"Principal '{caller_context.principal_id}' lacks 'leases:acquire' scope"
                     ),
                 }
             if not caller_context.is_agent_allowed(owner_agent_id):
@@ -1496,13 +1571,21 @@ class AppServices:
             }
 
         if caller_context is not None:
+            try:
+                self._validate_caller_context(caller_context)
+            except IdentitySecurityError as exc:
+                return {
+                    "status": "not_found_or_unauthorized",
+                    "released": False,
+                    "error": str(exc),
+                    "code": "unauthorized_principal",
+                }
             if not caller_context.has_scope("leases:release"):
                 return {
                     "status": "not_found_or_unauthorized",
                     "released": False,
                     "error": (
-                        f"Principal '{caller_context.principal_id}' lacks "
-                        "'leases:release' scope"
+                        f"Principal '{caller_context.principal_id}' lacks 'leases:release' scope"
                     ),
                 }
             if not caller_context.is_agent_allowed(owner_agent_id):
@@ -1545,3 +1628,71 @@ class AppServices:
             offset=offset,
         )
         return [lease_obj.to_dict() for lease_obj in leases]
+
+    # --- 13. Explicit Delegation Authority ---
+
+    def register_delegation(
+        self,
+        *,
+        delegator_id: str,
+        delegatee_id: str,
+        allowed_agents: list[str] | tuple[str, ...],
+        scopes: list[str] | tuple[str, ...],
+        grant_id: str | None = None,
+        ttl_seconds: float | None = None,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any]:
+        """Explicitly register an authorized delegation grant from delegator to delegatee."""
+        if caller_context is not None:
+            self._validate_caller_context(caller_context)
+            if not caller_context.authenticated:
+                raise IdentitySecurityError("Unauthenticated caller cannot delegate authority")
+            if not caller_context.is_trusted_operator:
+                if not caller_context.is_agent_allowed(delegator_id):
+                    raise IdentitySecurityError(
+                        f"Principal '{caller_context.principal_id}' is not authorized to "
+                        f"delegate on behalf of '{delegator_id}'"
+                    )
+                for sc in scopes:
+                    if not caller_context.has_scope(sc):
+                        raise IdentitySecurityError(
+                            f"Delegation scope violation: delegator "
+                            f"'{caller_context.principal_id}' lacks scope '{sc}'"
+                        )
+                for ag in allowed_agents:
+                    if not caller_context.is_agent_allowed(ag):
+                        raise IdentitySecurityError(
+                            f"Delegation agent violation: delegator "
+                            f"'{caller_context.principal_id}' is not authorized for agent '{ag}'"
+                        )
+            delegator_ctx = caller_context
+        else:
+            delegator_ctx = make_local_caller_context(delegator_id)
+
+        grant = self.delegation_registry.register_grant(
+            delegator=delegator_ctx,
+            delegatee_id=delegatee_id,
+            allowed_agents=allowed_agents,
+            scopes=scopes,
+            grant_id=grant_id,
+            ttl_seconds=ttl_seconds,
+        )
+        return grant.to_dict()
+
+    def revoke_delegation(
+        self,
+        grant_id: str,
+        caller_context: CallerContext | None = None,
+    ) -> bool:
+        """Revoke an active delegation grant."""
+        if caller_context is not None:
+            self._validate_caller_context(caller_context)
+            revoker = caller_context
+        else:
+            revoker = make_local_caller_context("local_operator")
+        return self.delegation_registry.revoke_grant(grant_id, revoker)
+
+    def get_delegation(self, grant_id: str) -> dict[str, Any] | None:
+        """Fetch delegation grant by grant_id."""
+        grant = self.delegation_registry.get_grant(grant_id)
+        return grant.to_dict() if grant is not None else None

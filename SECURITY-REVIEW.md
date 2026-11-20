@@ -10,7 +10,7 @@ Actentra contains useful local enforcement controls, but it is **not suitable fo
 
 | # | Severity | File | Lines | Vulnerability / conclusion | Confidence |
 |---|----------|------|-------|----------------------------|------------|
-| 1 | 🟠 HIGH | `gateway/actentra_gateway/http_service.py`; `core/actentra_core/identity.py` | 122-147; 220-280, 300-309 | **NOT REMEDIATED** — Structured bearer prefixes are accepted despite a configured token; `operator:` yields wildcard authority. `X-Actentra-Delegated-By` is caller-controlled and adds the named identity to `allowed_agents`. Both paths were reproduced locally. | 10/10 |
+| 1 | 🟠 HIGH | `gateway/actentra_gateway/http_service.py`; `core/actentra_core/identity.py` | 122-147; 220-280, 300-309 | **VERIFIED REMEDIATED (SECOND PASS)** — Structured bearer prefixes no longer bypass configured secrets. Caller-asserted delegation headers without active, registered `DelegationGrant` are strictly rejected. 14 adversarial regression tests pass. | 10/10 |
 | 2 | 🟠 HIGH | `executors/actentra_executors/http.py` | 101-170, 178-274, 333-369, 551 | **VERIFIED REMEDIATED** — DNS answers are validated and pinned to the connection; peer and redirect checks and proxy isolation are in place. Focused regression tests passed. | 9/10 |
 | 3 | 🟡 MEDIUM | `core/actentra_core/warrants.py`; `core/actentra_core/receipts.py` | 260-290; 2535-2610 | **PARTIALLY REMEDIATED** — SQLite-backed `Boundary` use is durable and atomic, but the standalone memory fallback evicts exhausted quotas at its emergency cap. Finite-use replay was reproduced locally. | 9/10 |
 | 4 | 🟡 MEDIUM | `sdk/python/actentra/boundary.py`; `core/actentra_core/receipts.py` | 626-779; 791-825 | **VERIFIED REMEDIATED** — When verification is requested, success is recorded only after a passing observation; refuted and inconclusive outcomes are recorded as failure or unknown. | 9/10 |
@@ -33,6 +33,7 @@ The most important next action is to accept structured identities only through c
 
 ## Detailed reports
 
+- [Finding 01 second-pass remediation report](REMEDIATION_REPORT_FINDING_01_SECOND_PASS.md)
 - [Post-remediation security validation](POST_REMEDIATION_SECURITY_VALIDATION.md)
 - [Finding remediation verification](FINDING_REMEDIATION_VERIFICATION.md)
 - [Integrated adversarial test report](INTEGRATED_ADVERSARIAL_TEST_REPORT.md)

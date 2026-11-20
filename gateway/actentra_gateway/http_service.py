@@ -24,7 +24,9 @@ from actentra_core.handoffs import (
 )
 from actentra_core.identity import (
     CallerContext,
+    DelegationRegistry,
     IdentitySecurityError,
+    get_default_delegation_registry,
     resolve_http_caller_context,
 )
 from actentra_gateway.services import AppServices, ExecutorRegistry
@@ -112,17 +114,30 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         expected_token = raw_token if isinstance(raw_token, str) else None
         raw_principals = getattr(server_obj, "token_principals", None)
         token_principals = raw_principals if isinstance(raw_principals, dict) else None
+        delegation_reg = None
+        server_services = getattr(server_obj, "services", None)
+        if server_services is not None:
+            cand = getattr(server_services, "delegation_registry", None)
+            if isinstance(cand, DelegationRegistry):
+                delegation_reg = cand
+        if delegation_reg is None:
+            cand = getattr(server_obj, "delegation_registry", None)
+            if isinstance(cand, DelegationRegistry):
+                delegation_reg = cand
+        if delegation_reg is None:
+            delegation_reg = get_default_delegation_registry()
         return resolve_http_caller_context(
             headers=headers_dict,
             expected_token=expected_token,
             remote_addr=remote_ip,
             token_principals=token_principals,
+            delegation_registry=delegation_reg,
         )
 
     def _check_auth(self) -> bool:
         server_obj = getattr(self, "server", None)
         raw_token = getattr(server_obj, "auth_token", None)
-        server_token = raw_token if isinstance(raw_token, str) else None
+        server_token = raw_token if isinstance(raw_token, str) and raw_token.strip() else None
         raw_principals = getattr(server_obj, "token_principals", None)
         token_principals = raw_principals if isinstance(raw_principals, dict) else None
         if not server_token and not token_principals:
@@ -139,11 +154,15 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             )
             return False
         token = auth_hdr[len("Bearer ") :].strip()
+        if not token:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "Unauthorized: missing or invalid Bearer token"},
+            )
+            return False
         if server_token and token == server_token:
             return True
         if token_principals and token in token_principals:
-            return True
-        if token.startswith(("agent:", "approver:", "operator:")):
             return True
         self._send_json(
             HTTPStatus.UNAUTHORIZED,
@@ -420,6 +439,18 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             self._send_html(HTTPStatus.OK, self._render_dashboard_html())
             return
 
+        if path.startswith("/v1/delegations/"):
+            grant_id = path[len("/v1/delegations/") :]
+            grant = services.get_delegation(grant_id)
+            if grant is None:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": f"Delegation grant '{grant_id}' not found"},
+                )
+            else:
+                self._send_json(HTTPStatus.OK, grant)
+            return
+
         self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Route '{path}' not found"})
 
     def do_POST(self) -> None:
@@ -575,9 +606,10 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                     status_code = HTTPStatus.FORBIDDEN
                 elif code == "not_found":
                     status_code = HTTPStatus.NOT_FOUND
-                elif code in ("already_executed", "claim_failed") or "already exists" in str(
-                    res.get("error", "")
-                ).lower():
+                elif (
+                    code in ("already_executed", "claim_failed")
+                    or "already exists" in str(res.get("error", "")).lower()
+                ):
                     status_code = HTTPStatus.CONFLICT
                 else:
                     status_code = HTTPStatus.BAD_REQUEST
@@ -1075,9 +1107,7 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             if not res.get("released"):
                 err_msg = str(res.get("error", "")).lower()
                 status = (
-                    HTTPStatus.FORBIDDEN
-                    if "not authorized" in err_msg
-                    else HTTPStatus.NOT_FOUND
+                    HTTPStatus.FORBIDDEN if "not authorized" in err_msg else HTTPStatus.NOT_FOUND
                 )
                 fallback_msg = f"Lease '{lid}' not found, already released, or unauthorized"
                 self._send_json(
@@ -1139,6 +1169,54 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"frozen": False, "message": "System unfrozen"})
             return
 
+        if path == "/v1/delegations":
+            try:
+                data = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid body: {exc}"})
+                return
+
+            delegation_req_fields = ("delegator_id", "delegatee_id", "allowed_agents", "scopes")
+            missing = [f for f in delegation_req_fields if f not in data]
+            if missing:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": f"Missing required fields: {', '.join(missing)}"},
+                )
+                return
+
+            try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
+            try:
+                grant = services.register_delegation(
+                    delegator_id=str(data["delegator_id"]),
+                    delegatee_id=str(data["delegatee_id"]),
+                    allowed_agents=data["allowed_agents"],
+                    scopes=data["scopes"],
+                    grant_id=data.get("grant_id"),
+                    ttl_seconds=float(data["ttl_seconds"]) if "ttl_seconds" in data else None,
+                    caller_context=caller_ctx,
+                )
+                self._send_json(HTTPStatus.CREATED, grant)
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": f"Failed to register delegation: {exc}"},
+                )
+            return
+
         self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Route '{path}' not found"})
 
     def do_DELETE(self) -> None:
@@ -1166,6 +1244,38 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     HTTPStatus.NOT_FOUND,
                     {"error": f"Causal link '{link_id}' not found"},
+                )
+            return
+
+        if path.startswith("/v1/delegations/"):
+            grant_id = path[len("/v1/delegations/") :]
+            try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
+            try:
+                success = services.revoke_delegation(grant_id, caller_context=caller_ctx)
+                if success:
+                    self._send_json(HTTPStatus.OK, {"revoked": True, "grant_id": grant_id})
+                else:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"error": f"Delegation grant '{grant_id}' not found"},
+                    )
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": f"Failed to revoke delegation: {exc}"},
                 )
             return
 
@@ -1222,6 +1332,7 @@ class ActentraHTTPServer(ThreadingHTTPServer):
             executor_registry=executor_registry,
             approval_ttl_seconds=approval_ttl_seconds,
         )
+        self.delegation_registry = self.services.delegation_registry
 
     def add_pending(self, envelope: Any, decision: Any) -> None:
         """Add pending approval to persistent SQLite store."""
