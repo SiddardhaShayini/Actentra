@@ -347,32 +347,42 @@ rules:
     assert code == 200
     allow_cid = allow_dec["crossing_id"]
 
-    # 2. Record outcome on allowed crossing
+    # 2. Claim crossing for execution
+    code, claim_res = _dispatch_handler(
+        services,
+        f"/v1/crossings/{allow_cid}/claim",
+        method="POST",
+        data={},
+    )
+    assert code == 200
+    claim_id = claim_res["claim_id"]
+
+    # 3. Record outcome on allowed crossing with claim_id
     code, out_res = _dispatch_handler(
         services,
         f"/v1/crossings/{allow_cid}/outcome",
         method="POST",
-        data={"status": "success", "result_hash": "sha256:abcd"},
+        data={"status": "success", "result_hash": "sha256:abcd", "claim_id": claim_id},
     )
     assert code == 200
     assert out_res["status"] == "recorded"
     assert out_res["reported_by"] == "caller"
 
-    # 3. Duplicate outcome must reject with 409 Conflict
+    # 4. Duplicate outcome (or claim replay) must reject with 409 Conflict
     code, dup_res = _dispatch_handler(
         services,
         f"/v1/crossings/{allow_cid}/outcome",
         method="POST",
-        data={"status": "success"},
+        data={"status": "success", "claim_id": claim_id},
     )
     assert code == 409
-    assert "Outcome already recorded" in str(dup_res)
+    assert "Outcome already recorded" in str(dup_res) or "conflict" in str(dup_res)
 
-    # 4. Outcome on non-existent crossing must reject with 404 Not Found
+    # 5. Outcome on non-existent crossing must reject with 404 Not Found
     code, nf_res = _dispatch_handler(
         services,
         "/v1/crossings/nonexistent-crossing-id/outcome",
         method="POST",
-        data={"status": "success"},
+        data={"status": "success", "claim_id": "dummy-claim-id"},
     )
     assert code == 404

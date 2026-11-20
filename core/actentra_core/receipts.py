@@ -21,6 +21,12 @@ from actentra_core.causal import (
     CycleDetectedError,
     detect_cycles,
 )
+from actentra_core.claims import (
+    ExecutionClaim,
+    ExecutionClaimError,
+    compute_claim_hash,
+    generate_claim_id,
+)
 from actentra_core.coordination import (
     ResourceConflictError,
     ResourceLease,
@@ -520,6 +526,31 @@ class ReceiptStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_warrant_usages_expires "
                 "ON warrant_usages(expires_at);"
+            )
+
+            # Phase 7: Durable one-time execution claims for outcome binding (Finding 5)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS execution_claims (
+                    claim_id TEXT PRIMARY KEY,
+                    crossing_id TEXT NOT NULL,
+                    executor_principal_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    canonical_hash TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('issued', 'consumed', 'expired')),
+                    issued_at TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    consumed_at TEXT,
+                    claim_hash TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_claim_crossing ON execution_claims(crossing_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_claim_executor ON execution_claims("
+                "executor_principal_id, status);"
             )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to initialize receipt store: {exc}") from exc
@@ -2626,6 +2657,246 @@ class ReceiptStore:
             return max(0, limit - consumed)
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to fetch remaining warrant uses: {exc}") from exc
+        finally:
+            conn.close()
+
+    # --- 13. Execution Claims (Phase 7 / Finding 5) ---
+
+    def issue_execution_claim(
+        self,
+        *,
+        crossing_id: str,
+        executor_principal_id: str,
+        session_id: str,
+        canonical_hash: str,
+        ttl_seconds: float = 300.0,
+    ) -> ExecutionClaim:
+        """Atomically issue a one-time execution claim for an allowed crossing."""
+        now = time.time()
+        now_iso = utc_now_iso()
+        exp_ts = now + ttl_seconds
+        claim_id = generate_claim_id()
+        claim_hash = compute_claim_hash(
+            claim_id=claim_id,
+            crossing_id=crossing_id,
+            executor_principal_id=executor_principal_id,
+            session_id=session_id,
+            canonical_hash=canonical_hash,
+            issued_at=now_iso,
+            expires_at=exp_ts,
+        )
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            # Check if active unexpired claim already exists
+            existing = conn.execute(
+                """
+                SELECT claim_id, expires_at FROM execution_claims
+                WHERE crossing_id = ? AND status = 'issued';
+                """,
+                (crossing_id,),
+            ).fetchall()
+            for row in existing:
+                if float(row[1]) > now:
+                    raise ExecutionClaimError(
+                        f"Active execution claim '{row[0]}' already exists "
+                        f"for crossing '{crossing_id}'"
+                    )
+
+            conn.execute(
+                """
+                INSERT INTO execution_claims (
+                    claim_id, crossing_id, executor_principal_id, session_id,
+                    canonical_hash, status, issued_at, expires_at, consumed_at, claim_hash
+                ) VALUES (?, ?, ?, ?, ?, 'issued', ?, ?, NULL, ?);
+                """,
+                (
+                    claim_id,
+                    crossing_id,
+                    executor_principal_id,
+                    session_id,
+                    canonical_hash,
+                    now_iso,
+                    exp_ts,
+                    claim_hash,
+                ),
+            )
+            conn.execute("COMMIT;")
+            return ExecutionClaim(
+                claim_id=claim_id,
+                crossing_id=crossing_id,
+                executor_principal_id=executor_principal_id,
+                session_id=session_id,
+                canonical_hash=canonical_hash,
+                status="issued",
+                issued_at=now_iso,
+                expires_at=exp_ts,
+                claim_hash=claim_hash,
+            )
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise
+        finally:
+            conn.close()
+
+    def get_execution_claim(self, claim_id: str) -> ExecutionClaim | None:
+        """Retrieve execution claim by ID."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT claim_id, crossing_id, executor_principal_id, session_id,
+                       canonical_hash, status, issued_at, expires_at, consumed_at, claim_hash
+                FROM execution_claims
+                WHERE claim_id = ? LIMIT 1;
+                """,
+                (claim_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return ExecutionClaim(
+                claim_id=str(row[0]),
+                crossing_id=str(row[1]),
+                executor_principal_id=str(row[2]),
+                session_id=str(row[3]),
+                canonical_hash=str(row[4]),
+                status=str(row[5]),  # type: ignore[arg-type]
+                issued_at=str(row[6]),
+                expires_at=float(row[7]),
+                consumed_at=str(row[8]) if row[8] is not None else None,
+                claim_hash=str(row[9]),
+            )
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch execution claim: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_execution_claim_for_crossing(self, crossing_id: str) -> ExecutionClaim | None:
+        """Retrieve the latest execution claim for a crossing_id."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT claim_id, crossing_id, executor_principal_id, session_id,
+                       canonical_hash, status, issued_at, expires_at, consumed_at, claim_hash
+                FROM execution_claims
+                WHERE crossing_id = ?
+                ORDER BY ROWID DESC LIMIT 1;
+                """,
+                (crossing_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return ExecutionClaim(
+                claim_id=str(row[0]),
+                crossing_id=str(row[1]),
+                executor_principal_id=str(row[2]),
+                session_id=str(row[3]),
+                canonical_hash=str(row[4]),
+                status=str(row[5]),  # type: ignore[arg-type]
+                issued_at=str(row[6]),
+                expires_at=float(row[7]),
+                consumed_at=str(row[8]) if row[8] is not None else None,
+                claim_hash=str(row[9]),
+            )
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch execution claim for crossing: {exc}") from exc
+        finally:
+            conn.close()
+
+    def consume_execution_claim(
+        self,
+        claim_id: str,
+        *,
+        executor_principal_id: str,
+        crossing_id: str,
+    ) -> ExecutionClaim:
+        """Atomically validate and consume an execution claim for outcome reporting."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            row = conn.execute(
+                """
+                SELECT claim_id, crossing_id, executor_principal_id, session_id,
+                       canonical_hash, status, issued_at, expires_at, consumed_at, claim_hash
+                FROM execution_claims
+                WHERE claim_id = ?;
+                """,
+                (claim_id,),
+            ).fetchone()
+            if row is None:
+                raise ExecutionClaimError(f"Execution claim '{claim_id}' not found")
+
+            claim = ExecutionClaim(
+                claim_id=str(row[0]),
+                crossing_id=str(row[1]),
+                executor_principal_id=str(row[2]),
+                session_id=str(row[3]),
+                canonical_hash=str(row[4]),
+                status=str(row[5]),  # type: ignore[arg-type]
+                issued_at=str(row[6]),
+                expires_at=float(row[7]),
+                consumed_at=str(row[8]) if row[8] is not None else None,
+                claim_hash=str(row[9]),
+            )
+
+            if claim.crossing_id != crossing_id:
+                raise ExecutionClaimError(
+                    f"Execution claim '{claim_id}' was issued for crossing '{claim.crossing_id}', "
+                    f"not '{crossing_id}'"
+                )
+
+            # Check executor principal match
+            if (
+                executor_principal_id != "anonymous_executor"
+                and claim.executor_principal_id != executor_principal_id
+            ):
+                raise ExecutionClaimError(
+                    f"Execution claim '{claim_id}' was issued to executor "
+                    f"'{claim.executor_principal_id}', not caller '{executor_principal_id}'"
+                )
+
+            if claim.status == "consumed":
+                raise ExecutionClaimError(
+                    f"Execution claim '{claim_id}' has already been consumed (replayed)"
+                )
+
+            if time.time() > claim.expires_at:
+                conn.execute(
+                    "UPDATE execution_claims SET status = 'expired' WHERE claim_id = ?;",
+                    (claim_id,),
+                )
+                conn.execute("COMMIT;")
+                raise ExecutionClaimError(f"Execution claim '{claim_id}' has expired")
+
+            now_iso = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE execution_claims
+                SET status = 'consumed', consumed_at = ?
+                WHERE claim_id = ?;
+                """,
+                (now_iso, claim_id),
+            )
+            conn.execute("COMMIT;")
+            return ExecutionClaim(
+                claim_id=claim.claim_id,
+                crossing_id=claim.crossing_id,
+                executor_principal_id=claim.executor_principal_id,
+                session_id=claim.session_id,
+                canonical_hash=claim.canonical_hash,
+                status="consumed",
+                issued_at=claim.issued_at,
+                expires_at=claim.expires_at,
+                consumed_at=now_iso,
+                claim_hash=claim.claim_hash,
+            )
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise
         finally:
             conn.close()
 

@@ -246,7 +246,7 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             return
 
         if path.startswith("/v1/crossings/") and not path.endswith(
-            ("/approve", "/execute", "/outcome")
+            ("/approve", "/execute", "/outcome", "/claim")
         ):
             cid = path[len("/v1/crossings/") :]
             detail = services.get_pending_approval(cid)
@@ -557,6 +557,35 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, res)
             return
 
+        if path.startswith("/v1/crossings/") and path.endswith("/claim"):
+            crossing_id = path[len("/v1/crossings/") : -len("/claim")]
+            try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
+            res = services.claim_crossing_for_execution(crossing_id, caller_context=caller_ctx)
+            if "error" in res:
+                code = res.get("code")
+                if code == "forbidden":
+                    status_code = HTTPStatus.FORBIDDEN
+                elif code == "not_found":
+                    status_code = HTTPStatus.NOT_FOUND
+                elif code in ("already_executed", "claim_failed") or "already exists" in str(
+                    res.get("error", "")
+                ).lower():
+                    status_code = HTTPStatus.CONFLICT
+                else:
+                    status_code = HTTPStatus.BAD_REQUEST
+                self._send_json(status_code, res)
+                return
+            self._send_json(HTTPStatus.OK, res)
+            return
+
         if path.startswith("/v1/crossings/") and path.endswith("/outcome"):
             crossing_id = path[len("/v1/crossings/") : -len("/outcome")]
             try:
@@ -580,18 +609,52 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            claim_id = data.get("claim_id") or self.headers.get("X-Actentra-Claim-Id")
+            if not claim_id:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": (
+                            "Missing required 'claim_id': external outcome reporting "
+                            "requires a valid one-time execution claim issued via "
+                            "POST /v1/crossings/{id}/claim"
+                        ),
+                        "code": "claim_required",
+                    },
+                )
+                return
+
+            try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
             res = services.record_external_outcome(
                 crossing_id,
                 status=status_val,
+                claim_id=claim_id,
                 result_hash=data.get("result_hash"),
                 error=data.get("error"),
+                caller_context=caller_ctx,
             )
             if "error" in res:
+                code = res.get("code")
                 err_msg = str(res.get("error", "")).lower()
-                if "already recorded" in err_msg:
-                    status_code = HTTPStatus.CONFLICT
-                elif "not found" in err_msg:
+                if code == "forbidden" or "unauthorized" in err_msg or "not authorized" in err_msg:
+                    status_code = HTTPStatus.FORBIDDEN
+                elif code == "not_found" or "not found" in err_msg:
                     status_code = HTTPStatus.NOT_FOUND
+                elif (
+                    code == "conflict"
+                    or "already recorded" in err_msg
+                    or "already been consumed" in err_msg
+                    or "replayed" in err_msg
+                ):
+                    status_code = HTTPStatus.CONFLICT
                 else:
                     status_code = HTTPStatus.BAD_REQUEST
                 self._send_json(status_code, res)

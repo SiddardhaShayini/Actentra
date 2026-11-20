@@ -17,7 +17,7 @@ The architecture is coherent as a local Python SDK and alpha gateway, but it is 
 ### Weaknesses
 
 - I1 is not enforceable by Actentra: in-process agents can hold raw credentials or call targets outside wrapped APIs.
-- HTTP external executors only report outcomes; the gateway cannot prove execution.
+- HTTP external executors report outcomes bound to one-time cryptographically hashed execution claims (remediating F-5); while claim unicity, caller identity, and replay prevention are guaranteed, execution attestation still relies on executor trust rather than hardware-enforced remote attestation.
 - MCP downstream server processes receive JSON-RPC only after proposal checks, but the proxy has no end-to-end auth or mTLS.
 - Arbitrary callable adapters can perform side effects that bypass registered executor policy constraints.
 - The code can be bypassed operationally by running tools outside Actentra.
@@ -96,6 +96,8 @@ They support a local stress-test, not strong distributed mutual exclusion.
 - the verifier is trusted because it runs on the same host/host identity
 
 Following Finding 04 remediation, Boundary defers outcome record creation until postcondition verification completes, binding observation and outcome within a single atomic SQLite transaction. Refuted observations map to `failure`, verifier errors map to `unknown`, and `externally_verified` evidence is strictly emitted only upon verified success.
+
+Following Finding 05 remediation, external outcome reporting over HTTP mandates a one-time execution claim cryptographically binding the crossing ID, executor principal, session, canonical hash, and expiry. Outcome reports cannot be submitted without an issued claim, claims cannot be replayed or shared across executors, and external outcome evidence is explicitly partitioned under the `CALLER_REPORTED` evidence tier.
 
 Postcondition verifier coverage is currently filesystem-oriented. It does not validate HTTP mutations, SQL effects, KMS changes, SaaS APIs, or external transaction commit semantics.
 

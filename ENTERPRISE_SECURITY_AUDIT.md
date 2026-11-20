@@ -162,22 +162,45 @@ Passing tests are treated as evidence for tested behavior, not proof of complete
 
 ### F-5. External outcome reporting is unbound
 
+**Status:** **REMEDIATED**  
 **Severity:** MEDIUM  
 **Affected source:** `gateway/actentra_gateway/services.py:521-559`; `gateway/actentra_gateway/http_service.py:479-507` (outcome route)
 
 **Attack preconditions:** An allowed crossing exists and an HTTP caller can reach the gateway.
 
+**Original Vulnerability:**
+In the initial gateway design, the external outcome endpoint (`POST /v1/crossings/{id}/outcome`) accepted arbitrary outcome reports without requiring proof that the crossing had been claimed for execution, without verifying that the caller was the authorized executor, and without single-use binding. Any network caller with access to the crossing ID could prematurely report success or failure, polluting the audit log with false `status="success"` entries and improperly consuming session budgets.
+
 **Reproduction:**
 
 1. Propose or receive an allowed external crossing.
 2. Call its outcome route with `status=success` without executing the tool.
-3. The store creates a caller-reported outcome and evidence.
+3. The store creates a caller-reported outcome and evidence without claim verification.
 
-**Actual impact:** False outcome/status history and budget accounting.
+**Actual impact:** False outcome/status history and corrupted budget accounting.
 
-**Remediation:** Issue a cryptographically bound one-time execution claim for each crossing. Bind outcomes to claim ID, executor principal, canonical hash, and session. Separate caller-reported evidence from verified evidence.
+**Remediation:**
+- **One-Time Execution Claim Architecture (`actentra_core.claims`):**
+  - Created `ExecutionClaim` dataclass, Crockford base32 claim ID generator (`generate_claim_id()` with prefix `claim_`), and canonical SHA-256 hash computation (`compute_claim_hash()`) cryptographically binding `crossing_id`, `executor_principal_id`, `session_id`, `canonical_hash`, `issued_at`, and `expires_at`.
+- **Durable Claim Store in SQLite (`ReceiptStore`):**
+  - Added `execution_claims` table with strict SQL schema (`status IN ('issued', 'consumed', 'expired')`) and indexes on `crossing_id` and `(executor_principal_id, status)`.
+  - Added atomic `ReceiptStore.issue_execution_claim(...)` using `BEGIN IMMEDIATE` transactions to prevent duplicate or conflicting active claims for the same crossing.
+  - Added atomic `ReceiptStore.consume_execution_claim(...)` using `BEGIN IMMEDIATE` transactions to enforce single-use consumption: validates crossing match, validates authenticated executor principal match, checks expiry, and transitions status to `consumed`.
+- **Gateway Endpoints & Services Hardening:**
+  - Added `POST /v1/crossings/{id}/claim` endpoint (`services.claim_crossing_for_execution`) that verifies crossing existence, requires `verdict="allow"`, checks `crossings:claim` or `crossings:execute` scope, validates principal authority over the agent, and issues a bound execution claim.
+  - Hardened `POST /v1/crossings/{id}/outcome` endpoint (`services.record_external_outcome`) to strictly mandate `claim_id` from HTTP callers (`400 Bad Request`, `code: claim_required`).
+  - Outcome recording verifies and atomically consumes the claim via `ReceiptStore.consume_execution_claim()`. Claim reuse/replay is rejected with `409 Conflict`, cross-executor claim spoofing is rejected with `403 Forbidden`, and expired claims are rejected with `400 Bad Request`.
+  - Distinguishes `EvidenceTier.CALLER_REPORTED` for external outcomes, and updates session budgets only on verified success.
+  - Preserved backward compatibility for in-process callers by auto-issuing and consuming an internal claim when `caller_context is None`.
 
-**Regression test:** Reject success/failure reporting before claim issuance and after claim reuse; accept once only from the authenticated executor principal.
+**Regression tests:** Added comprehensive regression test suite `tests/unit/test_security_finding_05_external_outcomes.py` with 7 tests:
+- `test_outcome_rejected_without_claim`: Rejects outcome submissions lacking `claim_id`.
+- `test_claim_issuance_and_successful_outcome_binding`: Verifies end-to-end claim issuance, claim consumption, outcome recording, and receipt persistence.
+- `test_claim_replay_rejected`: Ensures replaying an already consumed claim is rejected with `409 Conflict`.
+- `test_cross_executor_claim_spoofing_rejected`: Ensures an executor cannot submit an outcome using another executor's claim (`403 Forbidden`).
+- `test_expired_claim_rejected`: Ensures claims whose TTL has expired are rejected.
+- `test_cannot_claim_disallowed_crossing`: Ensures crossings with `verdict="deny"` or `verdict="ask"` cannot be claimed.
+- `test_http_gateway_claim_and_outcome_end_to_end`: Tests full HTTP gateway interaction across `/claim` and `/outcome`.
 
 ## Other security observations
 

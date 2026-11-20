@@ -36,6 +36,8 @@ DEFAULT_APPROVER_SCOPES: tuple[str, ...] = ("crossings:read", "crossings:approve
 DEFAULT_AGENT_SCOPES: tuple[str, ...] = (
     "crossings:propose",
     "crossings:execute",
+    "crossings:claim",
+    "crossings:outcome",
     "crossings:read",
     "handoffs:create",
     "handoffs:advance",
@@ -53,6 +55,8 @@ DEFAULT_LOOPBACK_SCOPES: tuple[str, ...] = (
     "leases:release",
     "crossings:approve",
     "crossings:execute",
+    "crossings:claim",
+    "crossings:outcome",
     "system:admin",
 )
 

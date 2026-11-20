@@ -20,6 +20,7 @@ from actentra_core.causal import (
     build_causal_trace,
     generate_link_id,
 )
+from actentra_core.claims import ExecutionClaimError
 from actentra_core.coordination import (
     LeaseMode,
     ResourceConflictError,
@@ -164,6 +165,8 @@ class AppServices:
         """Propose, canonicalize, evaluate, and conditionally execute an action."""
         # Enforce authenticated identity and principal constraints (Stage 0 Task 2)
         raw_agent = data.get("agent_id")
+        if raw_agent is None and isinstance(data.get("agent"), dict):
+            raw_agent = data["agent"].get("id")
         if caller_context is not None and caller_context.authenticated and raw_agent is None:
             agent_id_claim = caller_context.principal_id
         else:
@@ -586,32 +589,197 @@ class AppServices:
         except Exception as exc:
             return {"status": "failure", "error": type(exc).__name__, "crossing_id": crossing_id}
 
+    def claim_crossing_for_execution(
+        self,
+        crossing_id: str,
+        *,
+        caller_context: CallerContext | None = None,
+        ttl_seconds: float = 300.0,
+    ) -> dict[str, Any]:
+        """Issue a one-time execution claim for an approved/allowed crossing."""
+        dec_rec = self.boundary.receipt_store.get_decision_receipt(crossing_id)
+        if dec_rec is None:
+            return {"error": f"Crossing '{crossing_id}' not found", "code": "not_found"}
+
+        if dec_rec.verdict not in ("allow", "allow_with_constraints"):
+            p = self.boundary.receipt_store.get_pending_approval(crossing_id)
+            if p is None or p.status != "approved":
+                return {
+                    "error": (
+                        f"Cannot claim crossing '{crossing_id}' with non-allowed decision "
+                        f"(verdict={dec_rec.verdict})"
+                    ),
+                    "code": "not_permitted",
+                }
+
+        outcome_rec = self.boundary.receipt_store.get_outcome_receipt(crossing_id)
+        if outcome_rec is not None:
+            return {
+                "error": f"Crossing '{crossing_id}' has already been executed",
+                "code": "already_executed",
+            }
+
+        raw_env = self.boundary.receipt_store.get_envelope(crossing_id)
+        if raw_env is None:
+            return {
+                "error": f"Crossing envelope for '{crossing_id}' missing from store",
+                "code": "not_found",
+            }
+
+        agent_data = raw_env.get("agent") or {}
+        env_agent_id = str(agent_data.get("id", ""))
+        executor_principal = "anonymous_executor"
+
+        if caller_context is not None:
+            if not caller_context.has_scope("crossings:claim") and not caller_context.has_scope(
+                "crossings:execute"
+            ):
+                return {
+                    "error": (
+                        f"Principal '{caller_context.principal_id}' lacks "
+                        "'crossings:claim' or 'crossings:execute' scope"
+                    ),
+                    "code": "forbidden",
+                }
+            if (
+                caller_context.authenticated
+                and not caller_context.is_trusted_operator
+                and env_agent_id
+                and not caller_context.is_agent_allowed(env_agent_id)
+            ):
+                return {
+                    "error": (
+                        f"Principal '{caller_context.principal_id}' is not authorized to "
+                        f"claim crossing for agent '{env_agent_id}'"
+                    ),
+                    "code": "forbidden",
+                }
+            executor_principal = caller_context.principal_id
+
+        try:
+            claim = self.boundary.receipt_store.issue_execution_claim(
+                crossing_id=crossing_id,
+                executor_principal_id=executor_principal,
+                session_id=raw_env["session_id"],
+                canonical_hash=raw_env["canonical_hash"],
+                ttl_seconds=ttl_seconds,
+            )
+            return {
+                "claim_id": claim.claim_id,
+                "crossing_id": crossing_id,
+                "executor_principal_id": executor_principal,
+                "expires_at": claim.expires_at,
+                "status": claim.status,
+            }
+        except Exception as exc:
+            return {"error": str(exc), "code": "claim_failed"}
+
     def record_external_outcome(
         self,
         crossing_id: str,
         *,
         status: Literal["success", "failure", "unknown"],
+        claim_id: str | None = None,
         result_hash: str | None = None,
         error: str | None = None,
+        caller_context: CallerContext | None = None,
     ) -> dict[str, Any]:
-        """Record outcome receipt for an externally executed crossing."""
-        # Check corresponding decision receipt exists
+        """Record outcome receipt for an externally executed crossing with bound claim."""
         dec_rec = self.boundary.receipt_store.get_decision_receipt(crossing_id)
         if dec_rec is None:
-            return {"error": f"Decision receipt not found for crossing '{crossing_id}'"}
-
-        # Verify that the decision permitted execution
-        if dec_rec.verdict not in ("allow", "allow_with_constraints"):
             return {
-                "error": (
-                    f"Cannot record execution outcome for non-allowed decision "
-                    f"(crossing_id={crossing_id}, verdict={dec_rec.verdict})"
-                )
+                "error": f"Decision receipt not found for crossing '{crossing_id}'",
+                "code": "not_found",
             }
+
+        existing_outcome = self.boundary.receipt_store.get_outcome_receipt(crossing_id)
+        if existing_outcome is not None:
+            return {
+                "error": f"Outcome already recorded for crossing '{crossing_id}'",
+                "code": "conflict",
+            }
+
+        if dec_rec.verdict not in ("allow", "allow_with_constraints"):
+            p = self.boundary.receipt_store.get_pending_approval(crossing_id)
+            if p is None or p.status != "approved":
+                return {
+                    "error": (
+                        f"Cannot record execution outcome for non-allowed decision "
+                        f"(crossing_id={crossing_id}, verdict={dec_rec.verdict})"
+                    ),
+                    "code": "not_permitted",
+                }
 
         raw_env = self.boundary.receipt_store.get_envelope(crossing_id)
         if raw_env is None:
-            return {"error": f"Crossing '{crossing_id}' not found in store"}
+            return {"error": f"Crossing '{crossing_id}' not found in store", "code": "not_found"}
+
+        executor_principal = "anonymous_executor"
+        if caller_context is not None:
+            if not caller_context.has_scope("crossings:outcome") and not caller_context.has_scope(
+                "crossings:execute"
+            ):
+                return {
+                    "error": (
+                        f"Principal '{caller_context.principal_id}' lacks "
+                        "'crossings:outcome' or 'crossings:execute' scope"
+                    ),
+                    "code": "forbidden",
+                }
+            executor_principal = caller_context.principal_id
+
+        # Validate and consume execution claim (Finding 5)
+        clean_claim_id = str(claim_id).strip() if claim_id is not None else None
+        if clean_claim_id:
+            try:
+                self.boundary.receipt_store.consume_execution_claim(
+                    clean_claim_id,
+                    executor_principal_id=executor_principal,
+                    crossing_id=crossing_id,
+                )
+            except ExecutionClaimError as exc:
+                err_msg = str(exc)
+                code = "claim_invalid"
+                if "not found" in err_msg.lower():
+                    code = "not_found"
+                elif "caller" in err_msg.lower() or "executor" in err_msg.lower():
+                    code = "forbidden"
+                elif "replayed" in err_msg.lower() or "consumed" in err_msg.lower():
+                    code = "conflict"
+                elif "expired" in err_msg.lower():
+                    code = "expired"
+                return {"error": err_msg, "code": code}
+        elif caller_context is not None:
+            return {
+                "error": (
+                    "Missing required 'claim_id': external outcome reporting requires a valid "
+                    "one-time execution claim issued via POST /v1/crossings/{id}/claim"
+                ),
+                "code": "claim_required",
+            }
+        else:
+            # Direct in-process call without caller_context and claim: auto-issue internal claim
+            try:
+                internal_claim = self.boundary.receipt_store.issue_execution_claim(
+                    crossing_id=crossing_id,
+                    executor_principal_id=executor_principal,
+                    session_id=raw_env["session_id"],
+                    canonical_hash=raw_env["canonical_hash"],
+                )
+                self.boundary.receipt_store.consume_execution_claim(
+                    internal_claim.claim_id,
+                    executor_principal_id=executor_principal,
+                    crossing_id=crossing_id,
+                )
+                clean_claim_id = internal_claim.claim_id
+            except ExecutionClaimError as exc:
+                return {
+                    "error": (
+                        f"Outcome already recorded for crossing '{crossing_id}' "
+                        f"(claim constraint: {exc})"
+                    ),
+                    "code": "conflict",
+                }
 
         try:
             rec = self.boundary.receipt_store.record_outcome(
@@ -626,15 +794,22 @@ class AppServices:
                 evidence_status="caller_reported",
             )
         except Exception as exc:
-            return {"error": str(exc)}
+            code = "conflict" if "already recorded" in str(exc).lower() else "record_failed"
+            return {"error": str(exc), "code": code}
 
         with contextlib.suppress(Exception):
             ev = build_evidence_record(
                 crossing_id=crossing_id,
                 tier=EvidenceTier.CALLER_REPORTED,
                 trust_domain="external_caller",
-                collector="http_client",
-                details={"reported_status": status, "result_hash": result_hash, "error": error},
+                collector=f"executor:{executor_principal}",
+                details={
+                    "claim_id": clean_claim_id,
+                    "reported_status": status,
+                    "result_hash": result_hash,
+                    "error": error,
+                    "executor_principal_id": executor_principal,
+                },
             )
             self.boundary.receipt_store.record_evidence(ev)
 
@@ -662,6 +837,8 @@ class AppServices:
 
         return {
             "status": "recorded",
+            "crossing_id": crossing_id,
+            "claim_id": clean_claim_id,
             "outcome_seq": rec.seq,
             "entry_hash": rec.entry_hash,
             "reported_by": "caller",
