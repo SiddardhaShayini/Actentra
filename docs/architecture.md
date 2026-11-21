@@ -91,6 +91,9 @@
 * **Invariant I6:** Policy updates never apply partially; invalid policies are rejected while preserving the last-known-good configuration.
 * **Invariant I7:** Secrets managed by the Secrets Broker never appear in logs, error messages, or envelopes returned to the agent.
 * **Invariant I8:** Principal authority requires authenticated identity binding; delegation grants enforce bidirectional binding (`grant.delegator_id == delegator` and `grant.delegatee_id == authenticated_caller`), cryptographic/registry verification, scope attenuation, and nested depth limits.
+* **Invariant I9:** Sessions are server-controlled entities cryptographically bound to authenticated principals, trust domains, policy versions, and expiration timestamps. Cross-principal session access or session ID substitution is strictly rejected. Taint is durably bound to principal identity and cannot be reset or bypassed by arbitrary session recreation.
+* **Invariant I10:** Cumulative action, external call, and write byte limits are enforced across dual tiers (per-session and cumulative principal-wide). Counters are transactionally persisted in SQLite and survive process crashes, restarts, and concurrent executions.
+* **Invariant I11:** Every gateway HTTP route (GET, POST, DELETE) and internal service method requires explicit scope-based authorization or trusted operator credentials. Read endpoints querying sensitive resources enforce object-level authorization and redact sensitive execution parameters for non-owners.
 
 ---
 
@@ -153,3 +156,24 @@ Actentra is designed for local-first, low-overhead operation on resource-constra
   - `CallerContext` is consistently threaded through `Boundary`, `Gateway`, `Services`, and `Warrants`.
   - Boundary validates `ctx.is_agent_allowed(agent_id)`, `ctx.has_scope("crossings:execute")`, and ensures that any presented `Warrant.holder` matches the caller's authenticated identity or active delegator.
   - Approver identity is recorded in durable pending approval records and receipts.
+
+### 7. Session Isolation, Durable Budgets, Taint Integrity & Route Authorization (Phase 2 Hardening)
+- **Server-Controlled Session Lifecycle:**
+  - Clients can no longer choose arbitrary unauthenticated session identifiers to bypass security policies.
+  - Sessions are server-issued records (`sess-<uuid>`) bound in SQLite to `principal_id`, `trust_domain`, `policy_version`, `created_at`, `expires_at`, and `status`.
+  - Access to an existing session requires `sessions:read` scope and matches the session's owning principal (or trusted operator authority).
+  - Attempted cross-principal session access or session ID substitution triggers `identity:cross-principal-session-access` denial tagged with `session-hijack`.
+- **Durable Dual-Tier Cumulative Budgets:**
+  - Session-level budgets (`max_actions`, `max_external_calls`, `max_write_bytes`) prevent runaway single-session loops.
+  - Principal-level cumulative limits (`principal_max_actions`, `principal_max_external_calls`, `principal_max_write_bytes`) aggregate usage across all sessions owned by the principal.
+  - Counters are durably stored in the SQLite `principal_budgets` table and survive process termination, crashes, and daemon restarts.
+  - Atomic synchronization locks prevent concurrent race condition bypasses across parallel crossing requests.
+- **Durable Taint Integrity & Reset Prevention:**
+  - Untrusted data ingestion marks both the active session and the authenticated principal as untrusted in SQLite `principal_taints`.
+  - Creating a new session inherits the principal's active taint, preventing attackers from laundering tainted contexts via session recreation.
+  - Taint clearance is restricted strictly to authorized security operators (`ctx.is_trusted_operator`).
+- **HTTP Route-to-Scope & Object-Level Authorization Matrix:**
+  - Explicit `ROUTE_SCOPE_MATRIX` maps every GET, POST, and DELETE endpoint to mandatory permission scopes (e.g. `receipts:read`, `policies:read`, `observations:read`, `evidence:read`, `leases:read`, `handoffs:read`, `sessions:read`, `sessions:create`, `sessions:revoke`).
+  - Read endpoints enforce object-level authorization: non-operator callers can only inspect pending approvals, receipts, and sessions belonging to their own identity.
+  - Action parameters in pending approvals are automatically redacted (`{"_redacted": "UNAUTHORIZED_RESOURCE_ACCESS"}`) for non-owner viewers.
+  - Internal `AppServices` methods replicate all route authorization checks, preventing internal direct-call bypasses.

@@ -90,6 +90,81 @@ class PendingCrossing:
         }
 
 
+ROUTE_SCOPE_MATRIX: dict[tuple[str, str], tuple[str, ...]] = {
+    # GET routes (read-only authorization matrix)
+    ("GET", "/health"): (),
+    ("GET", "/ui"): ("console:access", "operator:access", "system:admin"),
+    ("GET", "/"): ("console:access", "operator:access", "system:admin"),
+    ("GET", "/v1/crossings/pending"): ("approvals:read", "crossings:read"),
+    ("GET", "/v1/crossings/*"): ("approvals:read", "crossings:read"),
+    ("GET", "/v1/receipts"): ("receipts:read",),
+    ("GET", "/v1/verify"): ("audit:verify", "receipts:read"),
+    ("GET", "/v1/policy"): ("policies:read",),
+    ("GET", "/v1/policy/lint"): ("policies:lint", "policies:read"),
+    ("GET", "/v1/bundle/export"): ("audit:export",),
+    ("GET", "/v1/observations"): ("observations:read",),
+    ("GET", "/v1/observations/*"): ("observations:read",),
+    ("GET", "/v1/trace/links"): ("trace:read", "receipts:read"),
+    ("GET", "/v1/trace/*"): ("trace:read", "receipts:read"),
+    ("GET", "/v1/handoffs"): ("handoffs:read",),
+    ("GET", "/v1/handoffs/*"): ("handoffs:read",),
+    ("GET", "/v1/evidence"): ("evidence:read",),
+    ("GET", "/v1/evidence/*"): ("evidence:read",),
+    ("GET", "/v1/leases"): ("leases:read",),
+    ("GET", "/v1/leases/*"): ("leases:read",),
+    ("GET", "/v1/delegations/*"): ("delegations:read",),
+    ("GET", "/v1/sessions"): ("sessions:read",),
+    ("GET", "/v1/sessions/*"): ("sessions:read",),
+
+    # POST routes (state-mutating action authorization)
+    ("POST", "/v1/crossings"): ("crossings:submit", "crossings:propose", "crossings:evaluate"),
+    ("POST", "/v1/crossings/*/approve"): ("crossings:approve", "approvals:write"),
+    ("POST", "/v1/crossings/*/execute"): ("crossings:execute",),
+    ("POST", "/v1/crossings/*/claim"): ("crossings:claim",),
+    ("POST", "/v1/crossings/*/outcome"): ("crossings:outcome",),
+    ("POST", "/v1/policy/canary"): ("policies:canary", "policies:read"),
+    ("POST", "/v1/simulate"): ("crossings:simulate", "crossings:propose"),
+    ("POST", "/v1/observations/verify"): ("observations:verify",),
+    ("POST", "/v1/trace/links"): ("trace:write",),
+    ("POST", "/v1/handoffs"): ("handoffs:create",),
+    ("POST", "/v1/handoffs/*/advance"): ("handoffs:advance",),
+    ("POST", "/v1/handoffs/*/verify"): ("handoffs:verify",),
+    ("POST", "/v1/leases"): ("leases:acquire",),
+    ("POST", "/v1/leases/*/release"): ("leases:release",),
+    ("POST", "/v1/freeze"): ("system:freeze",),
+    ("POST", "/v1/unfreeze"): ("system:unfreeze",),
+    ("POST", "/v1/delegations"): ("delegations:create",),
+    ("POST", "/v1/sessions"): ("sessions:create",),
+
+    # DELETE routes
+    ("DELETE", "/v1/trace/links/*"): ("trace:delete",),
+    ("DELETE", "/v1/delegations/*"): ("delegations:revoke",),
+    ("DELETE", "/v1/sessions/*"): ("sessions:revoke",),
+}
+
+
+def match_route_scopes(method: str, path: str) -> tuple[str, ...] | None:
+    """Resolve required scopes from ROUTE_SCOPE_MATRIX for method and path."""
+    clean_method = method.upper()
+    clean_path = path.rstrip("/") or "/"
+
+    # 1. Exact match
+    if (clean_method, clean_path) in ROUTE_SCOPE_MATRIX:
+        return ROUTE_SCOPE_MATRIX[(clean_method, clean_path)]
+
+    # 2. Wildcard pattern matching
+    for (m, pattern), scopes in ROUTE_SCOPE_MATRIX.items():
+        if m != clean_method:
+            continue
+        if "*" in pattern:
+            prefix, suffix = pattern.split("*", 1)
+            if clean_path.startswith(prefix) and clean_path.endswith(suffix):
+                middle = clean_path[len(prefix) : len(clean_path) - len(suffix) if suffix else None]
+                if "/" not in middle or not suffix:
+                    return scopes
+    return None
+
+
 class ActentraHTTPHandler(BaseHTTPRequestHandler):
     """HTTP request handler for Actentra REST API and Unified Operator Console."""
 
@@ -98,6 +173,61 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         # Suppress default noisy access logs to keep terminal output clean
         pass
+
+    def _authorize_route(self, method: str, path: str) -> tuple[bool, CallerContext | None]:
+        """Verify that the caller context has required scopes for this HTTP method and route."""
+        try:
+            caller_ctx = self._get_caller_context()
+        except IdentitySecurityError as exc:
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": str(exc), "code": "unauthorized_principal"},
+            )
+            return False, None
+
+        required_scopes = match_route_scopes(method, path)
+        if required_scopes is None:
+            # Route not found in authorization matrix - allow handler to 404
+            return True, caller_ctx
+
+        if not required_scopes:
+            # Public or open to all authenticated principals
+            return True, caller_ctx
+
+        # Trusted operator has all permissions
+        if caller_ctx.is_trusted_operator:
+            return True, caller_ctx
+
+        # Check if caller has any of the acceptable scopes
+        for scope in required_scopes:
+            if caller_ctx.has_scope(scope):
+                return True, caller_ctx
+
+        if path.endswith("/approve"):
+            err_msg = (
+                f"Principal '{caller_ctx.principal_id}' is not authorized to resolve approvals "
+                f"(lacks required scope: {list(required_scopes)})"
+            )
+        elif path == "/v1/freeze":
+            err_msg = "Only trusted operators may freeze the system"
+        elif path == "/v1/unfreeze":
+            err_msg = "Only trusted operators may unfreeze the system"
+        else:
+            err_msg = (
+                f"Forbidden: Principal '{caller_ctx.principal_id}' lacks required scope. "
+                f"Required one of: {list(required_scopes)}"
+            )
+
+        self._send_json(
+            HTTPStatus.FORBIDDEN,
+            {
+                "error": err_msg,
+                "code": "insufficient_scope",
+                "principal": caller_ctx.principal_id,
+                "required_scopes": list(required_scopes),
+            },
+        )
+        return False, caller_ctx
 
     def _get_caller_context(self) -> CallerContext:
         headers_dict = (
@@ -215,6 +345,9 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_forbidden(self, error: str, code: str = "unauthorized_principal") -> None:
+        self._send_json(HTTPStatus.FORBIDDEN, {"error": error, "code": code})
+
     def _read_json_body(self) -> dict[str, Any]:
         content_len_header = self.headers.get("Content-Length")
         if not content_len_header:
@@ -255,24 +388,36 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         query = parse_qs(parts.query)
         services = self.server.services
 
+        allowed, caller_ctx = self._authorize_route("GET", path)
+        if not allowed or caller_ctx is None:
+            return
+
         if path == "/health":
             self._send_json(HTTPStatus.OK, services.get_health())
             return
 
         if path == "/v1/crossings/pending":
-            pending = services.list_pending_approvals(status="pending")
-            self._send_json(HTTPStatus.OK, pending)
+            try:
+                pending = services.list_pending_approvals(
+                    status="pending", caller_context=caller_ctx
+                )
+                self._send_json(HTTPStatus.OK, pending)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path.startswith("/v1/crossings/") and not path.endswith(
             ("/approve", "/execute", "/outcome", "/claim")
         ):
             cid = path[len("/v1/crossings/") :]
-            detail = services.get_pending_approval(cid)
-            if detail is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Crossing '{cid}' not found"})
-                return
-            self._send_json(HTTPStatus.OK, detail)
+            try:
+                detail = services.get_pending_approval(cid, caller_context=caller_ctx)
+                if detail is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Crossing '{cid}' not found"})
+                    return
+                self._send_json(HTTPStatus.OK, detail)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path == "/v1/receipts":
@@ -293,37 +438,58 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             session_f = query.get("session_id", [None])[0]
             search_f = query.get("search", [None])[0]
 
-            resp = services.query_receipts(
-                limit=limit,
-                offset=offset,
-                verdict=verdict,
-                status=status_f,
-                tool=tool_f,
-                session_id=session_f,
-                search=search_f,
-            )
-            # Maintain backward compatibility: if simple query without offset/search, return list
-            if "offset" not in query and "search" not in query:
-                self._send_json(HTTPStatus.OK, resp["records"])
-            else:
-                self._send_json(HTTPStatus.OK, resp)
+            try:
+                resp = services.query_receipts(
+                    limit=limit,
+                    offset=offset,
+                    verdict=verdict,
+                    status=status_f,
+                    tool=tool_f,
+                    session_id=session_f,
+                    search=search_f,
+                    caller_context=caller_ctx,
+                )
+                if "offset" not in query and "search" not in query:
+                    self._send_json(HTTPStatus.OK, resp["records"])
+                else:
+                    self._send_json(HTTPStatus.OK, resp)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path == "/v1/verify":
-            self._send_json(HTTPStatus.OK, services.verify_audit_log())
+            try:
+                self._send_json(HTTPStatus.OK, services.verify_audit_log(caller_context=caller_ctx))
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path == "/v1/policy":
-            self._send_json(HTTPStatus.OK, {"policy_yaml": services.get_policy_yaml()})
+            try:
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"policy_yaml": services.get_policy_yaml(caller_context=caller_ctx)},
+                )
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path == "/v1/policy/lint":
-            self._send_json(HTTPStatus.OK, {"warnings": services.lint_active_policy()})
+            try:
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"warnings": services.lint_active_policy(caller_context=caller_ctx)},
+                )
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path == "/v1/bundle/export":
-            bundle = services.export_audit_bundle()
-            self._send_json(HTTPStatus.OK, bundle)
+            try:
+                bundle = services.export_audit_bundle(caller_context=caller_ctx)
+                self._send_json(HTTPStatus.OK, bundle)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path == "/v1/observations":
@@ -331,24 +497,31 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             res_f = query.get("resource", [None])[0]
             lim_f = int(query.get("limit", [50])[0])
             off_f = int(query.get("offset", [0])[0])
-            obs_list = services.list_observations(
-                crossing_id=cid_f,
-                subject_resource=res_f,
-                limit=lim_f,
-                offset=off_f,
-            )
-            self._send_json(HTTPStatus.OK, obs_list)
+            try:
+                obs_list = services.list_observations(
+                    crossing_id=cid_f,
+                    subject_resource=res_f,
+                    limit=lim_f,
+                    offset=off_f,
+                    caller_context=caller_ctx,
+                )
+                self._send_json(HTTPStatus.OK, obs_list)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path.startswith("/v1/observations/") and path != "/v1/observations/verify":
             obs_id = path[len("/v1/observations/") :]
-            obs_detail = services.get_observation(obs_id)
-            if obs_detail is None:
-                self._send_json(
-                    HTTPStatus.NOT_FOUND, {"error": f"Observation '{obs_id}' not found"}
-                )
-            else:
-                self._send_json(HTTPStatus.OK, obs_detail)
+            try:
+                obs_detail = services.get_observation(obs_id, caller_context=caller_ctx)
+                if obs_detail is None:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND, {"error": f"Observation '{obs_id}' not found"}
+                    )
+                else:
+                    self._send_json(HTTPStatus.OK, obs_detail)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path == "/v1/trace/links":
@@ -369,22 +542,31 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             agent_f = query.get("assigned_agent_id", [None])[0]
             stat_f = query.get("status", [None])[0]
             lim_f = int(query.get("limit", [50])[0])
-            hnds = services.list_task_handoffs(
-                task_id=task_f,
-                assigned_agent_id=agent_f,
-                status=stat_f,
-                limit=lim_f,
-            )
-            self._send_json(HTTPStatus.OK, hnds)
+            try:
+                hnds = services.list_task_handoffs(
+                    task_id=task_f,
+                    assigned_agent_id=agent_f,
+                    status=stat_f,
+                    limit=lim_f,
+                    caller_context=caller_ctx,
+                )
+                self._send_json(HTTPStatus.OK, hnds)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path.startswith("/v1/handoffs/") and not path.endswith(("/advance", "/verify")):
             hnd_id = path[len("/v1/handoffs/") :]
-            hnd = services.get_task_handoff(hnd_id)
-            if hnd is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Handoff '{hnd_id}' not found"})
-            else:
-                self._send_json(HTTPStatus.OK, hnd)
+            try:
+                hnd = services.get_task_handoff(hnd_id, caller_context=caller_ctx)
+                if hnd is None:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND, {"error": f"Handoff '{hnd_id}' not found"}
+                    )
+                else:
+                    self._send_json(HTTPStatus.OK, hnd)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path == "/v1/evidence":
@@ -395,17 +577,27 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 lim_f = int(query.get("limit", ["50"])[0])
             except ValueError:
                 lim_f = 50
-            evs = services.list_evidence(crossing_id=cid_f, tier=tier_f, limit=lim_f)
-            self._send_json(HTTPStatus.OK, evs)
+            try:
+                evs = services.list_evidence(
+                    crossing_id=cid_f, tier=tier_f, limit=lim_f, caller_context=caller_ctx
+                )
+                self._send_json(HTTPStatus.OK, evs)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path.startswith("/v1/evidence/"):
             ev_id = path[len("/v1/evidence/") :]
-            ev = services.get_evidence(ev_id)
-            if ev is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Evidence '{ev_id}' not found"})
-            else:
-                self._send_json(HTTPStatus.OK, ev)
+            try:
+                ev = services.get_evidence(ev_id, caller_context=caller_ctx)
+                if ev is None:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND, {"error": f"Evidence '{ev_id}' not found"}
+                    )
+                else:
+                    self._send_json(HTTPStatus.OK, ev)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path == "/v1/leases":
@@ -417,22 +609,65 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 lim_f = int(query.get("limit", ["50"])[0])
             except ValueError:
                 lim_f = 50
-            leases = services.list_resource_leases(
-                resource=res_f,
-                owner_agent_id=agent_f,
-                status=stat_f,
-                limit=lim_f,
-            )
-            self._send_json(HTTPStatus.OK, leases)
+            try:
+                leases = services.list_resource_leases(
+                    resource=res_f,
+                    owner_agent_id=agent_f,
+                    status=stat_f,
+                    limit=lim_f,
+                    caller_context=caller_ctx,
+                )
+                self._send_json(HTTPStatus.OK, leases)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path.startswith("/v1/leases/") and not path.endswith("/release"):
             lid = path[len("/v1/leases/") :]
-            lease = services.get_resource_lease(lid)
-            if lease is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Lease '{lid}' not found"})
-            else:
-                self._send_json(HTTPStatus.OK, lease)
+            try:
+                lease = services.get_resource_lease(lid, caller_context=caller_ctx)
+                if lease is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Lease '{lid}' not found"})
+                else:
+                    self._send_json(HTTPStatus.OK, lease)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
+            return
+
+        if path == "/v1/sessions":
+            pid_f = query.get("principal_id", [None])[0]
+            stat_f = query.get("status", [None])[0]
+            try:
+                lim_f = int(query.get("limit", [50])[0])
+            except ValueError:
+                lim_f = 50
+            try:
+                off_f = int(query.get("offset", [0])[0])
+            except ValueError:
+                off_f = 0
+            try:
+                sess_list = services.list_sessions(
+                    principal_id=pid_f,
+                    status=stat_f,
+                    limit=lim_f,
+                    offset=off_f,
+                    caller_context=caller_ctx,
+                )
+                self._send_json(HTTPStatus.OK, sess_list)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
+            return
+
+        if path.startswith("/v1/sessions/"):
+            sid = path[len("/v1/sessions/") :]
+            try:
+                sess_detail = services.get_session(sid, caller_context=caller_ctx)
+                if sess_detail is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Session '{sid}' not found"})
+                else:
+                    self._send_json(HTTPStatus.OK, sess_detail)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         if path in ("/ui", "/"):
@@ -441,14 +676,17 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
 
         if path.startswith("/v1/delegations/"):
             grant_id = path[len("/v1/delegations/") :]
-            grant = services.get_delegation(grant_id)
-            if grant is None:
-                self._send_json(
-                    HTTPStatus.NOT_FOUND,
-                    {"error": f"Delegation grant '{grant_id}' not found"},
-                )
-            else:
-                self._send_json(HTTPStatus.OK, grant)
+            try:
+                grant = services.get_delegation(grant_id, caller_context=caller_ctx)
+                if grant is None:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"error": f"Delegation grant '{grant_id}' not found"},
+                    )
+                else:
+                    self._send_json(HTTPStatus.OK, grant)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
             return
 
         self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Route '{path}' not found"})
@@ -468,6 +706,10 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 HTTPStatus.FORBIDDEN,
                 {"error": "Forbidden: cross-origin browser request rejected"},
             )
+            return
+
+        allowed, caller_ctx = self._authorize_route("POST", path)
+        if not allowed or caller_ctx is None:
             return
 
         if path == "/v1/crossings":
@@ -1221,6 +1463,30 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 )
             return
 
+        if path == "/v1/sessions":
+            try:
+                data = self._read_json_body()
+            except Exception:
+                data = {}
+
+            try:
+                sess = services.create_session(
+                    principal_id=data.get("principal_id"),
+                    trust_domain=str(data.get("trust_domain", "default")),
+                    session_id=data.get("session_id"),
+                    metadata=data.get("metadata"),
+                    ttl_seconds=float(data.get("ttl_seconds", 3600.0)),
+                    caller_context=caller_ctx,
+                )
+                self._send_json(HTTPStatus.CREATED, sess)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST, {"error": f"Failed to create session: {exc}"}
+                )
+            return
+
         self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Route '{path}' not found"})
 
     def do_DELETE(self) -> None:
@@ -1239,6 +1505,10 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             )
             return
 
+        allowed, caller_ctx = self._authorize_route("DELETE", path)
+        if not allowed or caller_ctx is None:
+            return
+
         if path.startswith("/v1/trace/links/"):
             link_id = path[len("/v1/trace/links/") :]
             deleted = services.delete_causal_link(link_id)
@@ -1253,15 +1523,6 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
 
         if path.startswith("/v1/delegations/"):
             grant_id = path[len("/v1/delegations/") :]
-            try:
-                caller_ctx = self._get_caller_context()
-            except IdentitySecurityError as exc:
-                self._send_json(
-                    HTTPStatus.FORBIDDEN,
-                    {"error": str(exc), "code": "unauthorized_principal"},
-                )
-                return
-
             try:
                 success = services.revoke_delegation(grant_id, caller_context=caller_ctx)
                 if success:
@@ -1280,6 +1541,26 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
                     {"error": f"Failed to revoke delegation: {exc}"},
+                )
+            return
+
+        if path.startswith("/v1/sessions/"):
+            sid = path[len("/v1/sessions/") :]
+            try:
+                success = services.revoke_session(sid, caller_context=caller_ctx)
+                if success:
+                    self._send_json(HTTPStatus.OK, {"revoked": True, "session_id": sid})
+                else:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Session '{sid}' not found"})
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": f"Failed to revoke session: {exc}"},
                 )
             return
 

@@ -148,6 +148,33 @@ class PendingApprovalRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionRecord:
+    """Server-issued, principal-bound session identity and security context (Phase 2)."""
+
+    session_id: str
+    principal_id: str
+    trust_domain: str
+    policy_version: str
+    created_at: float
+    expires_at: float
+    status: str
+    metadata: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "principal_id": self.principal_id,
+            "trust_domain": self.trust_domain,
+            "policy_version": self.policy_version,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "expires_in_seconds": max(0.0, round(self.expires_at - time.time(), 1)),
+            "status": self.status,
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class VerificationResult:
     ok: bool
     total_records: int
@@ -472,6 +499,54 @@ class ReceiptStore:
                 """
                 CREATE TABLE IF NOT EXISTS session_taints (
                     session_id TEXT PRIMARY KEY,
+                    taint_level TEXT NOT NULL CHECK (
+                        taint_level IN ('trusted', 'untrusted', 'unknown')
+                    ),
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+
+            # Phase 2 Hardening: Server-controlled session identity and ownership
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id TEXT PRIMARY KEY,
+                    principal_id TEXT NOT NULL,
+                    trust_domain TEXT NOT NULL,
+                    policy_version TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('active', 'expired', 'revoked')),
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_principal ON sessions(principal_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);"
+            )
+
+            # Phase 2 Hardening: Persistent principal cumulative budgets
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS principal_budgets (
+                    principal_id TEXT PRIMARY KEY,
+                    actions_count INTEGER NOT NULL DEFAULT 0,
+                    external_calls_count INTEGER NOT NULL DEFAULT 0,
+                    write_bytes_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+
+            # Phase 2 Hardening: Persistent principal taints
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS principal_taints (
+                    principal_id TEXT PRIMARY KEY,
                     taint_level TEXT NOT NULL CHECK (
                         taint_level IN ('trusted', 'untrusted', 'unknown')
                     ),
@@ -2273,6 +2348,397 @@ class ReceiptStore:
             return {str(r[0]): str(r[1]) for r in rows}
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to list session taints: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_principal_usage(self, principal_id: str) -> dict[str, int]:
+        """Fetch persisted cumulative usage for a principal across all sessions."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT actions_count, external_calls_count, write_bytes_count
+                FROM principal_budgets
+                WHERE principal_id = ? LIMIT 1;
+                """,
+                (principal_id,),
+            ).fetchone()
+            if row is None:
+                return {"actions_count": 0, "external_calls_count": 0, "write_bytes_count": 0}
+            return {
+                "actions_count": int(row[0]),
+                "external_calls_count": int(row[1]),
+                "write_bytes_count": int(row[2]),
+            }
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch principal usage: {exc}") from exc
+        finally:
+            conn.close()
+
+    def record_budget_usage(
+        self,
+        session_id: str,
+        principal_id: str | None = None,
+        *,
+        delta_actions: int = 0,
+        delta_external: int = 0,
+        delta_bytes: int = 0,
+    ) -> dict[str, Any]:
+        """Atomically record budget usage for session and principal in a single transaction."""
+        now_ts = utc_now_iso()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            # 1. Update session_budgets
+            row_s = conn.execute(
+                """
+                SELECT actions_count, external_calls_count, write_bytes_count
+                FROM session_budgets
+                WHERE session_id = ? LIMIT 1;
+                """,
+                (session_id,),
+            ).fetchone()
+            if row_s is None:
+                s_actions = delta_actions
+                s_external = delta_external
+                s_bytes = delta_bytes
+                conn.execute(
+                    """
+                    INSERT INTO session_budgets (
+                        session_id, actions_count, external_calls_count,
+                        write_bytes_count, updated_at
+                    ) VALUES (?, ?, ?, ?, ?);
+                    """,
+                    (session_id, s_actions, s_external, s_bytes, now_ts),
+                )
+            else:
+                s_actions = int(row_s[0]) + delta_actions
+                s_external = int(row_s[1]) + delta_external
+                s_bytes = int(row_s[2]) + delta_bytes
+                conn.execute(
+                    """
+                    UPDATE session_budgets
+                    SET actions_count = ?, external_calls_count = ?,
+                        write_bytes_count = ?, updated_at = ?
+                    WHERE session_id = ?;
+                    """,
+                    (s_actions, s_external, s_bytes, now_ts, session_id),
+                )
+
+            # 2. Update principal_budgets if principal_id provided
+            p_usage: dict[str, int] = {}
+            if principal_id:
+                clean_p = principal_id.strip()
+                row_p = conn.execute(
+                    """
+                    SELECT actions_count, external_calls_count, write_bytes_count
+                    FROM principal_budgets
+                    WHERE principal_id = ? LIMIT 1;
+                    """,
+                    (clean_p,),
+                ).fetchone()
+                if row_p is None:
+                    p_actions = delta_actions
+                    p_external = delta_external
+                    p_bytes = delta_bytes
+                    conn.execute(
+                        """
+                        INSERT INTO principal_budgets (
+                            principal_id, actions_count, external_calls_count,
+                            write_bytes_count, updated_at
+                        ) VALUES (?, ?, ?, ?, ?);
+                        """,
+                        (clean_p, p_actions, p_external, p_bytes, now_ts),
+                    )
+                else:
+                    p_actions = int(row_p[0]) + delta_actions
+                    p_external = int(row_p[1]) + delta_external
+                    p_bytes = int(row_p[2]) + delta_bytes
+                    conn.execute(
+                        """
+                        UPDATE principal_budgets
+                        SET actions_count = ?, external_calls_count = ?,
+                            write_bytes_count = ?, updated_at = ?
+                        WHERE principal_id = ?;
+                        """,
+                        (p_actions, p_external, p_bytes, now_ts, clean_p),
+                    )
+                p_usage = {
+                    "actions_count": p_actions,
+                    "external_calls_count": p_external,
+                    "write_bytes_count": p_bytes,
+                }
+
+            conn.execute("COMMIT;")
+            return {
+                "session": {
+                    "actions_count": s_actions,
+                    "external_calls_count": s_external,
+                    "write_bytes_count": s_bytes,
+                },
+                "principal": p_usage,
+            }
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to record budget usage: {exc}") from exc
+        finally:
+            conn.close()
+
+    def set_principal_taint(self, principal_id: str, taint_level: str) -> None:
+        """Persist taint status for a principal."""
+        if taint_level not in ("trusted", "untrusted", "unknown"):
+            raise ReceiptError(f"Invalid taint level: {taint_level!r}")
+        now_ts = utc_now_iso()
+        clean_p = principal_id.strip()
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO principal_taints (principal_id, taint_level, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(principal_id) DO UPDATE SET
+                    taint_level = excluded.taint_level,
+                    updated_at = excluded.updated_at;
+                """,
+                (clean_p, taint_level, now_ts),
+            )
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to set principal taint: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_principal_taint(self, principal_id: str) -> str | None:
+        """Fetch persisted taint status for a principal."""
+        clean_p = principal_id.strip()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT taint_level FROM principal_taints WHERE principal_id = ? LIMIT 1;",
+                (clean_p,),
+            ).fetchone()
+            return str(row[0]) if row else None
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to get principal taint: {exc}") from exc
+        finally:
+            conn.close()
+
+    def clear_taint(
+        self,
+        *,
+        session_id: str | None = None,
+        principal_id: str | None = None,
+    ) -> None:
+        """Explicitly clear taint for a session and/or principal (operator operation)."""
+        now_ts = utc_now_iso()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            if session_id:
+                conn.execute(
+                    """
+                    INSERT INTO session_taints (session_id, taint_level, updated_at)
+                    VALUES (?, 'trusted', ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        taint_level = 'trusted',
+                        updated_at = excluded.updated_at;
+                    """,
+                    (session_id, now_ts),
+                )
+            if principal_id:
+                conn.execute(
+                    """
+                    INSERT INTO principal_taints (principal_id, taint_level, updated_at)
+                    VALUES (?, 'trusted', ?)
+                    ON CONFLICT(principal_id) DO UPDATE SET
+                        taint_level = 'trusted',
+                        updated_at = excluded.updated_at;
+                    """,
+                    (principal_id.strip(), now_ts),
+                )
+            conn.execute("COMMIT;")
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to clear taint: {exc}") from exc
+        finally:
+            conn.close()
+
+    # --- Session Management ---
+
+    def create_session(
+        self,
+        session_id: str,
+        principal_id: str,
+        trust_domain: str = "default",
+        policy_version: str = "1",
+        ttl_seconds: float = 3600.0,
+        metadata: dict[str, Any] | None = None,
+    ) -> SessionRecord:
+        """Create and persist a server-issued session bound to an authenticated principal."""
+        now = time.time()
+        expires_at = now + ttl_seconds
+        meta = metadata or {}
+        meta_json = canonicalize_json(meta)
+        clean_sid = session_id.strip()
+        clean_pid = principal_id.strip()
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                INSERT INTO sessions (
+                    session_id, principal_id, trust_domain, policy_version,
+                    created_at, expires_at, status, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?);
+                """,
+                (clean_sid, clean_pid, trust_domain, policy_version, now, expires_at, meta_json),
+            )
+            conn.execute("COMMIT;")
+            return SessionRecord(
+                session_id=clean_sid,
+                principal_id=clean_pid,
+                trust_domain=trust_domain,
+                policy_version=policy_version,
+                created_at=now,
+                expires_at=expires_at,
+                status="active",
+                metadata=meta,
+            )
+        except sqlite3.IntegrityError as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Session '{clean_sid}' already exists") from exc
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to create session: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_session(self, session_id: str) -> SessionRecord | None:
+        """Fetch session record by session_id, evaluating expiration lazily."""
+        clean_sid = session_id.strip()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT session_id, principal_id, trust_domain, policy_version,
+                       created_at, expires_at, status, metadata_json
+                FROM sessions
+                WHERE session_id = ? LIMIT 1;
+                """,
+                (clean_sid,),
+            ).fetchone()
+            if row is None:
+                return None
+            status = str(row[6])
+            expires_at = float(row[5])
+            if status == "active" and time.time() > expires_at:
+                status = "expired"
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute(
+                        "UPDATE sessions SET status = 'expired' WHERE session_id = ?;",
+                        (clean_sid,),
+                    )
+            return SessionRecord(
+                session_id=str(row[0]),
+                principal_id=str(row[1]),
+                trust_domain=str(row[2]),
+                policy_version=str(row[3]),
+                created_at=float(row[4]),
+                expires_at=expires_at,
+                status=status,
+                metadata=json.loads(row[7]),
+            )
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to get session: {exc}") from exc
+        finally:
+            conn.close()
+
+    def list_sessions(
+        self,
+        *,
+        principal_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[SessionRecord]:
+        """List sessions optionally filtered by principal or status."""
+        conn = self._connect()
+        try:
+            clauses = []
+            params: list[Any] = []
+            if principal_id:
+                clauses.append("principal_id = ?")
+                params.append(principal_id.strip())
+            if status:
+                clauses.append("status = ?")
+                params.append(status.strip())
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            query = f"""
+                SELECT session_id, principal_id, trust_domain, policy_version,
+                       created_at, expires_at, status, metadata_json
+                FROM sessions {where}
+                ORDER BY created_at DESC LIMIT ? OFFSET ?;
+            """  # noqa: S608
+            params.extend([limit, max(0, offset)])
+            rows = conn.execute(query, params).fetchall()
+            now = time.time()
+            records: list[SessionRecord] = []
+            for r in rows:
+                st = str(r[6])
+                exp = float(r[5])
+                if st == "active" and now > exp:
+                    st = "expired"
+                records.append(
+                    SessionRecord(
+                        session_id=str(r[0]),
+                        principal_id=str(r[1]),
+                        trust_domain=str(r[2]),
+                        policy_version=str(r[3]),
+                        created_at=float(r[4]),
+                        expires_at=exp,
+                        status=st,
+                        metadata=json.loads(r[7]),
+                    )
+                )
+            return records
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to list sessions: {exc}") from exc
+        finally:
+            conn.close()
+
+    def revoke_session(self, session_id: str) -> bool:
+        """Revoke a session immediately."""
+        clean_sid = session_id.strip()
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE sessions SET status = 'revoked' "
+                "WHERE session_id = ? AND status = 'active';",
+                (clean_sid,),
+            )
+            return cur.rowcount > 0
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to revoke session: {exc}") from exc
+        finally:
+            conn.close()
+
+    def cleanup_expired_sessions(self) -> int:
+        """Mark all expired sessions as expired in database."""
+        now = time.time()
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE sessions SET status = 'expired' "
+                "WHERE status = 'active' AND expires_at < ?;",
+                (now,),
+            )
+            return cur.rowcount
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to cleanup expired sessions: {exc}") from exc
         finally:
             conn.close()
 

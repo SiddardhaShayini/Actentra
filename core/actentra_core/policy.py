@@ -161,8 +161,10 @@ def parse_policy_dict(raw: Any) -> PolicyPack:
             raise PolicyValidationError(f"limits[{idx}].id must be non-empty and unique")
         seen_limit_ids.add(lid)
         scope = str(item.get("scope", "")).strip().lower()
-        if scope not in ("session", "global"):
-            raise PolicyValidationError(f"limits[{idx}].scope must be 'session' or 'global'")
+        if scope not in ("session", "principal", "global"):
+            raise PolicyValidationError(
+                f"limits[{idx}].scope must be 'session', 'principal', or 'global'"
+            )
         cap = item.get("max_actions_per_minute")
         if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
             raise PolicyValidationError(
@@ -328,7 +330,12 @@ class PolicyEngine:
         now = timestamp if timestamp is not None else self._clock()
         cutoff = now - 60.0
         for limit in self._policy.limits:
-            scope_key = "global" if limit.scope == "global" else envelope.session_id
+            if limit.scope == "global":
+                scope_key = "global"
+            elif limit.scope == "principal":
+                scope_key = f"principal:{envelope.agent.id}"
+            else:
+                scope_key = envelope.session_id
             bucket_key = (limit.id, scope_key)
             if bucket_key not in self._buckets and len(self._buckets) >= _MAX_TRACKED_SESSIONS:
                 # Evict oldest inserted key to keep memory strictly bounded.
@@ -392,7 +399,10 @@ class PolicyEngine:
                 risk_tags=risk_tags,
             )
 
-        budget_hit = self._budget_tracker.check_budget(envelope)
+        budget_hit = self._budget_tracker.check_budget(
+            envelope,
+            principal_id=envelope.agent.id if envelope.agent else None,
+        )
         if budget_hit is not None:
             combined_tags = tuple(sorted(set(risk_tags) | set(budget_hit.risk_tags)))
             return self._finalize_decision(

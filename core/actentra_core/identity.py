@@ -876,7 +876,9 @@ class CallerContext:
 
     @property
     def is_trusted_operator(self) -> bool:
-        """True if the caller is an authenticated operator or local process."""
+        """True if the caller is an authenticated operator, local process, or holds system:admin."""
+        if "system:admin" in self.scopes or "*" in self.scopes:
+            return True
         return self.authenticated and self.principal_type in (
             PrincipalType.LOCAL_PROCESS,
             PrincipalType.AUTHENTICATED_OPERATOR,
@@ -895,7 +897,7 @@ class CallerContext:
 
     def has_scope(self, scope: str) -> bool:
         """Check whether principal holds the specified permission scope."""
-        if "*" in self.scopes:
+        if "*" in self.scopes or "system:admin" in self.scopes:
             return True
         if scope in self.scopes:
             return True

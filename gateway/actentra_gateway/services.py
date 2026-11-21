@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import threading
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
@@ -50,7 +52,7 @@ from actentra_core.identity import (
     make_local_caller_context,
 )
 from actentra_core.policy import lint_policy, load_policy_yaml
-from actentra_core.receipts import GENESIS_HASH, verify_log
+from actentra_core.receipts import GENESIS_HASH, SessionRecord, verify_log
 from actentra_core.verdict import Decision, Verdict
 from actentra_executors.fs import LocalFSExecutor
 from actentra_executors.http import ScopedHTTPExecutor
@@ -127,6 +129,7 @@ class AppServices:
             self.file_verifier = None
         # Clean up expired approvals upon service startup (idempotent, restart-safe)
         self.boundary.receipt_store.recover_pending_approvals()
+        self._crossing_lock = threading.RLock()
 
     def _validate_caller_context(self, caller_context: CallerContext | None) -> None:
         """Validate caller_context does not assert forged, mismatched, or revoked delegation."""
@@ -184,6 +187,23 @@ class AppServices:
                     audience=caller_context.audience,
                 )
 
+    def _require_scope_or_operator(
+        self,
+        caller_context: CallerContext | None,
+        *scopes: str,
+    ) -> None:
+        """Validate caller has at least one of the required scopes or is a trusted operator."""
+        if caller_context is None:
+            return
+        self._validate_caller_context(caller_context)
+        if caller_context.is_trusted_operator:
+            return
+        if not any(caller_context.has_scope(s) for s in scopes):
+            scope_str = scopes[0] if len(scopes) == 1 else ", ".join(scopes)
+            raise IdentitySecurityError(
+                f"Principal '{caller_context.principal_id}' lacks '{scope_str}' scope"
+            )
+
     # --- 1. Health & Status ---
 
     def get_health(self, *, full_verify: bool = False) -> dict[str, Any]:
@@ -224,6 +244,18 @@ class AppServices:
         caller_context: CallerContext | None = None,
     ) -> dict[str, Any]:
         """Propose, canonicalize, evaluate, and conditionally execute an action."""
+        with self._crossing_lock:
+            return self._submit_crossing_locked(
+                data, execute=execute, caller_context=caller_context
+            )
+
+    def _submit_crossing_locked(
+        self,
+        data: dict[str, Any],
+        *,
+        execute: bool = False,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any]:
         # Enforce authenticated identity and principal constraints (Stage 0 Task 2)
         raw_agent = data.get("agent_id")
         if raw_agent is None and isinstance(data.get("agent"), dict):
@@ -282,7 +314,10 @@ class AppServices:
                     "canonical_hash": "sha256:" + ("0" * 64),
                     "risk_tags": ["spoofing-attempt"],
                 }
-            if not caller_context.has_scope("crossings:propose"):
+            if (
+                not caller_context.has_scope("crossings:propose")
+                and not caller_context.has_scope("crossings:submit")
+            ):
                 return {
                     "verdict": Verdict.DENY.value,
                     "error": (
@@ -305,25 +340,53 @@ class AppServices:
                     "risk_tags": ["unauthorized-action"],
                 }
 
-        session_id = str(data.get("session_id", "default")).strip() or "default"
-        if len(session_id) > 128:
-            return {
-                "verdict": Verdict.HOLD.value,
-                "error": "session_id exceeds maximum length of 128 characters",
-                "rule_id": "kernel:session-id-too-long",
-                "canonical_hash": "sha256:" + ("0" * 64),
-                "risk_tags": [],
-            }
+        # Phase 2: Server-controlled session identity and ownership validation
+        raw_session_id = data.get("session_id")
+        caller_principal = (
+            caller_context.authenticated_identity
+            if caller_context
+            else agent_id_claim
+        )
+        if raw_session_id is not None and str(raw_session_id).strip():
+            candidate_sid = str(raw_session_id).strip()
+            if len(candidate_sid) > 128:
+                return {
+                    "verdict": Verdict.HOLD.value,
+                    "error": "session_id exceeds maximum length of 128 characters",
+                    "rule_id": "kernel:session-id-too-long",
+                    "canonical_hash": "sha256:" + ("0" * 64),
+                    "risk_tags": [],
+                }
+            try:
+                session_rec = self.validate_session_access(
+                    candidate_sid,
+                    caller_context=caller_context,
+                    auto_create=True,
+                )
+                session_id = session_rec.session_id
+            except IdentitySecurityError as exc:
+                return {
+                    "verdict": Verdict.DENY.value,
+                    "error": str(exc),
+                    "code": "unauthorized_principal",
+                    "rule_id": "identity:cross-principal-session-access",
+                    "canonical_hash": "sha256:" + ("0" * 64),
+                    "risk_tags": ["spoofing-attempt", "session-hijack"],
+                }
+        else:
+            session_rec = self.create_session_record(caller_context=caller_context)
+            session_id = session_rec.session_id
+
         prov_items = [
             ProvenanceItem(source=p["source"], trust=p["trust"])
             for p in data.get("provenance", [])
             if isinstance(p, dict) and "source" in p and "trust" in p
         ]
-        # Propagate session taint across gateway crossings
-        # (cannot be bypassed by declared provenance)
-        if self.boundary.get_session_taint(session_id) == "untrusted" and not any(
-            p.trust == "untrusted" for p in prov_items
-        ):
+        # Propagate session and principal taint across gateway crossings
+        # (cannot be bypassed by declared provenance or by creating a new session)
+        if self.boundary.get_session_taint(
+            session_id, principal_id=caller_principal
+        ) == "untrusted" and not any(p.trust == "untrusted" for p in prov_items):
             prov_items.append(ProvenanceItem(source="session", trust="untrusted"))
 
         try:
@@ -347,9 +410,14 @@ class AppServices:
                 "risk_tags": [],
             }
 
-        # Update session taint tracker if this action is untrusted (Finding 5)
+        # Update session and principal taint tracker if this action is untrusted (Phase 2)
         if envelope.max_taint == "untrusted":
-            self.boundary.set_session_taint("untrusted", session_id=envelope.session_id)
+            self.boundary.set_session_taint(
+                "untrusted",
+                session_id=envelope.session_id,
+                principal_id=caller_principal,
+                caller_context=caller_context,
+            )
 
         # Multi-agent coordination conflict check:
         # mutating operations check for active lease conflicts
@@ -401,7 +469,9 @@ class AppServices:
             executor = self.registry.get_executor(envelope.action.tool)
             if executor is not None:
                 try:
-                    exec_result = self._dispatch_and_record(envelope, decision, executor)
+                    exec_result = self._dispatch_and_record(
+                        envelope, decision, executor, caller_context=caller_context
+                    )
                     resp["executed"] = True
                     resp["outcome"] = {"status": "success", "result": exec_result}
                 except Exception as exc:
@@ -421,6 +491,7 @@ class AppServices:
         envelope: ActionEnvelope,
         decision: Decision,
         executor: ToolExecutorCallable,
+        caller_context: CallerContext | None = None,
     ) -> Any:
         """Internal dispatch executing the action and recording the outcome receipt."""
         # Invariant I3: TOCTOU check immediately before execution
@@ -492,8 +563,15 @@ class AppServices:
                 details={"result_hash": res_hash, "executed": True},
             )
             self.boundary.receipt_store.record_evidence(ev)
-        # Update session cumulative budgets for gateway execution (Finding 6)
-        self.boundary.engine.budget_tracker.record_usage(envelope)
+        # Update session and principal cumulative budgets for gateway execution
+        self.boundary.engine.budget_tracker.record_usage(
+            envelope,
+            principal_id=(
+                caller_context.authenticated_identity
+                if caller_context
+                else envelope.agent.id
+            ),
+        )
         return result
 
     # --- 3. Approvals Management ---
@@ -503,15 +581,73 @@ class AppServices:
         *,
         status: str | None = "pending",
         limit: int = 100,
+        caller_context: CallerContext | None = None,
     ) -> list[dict[str, Any]]:
-        """List pending approvals from SQLite store."""
-        records = self.boundary.receipt_store.list_pending_approvals(status=status, limit=limit)
-        return [r.to_dict() for r in records]
+        """List pending approvals from SQLite store with scope and object-level authorization."""
+        self._require_scope_or_operator(caller_context, "approvals:read", "crossings:read")
 
-    def get_pending_approval(self, crossing_id: str) -> dict[str, Any] | None:
-        """Get detail for a specific crossing approval."""
+        records = self.boundary.receipt_store.list_pending_approvals(status=status, limit=limit)
+        results: list[dict[str, Any]] = []
+        for r in records:
+            d = r.to_dict()
+            # Object-level filtering and parameter redaction for non-operators
+            if caller_context is not None and not caller_context.is_trusted_operator:
+                is_owner = False
+                sess = self.boundary.receipt_store.get_session(r.session_id)
+                auth_id = caller_context.authenticated_identity.lower()
+                if (sess and sess.principal_id.lower() == auth_id) or (
+                    caller_context.is_agent_allowed(r.session_id)
+                    or caller_context.principal_id.lower() == r.session_id.lower()
+                ):
+                    is_owner = True
+
+                if (
+                    not is_owner
+                    and not caller_context.is_approver
+                    and not caller_context.has_scope("approvals:read_all")
+                ):
+                    continue  # Non-owner cannot see other principals' pending approvals
+
+                if not is_owner and not caller_context.is_trusted_operator:
+                    # Redact sensitive parameters for non-owners/non-operators
+                    d["params"] = {"_redacted": "UNAUTHORIZED_RESOURCE_ACCESS"}
+            results.append(d)
+        return results
+
+    def get_pending_approval(
+        self,
+        crossing_id: str,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any] | None:
+        """Get detail for a specific crossing approval, enforcing object-level authorization."""
+        self._require_scope_or_operator(caller_context, "approvals:read", "crossings:read")
+
         r = self.boundary.receipt_store.get_pending_approval(crossing_id)
-        return r.to_dict() if r is not None else None
+        if r is None:
+            return None
+        d = r.to_dict()
+        if caller_context is not None and not caller_context.is_trusted_operator:
+            is_owner = False
+            sess = self.boundary.receipt_store.get_session(r.session_id)
+            auth_id = caller_context.authenticated_identity.lower()
+            if (sess and sess.principal_id.lower() == auth_id) or (
+                caller_context.is_agent_allowed(r.session_id)
+                or caller_context.principal_id.lower() == r.session_id.lower()
+            ):
+                is_owner = True
+
+            if (
+                not is_owner
+                and not caller_context.is_approver
+                and not caller_context.has_scope("approvals:read_all")
+            ):
+                raise IdentitySecurityError(
+                    f"Principal '{caller_context.principal_id}' is not authorized to access "
+                    f"approval '{crossing_id}' belonging to another principal"
+                )
+            if not is_owner and not caller_context.is_trusted_operator:
+                d["params"] = {"_redacted": "UNAUTHORIZED_RESOURCE_ACCESS"}
+        return d
 
     def resolve_approval(
         self,
@@ -572,6 +708,17 @@ class AppServices:
         caller_context: CallerContext | None = None,
     ) -> dict[str, Any]:
         """Execute a previously approved crossing through registered executor."""
+        with self._crossing_lock:
+            return self._execute_approved_crossing_locked(
+                crossing_id, caller_context=caller_context
+            )
+
+    def _execute_approved_crossing_locked(
+        self,
+        crossing_id: str,
+        *,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any]:
         p = self.boundary.receipt_store.get_pending_approval(crossing_id)
         if p is None:
             return {"error": f"Crossing '{crossing_id}' not found"}
@@ -676,7 +823,9 @@ class AppServices:
         self.boundary.consume_approval(envelope.canonical_hash, session_id=envelope.session_id)
 
         try:
-            result = self._dispatch_and_record(envelope, decision, executor)
+            result = self._dispatch_and_record(
+                envelope, decision, executor, caller_context=caller_context
+            )
             return {"status": "success", "result": result, "crossing_id": crossing_id}
         except Exception as exc:
             return {"status": "failure", "error": type(exc).__name__, "crossing_id": crossing_id}
@@ -925,7 +1074,10 @@ class AppServices:
                     provenance=prov_items,
                     crossing_id=crossing_id,
                 )
-                self.boundary.engine.budget_tracker.record_usage(env)
+                self.boundary.engine.budget_tracker.record_usage(
+                    env,
+                    principal_id=executor_principal,
+                )
 
         return {
             "status": "recorded",
@@ -940,8 +1092,9 @@ class AppServices:
 
     # --- 4. Policy, Linting, & Canary ---
 
-    def get_policy_yaml(self) -> str:
+    def get_policy_yaml(self, caller_context: CallerContext | None = None) -> str:
         """Return the current active policy formatted as YAML."""
+        self._require_scope_or_operator(caller_context, "policies:read")
         pack = self.boundary.engine.policy
         limits_list: list[dict[str, Any]] = [
             {"id": lim.id, "scope": lim.scope, "max_actions_per_minute": lim.max_actions_per_minute}
@@ -1007,8 +1160,11 @@ class AppServices:
 
         return yaml.dump(doc, sort_keys=False)
 
-    def lint_active_policy(self) -> list[dict[str, str]]:
+    def lint_active_policy(
+        self, caller_context: CallerContext | None = None
+    ) -> list[dict[str, str]]:
         """Run policy linter on the active policy pack."""
+        self._require_scope_or_operator(caller_context, "policies:lint", "policies:read")
         warnings = lint_policy(self.boundary.engine.policy)
         return [{"message": w} for w in warnings]
 
@@ -1061,8 +1217,24 @@ class AppServices:
         session_id: str | None = None,
         record_type: str | None = None,
         search: str | None = None,
+        caller_context: CallerContext | None = None,
     ) -> dict[str, Any]:
         """Query bounded receipts with pagination and total count."""
+        self._require_scope_or_operator(caller_context, "receipts:read")
+        if (
+            caller_context is not None
+            and not caller_context.is_trusted_operator
+            and not caller_context.has_scope("receipts:read_all")
+            and session_id
+        ):
+            sess = self.boundary.receipt_store.get_session(session_id)
+            auth_id = caller_context.authenticated_identity.lower()
+            if sess and sess.principal_id.lower() != auth_id:
+                raise IdentitySecurityError(
+                    f"Principal '{caller_context.principal_id}' cannot access receipts "
+                    f"for session '{session_id}' owned by '{sess.principal_id}'"
+                )
+
         records, total = self.boundary.receipt_store.query_records(
             limit=limit,
             offset=offset,
@@ -1073,6 +1245,29 @@ class AppServices:
             record_type=record_type,
             search=search,
         )
+
+        # Object-level filtering for non-operator callers
+        if (
+            caller_context is not None
+            and not caller_context.is_trusted_operator
+            and not caller_context.has_scope("receipts:read_all")
+        ):
+            filtered_records = []
+            auth_id = caller_context.authenticated_identity.lower()
+            for r in records:
+                sess = (
+                    self.boundary.receipt_store.get_session(r.session_id)
+                    if r.session_id
+                    else None
+                )
+                if (
+                    (sess and sess.principal_id.lower() == auth_id)
+                    or caller_context.is_agent_allowed(r.session_id)
+                ):
+                    filtered_records.append(r)
+            records = filtered_records
+            total = len(records)
+
         return {
             "records": [r.to_dict() for r in records],
             "total_count": total,
@@ -1080,8 +1275,14 @@ class AppServices:
             "offset": offset,
         }
 
-    def verify_audit_log(self, *, verify_envelopes: bool = True) -> dict[str, Any]:
+    def verify_audit_log(
+        self,
+        *,
+        verify_envelopes: bool = True,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any]:
         """Verify receipt log hash-chain and envelope integrity."""
+        self._require_scope_or_operator(caller_context, "audit:verify", "receipts:read")
         vr = verify_log(self.boundary.receipt_store.db_path, verify_envelopes=verify_envelopes)
         return {
             "ok": vr.ok,
@@ -1090,8 +1291,13 @@ class AppServices:
             "errors": list(vr.errors),
         }
 
-    def export_audit_bundle(self, out_path: str | Path | None = None) -> dict[str, Any]:
+    def export_audit_bundle(
+        self,
+        out_path: str | Path | None = None,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any]:
         """Create an exportable offline audit bundle."""
+        self._require_scope_or_operator(caller_context, "audit:export")
         vr = verify_log(self.boundary.receipt_store.db_path)
         records = [r.to_dict() for r in self.boundary.receipt_store.iter_records()]
         bundle = {
@@ -1177,8 +1383,13 @@ class AppServices:
                 self.boundary.receipt_store.record_evidence(ev)
         return obs.to_dict()
 
-    def get_observation(self, observation_id: str) -> dict[str, Any] | None:
+    def get_observation(
+        self,
+        observation_id: str,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any] | None:
         """Fetch detail for a specific observation."""
+        self._require_scope_or_operator(caller_context, "observations:read")
         obs = self.boundary.receipt_store.get_observation(observation_id)
         return obs.to_dict() if obs is not None else None
 
@@ -1186,8 +1397,10 @@ class AppServices:
         self,
         subject_resource: str,
         claim: str | None = None,
+        caller_context: CallerContext | None = None,
     ) -> dict[str, Any] | None:
         """Fetch latest observation for a resource."""
+        self._require_scope_or_operator(caller_context, "observations:read")
         obs = self.boundary.receipt_store.get_latest_observation(subject_resource, claim=claim)
         return obs.to_dict() if obs is not None else None
 
@@ -1198,8 +1411,10 @@ class AppServices:
         subject_resource: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        caller_context: CallerContext | None = None,
     ) -> list[dict[str, Any]]:
         """List persisted observations."""
+        self._require_scope_or_operator(caller_context, "observations:read")
         records = self.boundary.receipt_store.list_observations(
             crossing_id=crossing_id,
             subject_resource=subject_resource,
@@ -1210,8 +1425,13 @@ class AppServices:
 
     # --- Evidence Records Management (Phase 5) ---
 
-    def get_evidence(self, evidence_id: str) -> dict[str, Any] | None:
+    def get_evidence(
+        self,
+        evidence_id: str,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any] | None:
         """Fetch detail for a specific evidence record."""
+        self._require_scope_or_operator(caller_context, "evidence:read")
         ev = self.boundary.receipt_store.get_evidence(evidence_id)
         return ev.to_dict() if ev is not None else None
 
@@ -1222,8 +1442,10 @@ class AppServices:
         tier: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        caller_context: CallerContext | None = None,
     ) -> list[dict[str, Any]]:
         """List persisted evidence records."""
+        self._require_scope_or_operator(caller_context, "evidence:read")
         records = self.boundary.receipt_store.list_evidence(
             crossing_id=crossing_id,
             tier=tier,
@@ -1334,8 +1556,13 @@ class AppServices:
         saved = self.boundary.receipt_store.record_handoff(handoff)
         return saved.to_dict()
 
-    def get_task_handoff(self, handoff_id: str) -> dict[str, Any] | None:
+    def get_task_handoff(
+        self,
+        handoff_id: str,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any] | None:
         """Fetch detail for a specific task handoff (or active handoff by task_id)."""
+        self._require_scope_or_operator(caller_context, "handoffs:read")
         hnd = self.boundary.receipt_store.get_handoff(handoff_id)
         if hnd is None:
             hnd = self.boundary.receipt_store.get_active_handoff_by_task(handoff_id)
@@ -1348,8 +1575,10 @@ class AppServices:
         assigned_agent_id: str | None = None,
         status: str | None = None,
         limit: int = 50,
+        caller_context: CallerContext | None = None,
     ) -> list[dict[str, Any]]:
         """List task handoffs matching criteria."""
+        self._require_scope_or_operator(caller_context, "handoffs:read")
         handoffs = self.boundary.receipt_store.list_handoffs(
             task_id=task_id,
             assigned_agent_id=assigned_agent_id,
@@ -1632,8 +1861,13 @@ class AppServices:
             return {"status": "not_found_or_unauthorized", "released": False}
         return {"status": "released", "released": True, "lease_id": lease_id}
 
-    def get_resource_lease(self, lease_id: str) -> dict[str, Any] | None:
+    def get_resource_lease(
+        self,
+        lease_id: str,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any] | None:
         """Get detail for a specific resource lease."""
+        self._require_scope_or_operator(caller_context, "leases:read")
         lease = self.boundary.receipt_store.get_lease(lease_id)
         return lease.to_dict() if lease is not None else None
 
@@ -1645,8 +1879,17 @@ class AppServices:
         status: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        caller_context: CallerContext | None = None,
     ) -> list[dict[str, Any]]:
         """List resource leases with optional filtering."""
+        self._require_scope_or_operator(caller_context, "leases:read")
+        if (
+            caller_context is not None
+            and not caller_context.is_trusted_operator
+            and owner_agent_id
+            and not caller_context.is_agent_allowed(owner_agent_id)
+        ):
+            return []
         leases = self.boundary.receipt_store.list_leases(
             resource=resource,
             owner_agent_id=owner_agent_id,
@@ -1723,7 +1966,213 @@ class AppServices:
             revoker = make_local_caller_context("local_operator")
         return self.delegation_registry.revoke_grant(grant_id, revoker)
 
-    def get_delegation(self, grant_id: str) -> dict[str, Any] | None:
+    def get_delegation(
+        self,
+        grant_id: str,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any] | None:
         """Fetch delegation grant by grant_id."""
+        self._require_scope_or_operator(caller_context, "delegations:read")
         grant = self.delegation_registry.get_grant(grant_id)
-        return grant.to_dict() if grant is not None else None
+        if grant is None:
+            return None
+        if caller_context is not None and not caller_context.is_trusted_operator:
+            ident = caller_context.authenticated_identity.lower()
+            if ident not in (grant.delegator_id.lower(), grant.delegatee_id.lower()):
+                raise IdentitySecurityError(
+                    f"Principal '{caller_context.principal_id}' not authorized "
+                    f"to view delegation '{grant_id}'"
+                )
+        return grant.to_dict()
+
+    # --- 14. Server-Controlled Session Management (Phase 2) ---
+
+    def create_session_record(
+        self,
+        caller_context: CallerContext | None = None,
+        trust_domain: str = "default",
+        session_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        ttl_seconds: float = 3600.0,
+    ) -> SessionRecord:
+        """Create a server-controlled session record bound to authenticated principal."""
+        principal_id = (
+            caller_context.authenticated_identity
+            if caller_context
+            else "local_operator"
+        )
+        if not session_id:
+            session_id = f"sess-{uuid.uuid4().hex[:16]}"
+        policy_version = self.boundary.engine.policy.policy_version
+        return self.boundary.receipt_store.create_session(
+            session_id=session_id,
+            principal_id=principal_id,
+            trust_domain=trust_domain,
+            policy_version=policy_version,
+            ttl_seconds=ttl_seconds,
+            metadata=metadata,
+        )
+
+    def validate_session_access(
+        self,
+        session_id: str,
+        caller_context: CallerContext | None = None,
+        auto_create: bool = True,
+    ) -> SessionRecord:
+        """Validate that the caller is authorized to access the given session ID.
+
+        If the session does not exist and auto_create is True, it is bound to the
+        caller's authenticated identity. If the session exists and belongs to another
+        principal, IdentitySecurityError is raised.
+        """
+        if caller_context is not None:
+            self._validate_caller_context(caller_context)
+            caller_principal = caller_context.authenticated_identity.lower()
+        else:
+            caller_principal = "local_operator"
+
+        existing = self.boundary.receipt_store.get_session(session_id)
+        if existing is None:
+            if not auto_create:
+                raise IdentitySecurityError(f"Session '{session_id}' not found or expired")
+            policy_version = self.boundary.engine.policy.policy_version
+            return self.boundary.receipt_store.create_session(
+                session_id=session_id,
+                principal_id=caller_principal,
+                trust_domain="default",
+                policy_version=policy_version,
+                ttl_seconds=3600.0,
+            )
+
+        if existing.status == "revoked":
+            raise IdentitySecurityError(f"Session '{session_id}' has been revoked")
+        if existing.status == "expired":
+            raise IdentitySecurityError(f"Session '{session_id}' has expired")
+
+        if (
+            caller_context is not None
+            and not caller_context.is_trusted_operator
+            and existing.principal_id.lower() != caller_principal
+        ):
+            raise IdentitySecurityError(
+                f"Principal '{caller_context.principal_id}' cannot access session "
+                f"'{session_id}' owned by '{existing.principal_id}'"
+            )
+
+        return existing
+
+    def create_session(
+        self,
+        principal_id: str | None = None,
+        trust_domain: str = "default",
+        session_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        ttl_seconds: float = 3600.0,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any]:
+        """Create a server-controlled session record."""
+        self._require_scope_or_operator(caller_context, "sessions:create")
+        if caller_context is not None and not caller_context.is_trusted_operator:
+            auth_id = caller_context.authenticated_identity.lower()
+            if principal_id and principal_id.lower() != auth_id:
+                raise IdentitySecurityError(
+                    f"Principal '{caller_context.principal_id}' cannot create "
+                    f"session for '{principal_id}'"
+                )
+            principal_id = caller_context.authenticated_identity
+        else:
+            if not principal_id:
+                principal_id = "local_operator"
+
+        target_principal = principal_id or "local_operator"
+        if not session_id:
+            session_id = f"sess-{uuid.uuid4().hex[:16]}"
+
+        policy_version = self.boundary.engine.policy.policy_version
+        rec = self.boundary.receipt_store.create_session(
+            session_id=session_id,
+            principal_id=target_principal,
+            trust_domain=trust_domain,
+            policy_version=policy_version,
+            ttl_seconds=ttl_seconds,
+            metadata=metadata,
+        )
+        return rec.to_dict()
+
+    def get_session(
+        self,
+        session_id: str,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any] | None:
+        """Fetch session detail by session_id, enforcing ownership check."""
+        self._require_scope_or_operator(caller_context, "sessions:read")
+        rec = self.boundary.receipt_store.get_session(session_id)
+        if rec is None:
+            return None
+
+        if (
+            caller_context is not None
+            and not caller_context.is_trusted_operator
+            and rec.principal_id.lower() != caller_context.authenticated_identity.lower()
+        ):
+            raise IdentitySecurityError(
+                f"Principal '{caller_context.principal_id}' cannot read session '{session_id}' "
+                f"owned by '{rec.principal_id}'"
+            )
+        return rec.to_dict()
+
+    def list_sessions(
+        self,
+        principal_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        caller_context: CallerContext | None = None,
+    ) -> list[dict[str, Any]]:
+        """List session records, partitioned by principal for non-operators."""
+        self._require_scope_or_operator(caller_context, "sessions:read")
+        if caller_context is not None and not caller_context.is_trusted_operator:
+            principal_id = caller_context.authenticated_identity
+
+        records = self.boundary.receipt_store.list_sessions(
+            principal_id=principal_id,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+        return [r.to_dict() for r in records]
+
+    def revoke_session(
+        self,
+        session_id: str,
+        caller_context: CallerContext | None = None,
+    ) -> bool:
+        """Revoke a session."""
+        self._require_scope_or_operator(caller_context, "sessions:revoke")
+        if caller_context is not None and not caller_context.is_trusted_operator:
+            existing = self.boundary.receipt_store.get_session(session_id)
+            if (
+                existing
+                and existing.principal_id.lower()
+                != caller_context.authenticated_identity.lower()
+            ):
+                raise IdentitySecurityError(
+                    f"Principal '{caller_context.principal_id}' cannot revoke session "
+                    f"'{session_id}' owned by '{existing.principal_id}'"
+                )
+
+        return self.boundary.receipt_store.revoke_session(session_id)
+
+    def freeze(self, caller_context: CallerContext | None = None) -> None:
+        """Freeze the boundary engine to block new crossings."""
+        self._require_scope_or_operator(caller_context, "system:freeze")
+        self.boundary.freeze()
+
+    def unfreeze(self, caller_context: CallerContext | None = None) -> None:
+        """Unfreeze the boundary engine."""
+        self._require_scope_or_operator(caller_context, "system:unfreeze")
+        self.boundary.unfreeze()
+
+    def is_frozen(self) -> bool:
+        """Check if boundary engine is frozen."""
+        return self.boundary.is_frozen

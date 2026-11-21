@@ -142,6 +142,7 @@ class Boundary:
                 self._warrant_registry.set_receipt_store(self._store)
         else:
             self._warrant_registry = WarrantRegistry(receipt_store=self._store)
+        self._engine.budget_tracker.set_receipt_store(self._store)
         self._verifier = verifier
         self._lock = threading.Lock()
         self._approvals: dict[tuple[str, str], ApprovalGrant] = {}
@@ -289,6 +290,10 @@ class Boundary:
     def unfreeze(self) -> None:
         self._engine.unfreeze()
 
+    @property
+    def is_frozen(self) -> bool:
+        return bool(self._engine.frozen)
+
     def _has_valid_approval(self, envelope: ActionEnvelope) -> bool:
         with self._lock:
             key = (envelope.session_id, envelope.canonical_hash)
@@ -330,28 +335,109 @@ class Boundary:
         with self._lock:
             return self._approvals.pop((sid, canonical_hash), None) is not None
 
-    def get_session_taint(self, session_id: str | None = None) -> str | None:
-        """Return cumulative session taint level (checked from memory or durable SQLite)."""
+    def get_session_taint(
+        self,
+        session_id: str | None = None,
+        principal_id: str | None = None,
+    ) -> str | None:
+        """Return cumulative taint level from memory or durable SQLite."""
         sid = session_id or self._session_id
+        if principal_id:
+            pid = principal_id
+        elif hasattr(self._store, "get_session"):
+            sess = self._store.get_session(sid)
+            if sess:
+                pid = sess.principal_id
+            elif session_id is None:
+                pid = (
+                    self._caller_context.authenticated_identity
+                    if self._caller_context
+                    else self._agent_id
+                )
+            else:
+                pid = None
+        elif session_id is None:
+            pid = (
+                self._caller_context.authenticated_identity
+                if self._caller_context
+                else self._agent_id
+            )
+        else:
+            pid = None
         with self._lock:
-            if sid in self._session_taints:
-                return self._session_taints[sid]
-            persisted = self._store.get_session_taint(sid)
-            if persisted is not None:
-                self._session_taints[sid] = persisted
-            return persisted
+            # 1. Check session taint
+            s_taint = self._session_taints.get(sid)
+            if s_taint is None:
+                s_taint = self._store.get_session_taint(sid)
+                if s_taint is not None:
+                    self._session_taints[sid] = s_taint
+            if s_taint == "untrusted":
+                return "untrusted"
 
-    def set_session_taint(self, taint: str, session_id: str | None = None) -> None:
-        """Explicitly set or clear session-level taint in memory and durable SQLite."""
+            # 2. Check principal taint (cannot be bypassed by creating a new session)
+            if pid and hasattr(self._store, "get_principal_taint"):
+                p_taint = self._store.get_principal_taint(pid)
+                if p_taint == "untrusted":
+                    return "untrusted"
+
+            return s_taint
+
+    def set_session_taint(
+        self,
+        taint: str,
+        session_id: str | None = None,
+        principal_id: str | None = None,
+        caller_context: Any | None = None,
+    ) -> None:
+        """Explicitly set or clear session/principal taint in memory and durable SQLite."""
         sid = session_id or self._session_id
+        if principal_id:
+            pid = principal_id
+        elif caller_context and getattr(caller_context, "authenticated_identity", None):
+            pid = caller_context.authenticated_identity
+        elif hasattr(self._store, "get_session"):
+            sess = self._store.get_session(sid)
+            if sess:
+                pid = sess.principal_id
+            elif session_id is None:
+                pid = (
+                    self._caller_context.authenticated_identity
+                    if self._caller_context
+                    else self._agent_id
+                )
+            else:
+                pid = None
+        elif session_id is None:
+            pid = (
+                self._caller_context.authenticated_identity
+                if self._caller_context
+                else self._agent_id
+            )
+        else:
+            pid = None
         clean = taint.strip().lower()
         with self._lock:
             if clean in ("trusted", "clean", ""):
+                ctx = caller_context or self._caller_context
+                if ctx is not None and not (
+                    ctx.is_trusted_operator
+                    or ctx.has_scope("taint:clear")
+                    or ctx.has_scope("operator:*")
+                ):
+                    from actentra_core.identity import IdentitySecurityError
+
+                    raise IdentitySecurityError(
+                        "Only authorized operators can clear or reset security taint"
+                    )
                 self._session_taints.pop(sid, None)
                 self._store.set_session_taint(sid, "trusted")
+                if pid and hasattr(self._store, "set_principal_taint"):
+                    self._store.set_principal_taint(pid, "trusted")
             else:
                 self._session_taints[sid] = clean
                 self._store.set_session_taint(sid, clean)
+                if pid and hasattr(self._store, "set_principal_taint"):
+                    self._store.set_principal_taint(pid, clean)
 
     def dry_run(
         self,
@@ -557,9 +643,13 @@ class Boundary:
                 self._store.record_decision(envelope, deny_decision)
                 raise ActionBlockedError(deny_decision, envelope.crossing_id)
 
-        # Update session taint tracker if this action is untrusted
+        # Update session and principal taint tracker if this action is untrusted
         if envelope.max_taint == "untrusted":
-            self._session_taints[envelope.session_id] = "untrusted"
+            self.set_session_taint(
+                "untrusted",
+                session_id=envelope.session_id,
+                principal_id=envelope.agent.id,
+            )
 
         decision = self._engine.evaluate(envelope)
 
@@ -752,8 +842,11 @@ class Boundary:
                 evidence_status="externally_verified",
                 observation=obs,
             )
-            # Update session cumulative budgets only on verified success
-            self._engine.budget_tracker.record_usage(envelope)
+            # Update session and principal cumulative budgets only on verified success
+            self._engine.budget_tracker.record_usage(
+                envelope,
+                principal_id=envelope.agent.id,
+            )
 
             ev = build_evidence_record(
                 crossing_id=envelope.crossing_id,
