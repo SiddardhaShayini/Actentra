@@ -90,6 +90,7 @@
 * **Invariant I5:** No action executes unless its decision receipt is durable; each execution attempt records an immutable outcome record.
 * **Invariant I6:** Policy updates never apply partially; invalid policies are rejected while preserving the last-known-good configuration.
 * **Invariant I7:** Secrets managed by the Secrets Broker never appear in logs, error messages, or envelopes returned to the agent.
+* **Invariant I8:** Principal authority requires authenticated identity binding; delegation grants enforce bidirectional binding (`grant.delegator_id == delegator` and `grant.delegatee_id == authenticated_caller`), cryptographic/registry verification, scope attenuation, and nested depth limits.
 
 ---
 
@@ -127,3 +128,28 @@ Actentra is designed for local-first, low-overhead operation on resource-constra
 - **Platform DPAPI Storage:** The `SecretsBroker` secures credentials using Windows Data Protection API (DPAPI) tied to the local user account, falling back to AES-256-GCM on POSIX.
 - **Dynamic Resolution:** Agents refer to credentials only via opaque handles (`secret:<NAME>`). Scoped executors resolve and inject these handles into HTTP headers or parameters only at the moment of dispatch.
 - **Zero-Leak Redaction:** All outgoing requests, incoming response headers, bodies, error messages, and durable receipts pass through `secrets_broker.redact()`, guaranteeing that raw secrets are never leaked to logs or the agent context.
+
+### 6. Canonical Identity & Delegation Architecture (Phase 1 / ACT-01 Hardening)
+- **Four-Way Identity Separation:**
+  1. *Claimed Identity:* Untrusted caller-asserted metadata (e.g. `agent_id` in request body or unverified headers).
+  2. *Authenticated Identity:* Verified cryptographic or transport principal (`Bearer` token lookup, Ed25519 signature, or local process identity).
+  3. *Delegated Identity:* Verified delegator principal acting through an explicit, active delegation grant.
+  4. *Effective Principal:* The authorized identity under which the operation actually executes (`delegated_by` if acting under a valid delegation grant, otherwise `authenticated_identity`).
+- **Bidirectional Delegation Grant Binding:**
+  - A delegation grant ID alone is never sufficient for authorization.
+  - The delegation registry strictly validates:
+    - `grant.delegatee_id == authenticated_caller.principal_id`
+    - `grant.delegator_id == caller.delegated_by`
+    - `grant.audience == target_audience` (when configured)
+    - Grant expiration, non-revocation, and replay nonce.
+- **Scope Attenuation & Nested Depth Limits:**
+  - A delegatee cannot receive scopes or represent agents that the delegator lacks.
+  - Sub-delegations increment grant depth (`depth = parent.depth + 1`) bounded by `max_depth`.
+  - Expirations on child grants are strictly bounded by parent grant lifetimes.
+  - Revoking a parent grant cascades transitively to invalidate all downstream child grants.
+- **Cryptographic Grants:**
+  - Ed25519-signed delegation grants (`issue_signed_delegation_grant`, `verify_signed_delegation_grant`) allow stateless, verifiable token issuance with replay protection (`nonce`, `issued_at`, `expires_at`).
+- **Canonical Security Context Propagation:**
+  - `CallerContext` is consistently threaded through `Boundary`, `Gateway`, `Services`, and `Warrants`.
+  - Boundary validates `ctx.is_agent_allowed(agent_id)`, `ctx.has_scope("crossings:execute")`, and ensures that any presented `Warrant.holder` matches the caller's authenticated identity or active delegator.
+  - Approver identity is recorded in durable pending approval records and receipts.

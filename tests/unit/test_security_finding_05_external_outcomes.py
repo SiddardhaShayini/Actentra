@@ -106,7 +106,7 @@ def test_outcome_rejected_without_claim(service_env: tuple[AppServices, ReceiptS
 
 
 def test_claim_issuance_and_successful_outcome_binding(
-    service_env: tuple[AppServices, ReceiptStore]
+    service_env: tuple[AppServices, ReceiptStore],
 ) -> None:
     """T-05: Allowed crossing is claimed by executor and outcome recorded once."""
     services, store = service_env
@@ -200,7 +200,7 @@ def test_claim_replay_rejected(service_env: tuple[AppServices, ReceiptStore]) ->
 
 
 def test_cross_executor_claim_spoofing_rejected(
-    service_env: tuple[AppServices, ReceiptStore]
+    service_env: tuple[AppServices, ReceiptStore],
 ) -> None:
     """T-05: Executor B cannot use an execution claim issued to Executor A."""
     services, store = service_env
@@ -289,9 +289,7 @@ def test_expired_claim_rejected(service_env: tuple[AppServices, ReceiptStore]) -
     assert res.get("code") == "expired"
 
 
-def test_cannot_claim_disallowed_crossing(
-    service_env: tuple[AppServices, ReceiptStore]
-) -> None:
+def test_cannot_claim_disallowed_crossing(service_env: tuple[AppServices, ReceiptStore]) -> None:
     """Non-allowed (ASK/DENY) crossings cannot be claimed without approval."""
     services, _ = service_env
     raw_envelope = {

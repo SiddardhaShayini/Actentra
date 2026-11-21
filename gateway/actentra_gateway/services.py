@@ -129,36 +129,59 @@ class AppServices:
         self.boundary.receipt_store.recover_pending_approvals()
 
     def _validate_caller_context(self, caller_context: CallerContext | None) -> None:
-        """Validate that caller_context does not assert forged or revoked delegation."""
+        """Validate caller_context does not assert forged, mismatched, or revoked delegation."""
         if caller_context is None:
             return
         if caller_context.delegated_by is not None and not caller_context.is_trusted_operator:
-            grant = None
+            reg = self.delegation_registry
+            auth_id = (
+                caller_context.authenticated_principal_id
+                if caller_context.authenticated_principal_id
+                else caller_context.principal_id
+            )
             if caller_context.delegation_grant_id:
-                grant = self.delegation_registry.get_grant(caller_context.delegation_grant_id)
-            if grant is None:
-                grant = self.delegation_registry.find_active_grant(
-                    delegator_id=caller_context.delegated_by,
-                    delegatee_id=caller_context.principal_id,
-                )
-            if grant is None:
-                default_reg = get_default_delegation_registry()
-                if caller_context.delegation_grant_id:
-                    grant = default_reg.get_grant(caller_context.delegation_grant_id)
-                if grant is None:
-                    grant = default_reg.find_active_grant(
-                        delegator_id=caller_context.delegated_by,
-                        delegatee_id=caller_context.principal_id,
+                try:
+                    reg.validate_grant_binding(
+                        caller_context.delegation_grant_id,
+                        authenticated_delegatee_id=auth_id,
+                        authenticated_delegator_id=caller_context.delegated_by,
+                        audience=caller_context.audience,
                     )
-            if grant is None:
-                raise IdentitySecurityError(
-                    f"Forged delegation context: principal '{caller_context.principal_id}' "
-                    f"has no verified delegation grant from '{caller_context.delegated_by}'"
+                except IdentitySecurityError:
+                    default_reg = get_default_delegation_registry()
+                    if default_reg is not reg:
+                        default_reg.validate_grant_binding(
+                            caller_context.delegation_grant_id,
+                            authenticated_delegatee_id=auth_id,
+                            authenticated_delegator_id=caller_context.delegated_by,
+                            audience=caller_context.audience,
+                        )
+                    else:
+                        raise
+            else:
+                grant = reg.find_active_grant(
+                    delegator_id=caller_context.delegated_by,
+                    delegatee_id=auth_id,
+                    audience=caller_context.audience,
                 )
-            if not grant.is_valid():
-                raise IdentitySecurityError(
-                    f"Delegation grant from '{caller_context.delegated_by}' to "
-                    f"'{caller_context.principal_id}' is invalid or revoked"
+                if grant is None:
+                    default_reg = get_default_delegation_registry()
+                    if default_reg is not reg:
+                        grant = default_reg.find_active_grant(
+                            delegator_id=caller_context.delegated_by,
+                            delegatee_id=auth_id,
+                            audience=caller_context.audience,
+                        )
+                if grant is None:
+                    raise IdentitySecurityError(
+                        f"Forged delegation context: principal '{caller_context.principal_id}' "
+                        f"has no verified delegation grant from '{caller_context.delegated_by}'"
+                    )
+                reg.validate_grant_binding(
+                    grant,
+                    authenticated_delegatee_id=auth_id,
+                    authenticated_delegator_id=caller_context.delegated_by,
+                    audience=caller_context.audience,
                 )
 
     # --- 1. Health & Status ---
@@ -514,7 +537,11 @@ class AppServices:
                     )
                 }
 
-        res = self.boundary.receipt_store.resolve_pending_approval(crossing_id, approved=approved)
+        res = self.boundary.receipt_store.resolve_pending_approval(
+            crossing_id,
+            approved=approved,
+            approver_id=caller_context.principal_id if caller_context else None,
+        )
         if res is None:
             return {
                 "error": f"Pending crossing '{crossing_id}' not found, already resolved, or expired"
@@ -1640,6 +1667,8 @@ class AppServices:
         scopes: list[str] | tuple[str, ...],
         grant_id: str | None = None,
         ttl_seconds: float | None = None,
+        audience: str | None = None,
+        max_depth: int = 1,
         caller_context: CallerContext | None = None,
     ) -> dict[str, Any]:
         """Explicitly register an authorized delegation grant from delegator to delegatee."""
@@ -1676,6 +1705,8 @@ class AppServices:
             scopes=scopes,
             grant_id=grant_id,
             ttl_seconds=ttl_seconds,
+            audience=audience,
+            max_depth=max_depth,
         )
         return grant.to_dict()
 

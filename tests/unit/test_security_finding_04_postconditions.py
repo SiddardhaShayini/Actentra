@@ -62,7 +62,7 @@ def test_env(tmp_path: Path) -> tuple[Boundary, ReceiptStore, WorkspaceFileVerif
 
 
 def test_postcondition_exists_verified_records_success(
-    test_env: tuple[Boundary, ReceiptStore, WorkspaceFileVerifier, Path]
+    test_env: tuple[Boundary, ReceiptStore, WorkspaceFileVerifier, Path],
 ) -> None:
     """Exists claim succeeds when file was created; records success & externally_verified."""
     boundary, store, _, workspace = test_env
@@ -105,7 +105,7 @@ def test_postcondition_exists_verified_records_success(
 
 
 def test_postcondition_exists_refuted_records_failure_and_no_external_evidence(
-    test_env: tuple[Boundary, ReceiptStore, WorkspaceFileVerifier, Path]
+    test_env: tuple[Boundary, ReceiptStore, WorkspaceFileVerifier, Path],
 ) -> None:
     """T-04: Exists claim fails when file is absent; records failure, NOT success."""
     boundary, store, _, workspace = test_env
@@ -147,7 +147,7 @@ def test_postcondition_exists_refuted_records_failure_and_no_external_evidence(
 
 
 def test_postcondition_absent_claim_semantics(
-    test_env: tuple[Boundary, ReceiptStore, WorkspaceFileVerifier, Path]
+    test_env: tuple[Boundary, ReceiptStore, WorkspaceFileVerifier, Path],
 ) -> None:
     """T-04: Absent claim verified when file missing, refuted when file exists."""
     boundary, store, _, workspace = test_env
@@ -197,7 +197,7 @@ def test_postcondition_absent_claim_semantics(
 
 
 def test_postcondition_digest_match_claim_semantics(
-    test_env: tuple[Boundary, ReceiptStore, WorkspaceFileVerifier, Path]
+    test_env: tuple[Boundary, ReceiptStore, WorkspaceFileVerifier, Path],
 ) -> None:
     """T-04: Digest_match verified when hash matches, refuted when hash deviates."""
     boundary, store, _, workspace = test_env
@@ -243,7 +243,7 @@ def test_postcondition_digest_match_claim_semantics(
 
 
 def test_postcondition_verifier_error_records_unknown(
-    test_env: tuple[Boundary, ReceiptStore, WorkspaceFileVerifier, Path]
+    test_env: tuple[Boundary, ReceiptStore, WorkspaceFileVerifier, Path],
 ) -> None:
     """T-04: Verifier error (e.g. missing digest param) maps to unknown outcome."""
     boundary, store, _, workspace = test_env
@@ -387,7 +387,7 @@ def test_postcondition_unconfigured_verifier_records_unknown(
 
 
 def test_raise_on_postcondition_failure_strictly_enforces_contract(
-    test_env: tuple[Boundary, ReceiptStore, WorkspaceFileVerifier, Path]
+    test_env: tuple[Boundary, ReceiptStore, WorkspaceFileVerifier, Path],
 ) -> None:
     """When raise_on_postcondition_failure=True, refuted or error postconditions raise."""
     boundary, store, _, workspace = test_env

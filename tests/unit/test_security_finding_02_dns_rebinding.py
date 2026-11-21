@@ -145,6 +145,7 @@ def test_dns_rebinding_dual_resolution_attack_blocked_at_socket_connect() -> Non
 
 def test_dns_dual_resolution_multi_record_with_private_ip_immediately_blocked() -> None:
     """DNS dual-resolution with round-robin public and private IPs is blocked before connect."""
+
     def mock_getaddrinfo(host: str, port: Any, *args: Any, **kwargs: Any) -> list[Any]:
         if host == "dual-stack.attacker.com":
             # Attacker returns both public and private IP in DNS answer
@@ -219,6 +220,7 @@ def test_post_connect_peer_ip_mismatch_aborts() -> None:
 
 def test_redirect_dns_rebinding_to_metadata_service_blocked() -> None:
     """Redirect target resolving to AWS IMDS or private IP is blocked before request."""
+
     def mock_getaddrinfo(host: str, port: Any, *args: Any, **kwargs: Any) -> list[Any]:
         if host == "metadata.attacker.com":
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", port))]
@@ -265,15 +267,15 @@ def test_redirect_dns_rebinding_to_metadata_service_blocked() -> None:
         "172.16.0.1",
         "192.168.1.1",
         "169.254.169.254",  # AWS/GCP metadata
-        "100.64.0.1",       # Carrier-Grade NAT (RFC 6598)
-        "192.0.0.1",        # IETF Protocol Assignments
-        "198.18.0.1",       # Network Benchmark
-        "::1",              # IPv6 loopback
-        "fe80::1",          # IPv6 link-local
-        "::ffff:127.0.0.1", # IPv4-mapped IPv6 loopback
+        "100.64.0.1",  # Carrier-Grade NAT (RFC 6598)
+        "192.0.0.1",  # IETF Protocol Assignments
+        "198.18.0.1",  # Network Benchmark
+        "::1",  # IPv6 loopback
+        "fe80::1",  # IPv6 link-local
+        "::ffff:127.0.0.1",  # IPv4-mapped IPv6 loopback
         "::ffff:169.254.169.254",  # IPv4-mapped metadata
         "::ffff:10.0.0.1",  # IPv4-mapped private
-        "0.0.0.0",          # Unspecified
+        "0.0.0.0",  # Unspecified
         "255.255.255.255",  # Broadcast
     ],
 )
@@ -313,9 +315,7 @@ def test_https_sni_and_cert_validation_preserved_with_pinned_ip() -> None:
         conn.connect()
 
         # Connect connects directly to pinned IP
-        mock_create_conn.assert_called_once_with(
-            ("93.184.216.34", 443), conn.timeout, None
-        )
+        mock_create_conn.assert_called_once_with(("93.184.216.34", 443), conn.timeout, None)
         # wrap_socket MUST receive server_hostname="secure.example.com", NEVER the IP
         mock_ssl_context.wrap_socket.assert_called_once_with(
             mock_sock, server_hostname="secure.example.com"

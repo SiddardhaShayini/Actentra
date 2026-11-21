@@ -75,10 +75,16 @@ from actentra_core.handoffs import (
 )
 from actentra_core.identity import (
     CallerContext,
+    DelegationGrant,
+    DelegationRegistry,
     IdentitySecurityError,
     PrincipalType,
+    get_default_delegation_registry,
+    issue_signed_delegation_grant,
     make_local_caller_context,
+    reset_default_delegation_registry,
     resolve_http_caller_context,
+    verify_signed_delegation_grant,
 )
 from actentra_core.observations import (
     ObservationError,
@@ -152,8 +158,14 @@ __all__ = [
     "EvidenceTier",
     "ExpiredHandoffError",
     "CallerContext",
+    "DelegationGrant",
+    "DelegationRegistry",
     "IdentitySecurityError",
     "PrincipalType",
+    "get_default_delegation_registry",
+    "reset_default_delegation_registry",
+    "issue_signed_delegation_grant",
+    "verify_signed_delegation_grant",
     "GENESIS_HASH",
     "HandoffError",
     "IntentInfo",

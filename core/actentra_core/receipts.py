@@ -125,6 +125,7 @@ class PendingApprovalRecord:
     expires_at: float
     status: PendingApprovalStatus
     resolution_ts: str | None = None
+    approver_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -142,6 +143,7 @@ class PendingApprovalRecord:
             "expires_in_seconds": max(0.0, round(self.expires_at - time.time(), 1)),
             "status": self.status,
             "resolution_ts": self.resolution_ts,
+            "approver_id": self.approver_id,
         }
 
 
@@ -308,10 +310,13 @@ class ReceiptStore:
                     status TEXT NOT NULL CHECK (
                         status IN ('pending', 'approved', 'rejected', 'expired', 'consumed')
                     ),
-                    resolution_ts TEXT
+                    resolution_ts TEXT,
+                    approver_id TEXT
                 );
                 """
             )
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("ALTER TABLE pending_approvals ADD COLUMN approver_id TEXT;")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_approvals(status);"
             )
@@ -1208,7 +1213,7 @@ class ReceiptStore:
                 cur = conn.execute(
                     "SELECT crossing_id, session_id, canonical_hash, tool, verb, "
                     "resource, risk_tags_json, reason, params_json, ts, expires_at, "
-                    "status, resolution_ts FROM pending_approvals "
+                    "status, resolution_ts, approver_id FROM pending_approvals "
                     "WHERE status = ? ORDER BY expires_at ASC LIMIT ?;",
                     (status, limit),
                 )
@@ -1216,7 +1221,7 @@ class ReceiptStore:
                 cur = conn.execute(
                     "SELECT crossing_id, session_id, canonical_hash, tool, verb, "
                     "resource, risk_tags_json, reason, params_json, ts, expires_at, "
-                    "status, resolution_ts FROM pending_approvals "
+                    "status, resolution_ts, approver_id FROM pending_approvals "
                     "ORDER BY ts DESC LIMIT ?;",
                     (limit,),
                 )
@@ -1245,6 +1250,7 @@ class ReceiptStore:
                     expires_at=float(r[10]),
                     status=str(r[11]),  # type: ignore[arg-type]
                     resolution_ts=str(r[12]) if r[12] is not None else None,
+                    approver_id=str(r[13]) if len(r) > 13 and r[13] is not None else None,
                 )
             )
         return out
@@ -1257,7 +1263,7 @@ class ReceiptStore:
             cur = conn.execute(
                 "SELECT crossing_id, session_id, canonical_hash, tool, verb, "
                 "resource, risk_tags_json, reason, params_json, ts, expires_at, "
-                "status, resolution_ts FROM pending_approvals "
+                "status, resolution_ts, approver_id FROM pending_approvals "
                 "WHERE crossing_id = ?;",
                 (crossing_id,),
             )
@@ -1280,6 +1286,7 @@ class ReceiptStore:
                 expires_at=float(r[10]),
                 status=str(r[11]),  # type: ignore[arg-type]
                 resolution_ts=str(r[12]) if r[12] is not None else None,
+                approver_id=str(r[13]) if len(r) > 13 and r[13] is not None else None,
             )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to get pending approval: {exc}") from exc
@@ -1287,7 +1294,11 @@ class ReceiptStore:
             conn.close()
 
     def resolve_pending_approval(
-        self, crossing_id: str, *, approved: bool
+        self,
+        crossing_id: str,
+        *,
+        approved: bool,
+        approver_id: str | None = None,
     ) -> PendingApprovalRecord | None:
         """Resolve a pending approval to approved or rejected (single-use)."""
         self.cleanup_expired_approvals()
@@ -1297,9 +1308,9 @@ class ReceiptStore:
         try:
             conn.execute("BEGIN IMMEDIATE;")
             cur = conn.execute(
-                "UPDATE pending_approvals SET status = ?, resolution_ts = ? "
+                "UPDATE pending_approvals SET status = ?, resolution_ts = ?, approver_id = ? "
                 "WHERE crossing_id = ? AND status = 'pending';",
-                (new_status, now_iso, crossing_id),
+                (new_status, now_iso, approver_id, crossing_id),
             )
             if cur.rowcount == 0:
                 conn.execute("ROLLBACK;")
@@ -2568,9 +2579,7 @@ class ReceiptStore:
                 conn.execute("ROLLBACK;")
                 from actentra_core.warrants import WarrantError
 
-                raise WarrantError(
-                    f"Warrant '{warrant.warrant_id}' max uses ({limit}) exceeded"
-                )
+                raise WarrantError(f"Warrant '{warrant.warrant_id}' max uses ({limit}) exceeded")
 
             new_uses = current_uses + 1
             if row is None:

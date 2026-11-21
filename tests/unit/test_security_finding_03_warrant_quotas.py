@@ -555,4 +555,3 @@ def test_adversarial_expired_warrant_pruning_under_pressure() -> None:
     assert expired.warrant_id not in reg._uses
     assert w1.warrant_id in reg._uses
     assert w2.warrant_id in reg._uses
-

@@ -1202,6 +1202,10 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                     scopes=data["scopes"],
                     grant_id=data.get("grant_id"),
                     ttl_seconds=float(data["ttl_seconds"]) if "ttl_seconds" in data else None,
+                    audience=str(data["audience"]).strip()
+                    if "audience" in data and data["audience"]
+                    else None,
+                    max_depth=int(data["max_depth"]) if "max_depth" in data else 1,
                     caller_context=caller_ctx,
                 )
                 self._send_json(HTTPStatus.CREATED, grant)

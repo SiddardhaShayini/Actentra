@@ -1,21 +1,37 @@
-"""Explicit identity, trust boundaries, and authority model for Actentra (V5).
+"""Explicit identity, trust boundaries, and authority model for Actentra (Phase 1).
 
 Provides a strict separation between:
-- caller-supplied metadata (e.g. agent_id, session_id claimed by HTTP payload)
-- authenticated operator identity (verified credentials, tokens, or local in-process callers)
-- trust domains and delegated authority
+- claimed identity: untrusted caller-supplied metadata (e.g. agent_id in payload or headers)
+- authenticated identity: verified transport/credential principal (cryptographic signatures,
+  bearer tokens, or local process)
+- delegated identity: explicitly authorized, cryptographically and registry-bound authority
+  from a parent principal
+- effective execution principal: the verified, authorized identity under which the operation
+  actually runs
 """
 
 from __future__ import annotations
 
+import base64
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from actentra_core.canonicalize import canonicalize_unicode
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives.serialization import (
+    load_pem_private_key,
+    load_pem_public_key,
+)
+
+from actentra_core.canonicalize import canonicalize_json, canonicalize_unicode
 
 
 class PrincipalType(StrEnum):
@@ -70,7 +86,7 @@ class IdentitySecurityError(PermissionError):
 
 @dataclass(frozen=True, slots=True)
 class DelegationGrant:
-    """Explicitly authorized delegation of authority from a delegator to a delegatee."""
+    """Explicitly authorized, cryptographically verifiable delegation of authority."""
 
     grant_id: str
     delegator_id: str
@@ -80,16 +96,95 @@ class DelegationGrant:
     parent_grant_id: str | None = None
     revoked: bool = False
     expires_at: float | None = None
+    issued_at: float | None = None
+    issuer: str | None = None
+    version: int = 1
+    audience: str | None = None
+    depth: int = 0
+    max_depth: int = 1
+    nonce: str | None = None
+    signature: str | None = None
+    revoked_at: float | None = None
+    revoked_by: str | None = None
+    revocation_reason: str | None = None
 
-    def is_valid(self, at_time: float | None = None) -> bool:
-        """Check whether grant is active, not revoked, and not expired."""
+    def is_valid(
+        self,
+        at_time: float | None = None,
+        expected_audience: str | None = None,
+    ) -> bool:
+        """Check whether grant is active, not revoked, not expired, and matches audience/depth."""
         if self.revoked:
             return False
-        if self.expires_at is not None:
-            now = at_time if at_time is not None else time.time()
-            if now > self.expires_at:
+        now = at_time if at_time is not None else time.time()
+        if self.expires_at is not None and now > self.expires_at:
+            return False
+        if self.issued_at is not None and self.issued_at > (now + 60.0):
+            return False  # Clock skew protection against future-dated grants
+        if expected_audience is not None and self.audience is not None:
+            clean_expected = canonicalize_unicode(expected_audience).strip().lower()
+            clean_aud = canonicalize_unicode(self.audience).strip().lower()
+            if clean_aud != clean_expected:
                 return False
-        return True
+        return self.depth <= self.max_depth
+
+    def has_scope(self, scope: str) -> bool:
+        """Check whether grant permits the specified permission scope."""
+        if "*" in self.scopes:
+            return True
+        if scope in self.scopes:
+            return True
+        if ":" in scope:
+            prefix = scope.split(":", 1)[0]
+            if f"{prefix}:*" in self.scopes:
+                return True
+        return False
+
+    def is_agent_allowed(self, agent_id: str) -> bool:
+        """Validate if this grant permits asserting the specified agent_id."""
+        clean = canonicalize_unicode(agent_id).strip().lower()
+        if not clean:
+            return False
+        if "*" in self.allowed_agents:
+            return True
+        return clean in (a.lower() for a in self.allowed_agents)
+
+    def payload_bytes(self) -> bytes:
+        """Deterministic canonical bytes representation for Ed25519 signature verification."""
+        data = {
+            "grant_id": self.grant_id,
+            "delegator_id": self.delegator_id,
+            "delegatee_id": self.delegatee_id,
+            "allowed_agents": sorted(list(self.allowed_agents)),
+            "scopes": sorted(list(self.scopes)),
+            "parent_grant_id": self.parent_grant_id,
+            "expires_at": self.expires_at,
+            "issued_at": self.issued_at,
+            "issuer": self.issuer,
+            "version": self.version,
+            "audience": self.audience,
+            "depth": self.depth,
+            "max_depth": self.max_depth,
+            "nonce": self.nonce,
+        }
+        return canonicalize_json(data).encode("utf-8")
+
+    def verify_signature(self, pubkey_pem: bytes) -> tuple[bool, str]:
+        """Verify the cryptographic Ed25519 signature of this grant."""
+        if not self.signature:
+            return False, "Delegation grant is unsigned"
+        try:
+            loaded_pub = load_pem_public_key(pubkey_pem)
+        except Exception as exc:
+            return False, f"Failed to load Ed25519 public key: {exc}"
+        if not isinstance(loaded_pub, Ed25519PublicKey):
+            return False, "Public key must be Ed25519"
+        try:
+            sig_bytes = base64.b64decode(self.signature)
+            loaded_pub.verify(sig_bytes, self.payload_bytes())
+        except (InvalidSignature, ValueError) as exc:
+            return False, f"Cryptographic signature invalid: {exc}"
+        return True, "Signature valid"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -101,11 +196,58 @@ class DelegationGrant:
             "parent_grant_id": self.parent_grant_id,
             "revoked": self.revoked,
             "expires_at": self.expires_at,
+            "issued_at": self.issued_at,
+            "issuer": self.issuer,
+            "version": self.version,
+            "audience": self.audience,
+            "depth": self.depth,
+            "max_depth": self.max_depth,
+            "nonce": self.nonce,
+            "signature": self.signature,
+            "revoked_at": self.revoked_at,
+            "revoked_by": self.revoked_by,
+            "revocation_reason": self.revocation_reason,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DelegationGrant:
+        raw_allowed = data.get("allowed_agents", ())
+        allowed_tuple = (
+            tuple(str(a) for a in raw_allowed) if isinstance(raw_allowed, (list, tuple)) else ()
+        )
+        raw_scopes = data.get("scopes", ())
+        scopes_tuple = (
+            tuple(str(s) for s in raw_scopes) if isinstance(raw_scopes, (list, tuple)) else ()
+        )
+        return cls(
+            grant_id=str(data["grant_id"]),
+            delegator_id=str(data["delegator_id"]),
+            delegatee_id=str(data["delegatee_id"]),
+            allowed_agents=allowed_tuple,
+            scopes=scopes_tuple,
+            parent_grant_id=str(data["parent_grant_id"])
+            if data.get("parent_grant_id") is not None
+            else None,
+            revoked=bool(data.get("revoked", False)),
+            expires_at=float(data["expires_at"]) if data.get("expires_at") is not None else None,
+            issued_at=float(data["issued_at"]) if data.get("issued_at") is not None else None,
+            issuer=str(data["issuer"]) if data.get("issuer") is not None else None,
+            version=int(data.get("version", 1)),
+            audience=str(data["audience"]) if data.get("audience") is not None else None,
+            depth=int(data.get("depth", 0)),
+            max_depth=int(data.get("max_depth", 1)),
+            nonce=str(data["nonce"]) if data.get("nonce") is not None else None,
+            signature=str(data["signature"]) if data.get("signature") is not None else None,
+            revoked_at=float(data["revoked_at"]) if data.get("revoked_at") is not None else None,
+            revoked_by=str(data["revoked_by"]) if data.get("revoked_by") is not None else None,
+            revocation_reason=str(data["revocation_reason"])
+            if data.get("revocation_reason") is not None
+            else None,
+        )
 
 
 class DelegationRegistry:
-    """Thread-safe registry managing delegation grants and verification."""
+    """Thread-safe registry managing delegation grants, lifecycle, and strict principal binding."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -120,6 +262,11 @@ class DelegationRegistry:
         scopes: tuple[str, ...] | list[str],
         grant_id: str | None = None,
         ttl_seconds: float | None = None,
+        audience: str | None = None,
+        max_depth: int = 1,
+        nonce: str | None = None,
+        signature: str | None = None,
+        issuer: str | None = None,
     ) -> DelegationGrant:
         """Register a new delegation grant from an authenticated delegator."""
         if not delegator.authenticated:
@@ -151,9 +298,54 @@ class DelegationRegistry:
                     f"is not authorized for agent '{a}' and cannot delegate it"
                 )
 
-        gid = grant_id or f"grant-{uuid.uuid4().hex[:12]}"
         now = time.time()
         expires_at = (now + ttl_seconds) if ttl_seconds is not None and ttl_seconds > 0 else None
+
+        # Nested delegation tracking and depth limits
+        depth = 1
+        parent_grant_id = None
+        if delegator.delegation_grant_id is not None or delegator.delegated_by is not None:
+            # The delegator is acting under a delegation grant
+            parent_grant = (
+                self.get_grant(delegator.delegation_grant_id)
+                if delegator.delegation_grant_id
+                else self.find_active_grant(
+                    delegator_id=delegator.delegated_by or "",
+                    delegatee_id=delegator.principal_id,
+                )
+            )
+            if parent_grant is None or not parent_grant.is_valid(at_time=now):
+                raise IdentitySecurityError("Parent delegation grant is invalid or revoked")
+            if parent_grant.depth >= parent_grant.max_depth:
+                raise IdentitySecurityError(
+                    f"Delegation depth limit exceeded: depth {parent_grant.depth} "
+                    f"reaches or exceeds max_depth {parent_grant.max_depth}"
+                )
+            depth = parent_grant.depth + 1
+            max_depth = min(max_depth, parent_grant.max_depth)
+            parent_grant_id = parent_grant.grant_id
+            if parent_grant.expires_at is not None:
+                expires_at = (
+                    min(expires_at, parent_grant.expires_at)
+                    if expires_at is not None
+                    else parent_grant.expires_at
+                )
+            for s in scopes_tuple:
+                if not parent_grant.has_scope(s):
+                    raise IdentitySecurityError(
+                        f"Delegation scope violation: child '{clean_delegatee}' has scope '{s}' "
+                        f"which exceeds parent grant '{parent_grant.grant_id}'"
+                    )
+            for a in agents_tuple:
+                if not parent_grant.is_agent_allowed(a):
+                    raise IdentitySecurityError(
+                        f"Delegation agent violation: child '{clean_delegatee}' has "
+                        f"allowed agent '{a}' which exceeds parent grant '{parent_grant.grant_id}'"
+                    )
+
+        gid = grant_id or f"grant-{uuid.uuid4().hex[:12]}"
+        grant_nonce = nonce or uuid.uuid4().hex
+        grant_issuer = issuer or canonicalize_unicode(delegator.principal_id).strip()
 
         grant = DelegationGrant(
             grant_id=gid,
@@ -161,8 +353,17 @@ class DelegationRegistry:
             delegatee_id=clean_delegatee,
             allowed_agents=agents_tuple,
             scopes=scopes_tuple,
+            parent_grant_id=parent_grant_id,
             revoked=False,
             expires_at=expires_at,
+            issued_at=now,
+            issuer=grant_issuer,
+            version=1,
+            audience=canonicalize_unicode(audience).strip() if audience else None,
+            depth=depth,
+            max_depth=max_depth,
+            nonce=grant_nonce,
+            signature=signature,
         )
 
         with self._lock:
@@ -174,11 +375,135 @@ class DelegationRegistry:
         with self._lock:
             self._grants[grant.grant_id] = grant
 
-    def revoke_grant(self, grant_id: str, revoker: CallerContext) -> bool:
-        """Revoke an active delegation grant. Only delegator or trusted operator can revoke."""
+    def validate_grant_binding(
+        self,
+        grant: DelegationGrant | str,
+        *,
+        authenticated_delegatee_id: str,
+        authenticated_delegator_id: str | None = None,
+        required_scopes: tuple[str, ...] | list[str] | None = None,
+        required_agent: str | None = None,
+        audience: str | None = None,
+        at_time: float | None = None,
+    ) -> DelegationGrant:
+        """Validate that a grant strictly binds to the authenticated principals and is active.
+
+        Enforces:
+        - grant.delegator_id == authenticated_delegator.id (if specified)
+        - grant.delegatee_id == authenticated_delegatee.id
+        - Grant is unrevoked, unexpired, and within depth limits
+        - All parent grants in the delegation chain are valid and unrevoked
+        """
+        now = at_time if at_time is not None else time.time()
+        resolved_grant: DelegationGrant
+        with self._lock:
+            if isinstance(grant, str):
+                g = self._grants.get(grant)
+                if g is None:
+                    raise IdentitySecurityError(f"Delegation grant '{grant}' not found")
+                resolved_grant = g
+            else:
+                resolved_grant = grant
+
+        # 1. Check revocation
+        if resolved_grant.revoked:
+            raise IdentitySecurityError(
+                f"Delegation grant from '{resolved_grant.delegator_id}' to "
+                f"'{resolved_grant.delegatee_id}' is invalid or revoked"
+            )
+
+        # 2. Check expiration
+        if resolved_grant.expires_at is not None and now > resolved_grant.expires_at:
+            raise IdentitySecurityError(
+                f"Delegation grant from '{resolved_grant.delegator_id}' to "
+                f"'{resolved_grant.delegatee_id}' is invalid or revoked"
+            )
+
+        # 3. Check audience
+        if audience is not None and resolved_grant.audience is not None:
+            clean_expected = canonicalize_unicode(audience).strip().lower()
+            clean_aud = canonicalize_unicode(resolved_grant.audience).strip().lower()
+            if clean_aud != clean_expected:
+                raise IdentitySecurityError(
+                    f"Delegation grant '{resolved_grant.grant_id}' audience mismatch: "
+                    f"expected '{audience}', got '{resolved_grant.audience}'"
+                )
+
+        # 4. Check general validity (clock skew, depth)
+        if not resolved_grant.is_valid(at_time=now, expected_audience=audience):
+            raise IdentitySecurityError(
+                f"Delegation grant '{resolved_grant.grant_id}' is invalid or expired"
+            )
+
+        # 5. Strict delegatee binding: The authenticated caller MUST be the intended delegatee
+        clean_auth_del = canonicalize_unicode(authenticated_delegatee_id).strip().lower()
+        if resolved_grant.delegatee_id.lower() != clean_auth_del:
+            raise IdentitySecurityError(
+                f"Grant binding violation: grant '{resolved_grant.grant_id}' was issued to "
+                f"delegatee '{resolved_grant.delegatee_id}', "
+                f"but presented by '{authenticated_delegatee_id}'"
+            )
+
+        # 6. Strict delegator binding: If delegator is claimed, it MUST match the grant
+        if authenticated_delegator_id is not None:
+            clean_claimed_parent = canonicalize_unicode(authenticated_delegator_id).strip().lower()
+            if resolved_grant.delegator_id.lower() != clean_claimed_parent:
+                raise IdentitySecurityError(
+                    f"Grant binding violation: grant '{resolved_grant.grant_id}' was issued by "
+                    f"delegator '{resolved_grant.delegator_id}', but caller asserted "
+                    f"delegator '{authenticated_delegator_id}'"
+                )
+
+        # 6. Check required scopes if specified
+        if required_scopes:
+            for sc in required_scopes:
+                if not resolved_grant.has_scope(sc):
+                    raise IdentitySecurityError(
+                        f"Delegation scope violation: grant '{resolved_grant.grant_id}' "
+                        f"lacks scope '{sc}'"
+                    )
+
+        # 7. Check required agent if specified
+        if required_agent and not resolved_grant.is_agent_allowed(required_agent):
+            raise IdentitySecurityError(
+                f"Delegation agent violation: grant '{resolved_grant.grant_id}' "
+                f"does not allow agent '{required_agent}'"
+            )
+
+        # 8. Recursive parent chain validation for nested delegations
+        if resolved_grant.parent_grant_id:
+            with self._lock:
+                parent = self._grants.get(resolved_grant.parent_grant_id)
+            if parent is None or not parent.is_valid(at_time=now):
+                raise IdentitySecurityError(
+                    f"Delegation chain broken: parent grant '{resolved_grant.parent_grant_id}' "
+                    f"is invalid or revoked"
+                )
+            if parent.revoked:
+                raise IdentitySecurityError(
+                    f"Delegation chain broken: parent grant '{resolved_grant.parent_grant_id}' "
+                    f"has been revoked"
+                )
+            # Recursively validate parent grant binding up the chain
+            self.validate_grant_binding(
+                parent,
+                authenticated_delegatee_id=parent.delegatee_id,
+                at_time=now,
+            )
+
+        return resolved_grant
+
+    def revoke_grant(
+        self,
+        grant_id: str,
+        revoker: CallerContext,
+        reason: str = "manual_revocation",
+    ) -> bool:
+        """Revoke an active delegation grant and recursively cascade revocation down the chain."""
         if not revoker.authenticated:
             raise IdentitySecurityError("Unauthenticated caller cannot revoke delegation")
 
+        now = time.time()
         with self._lock:
             grant = self._grants.get(grant_id)
             if grant is None:
@@ -186,12 +511,28 @@ class DelegationRegistry:
 
             clean_revoker = canonicalize_unicode(revoker.principal_id).strip().lower()
             clean_delegator = canonicalize_unicode(grant.delegator_id).strip().lower()
-            if not revoker.is_trusted_operator and clean_revoker != clean_delegator:
+
+            # Check if revoker is delegator, trusted operator, or an upstream ancestor
+            is_authorized = revoker.is_trusted_operator or clean_revoker == clean_delegator
+            if not is_authorized:
+                # Walk up parent chain to check if revoker is an ancestor delegator
+                curr = grant
+                while curr.parent_grant_id:
+                    parent = self._grants.get(curr.parent_grant_id)
+                    if parent is None:
+                        break
+                    if parent.delegator_id.lower() == clean_revoker:
+                        is_authorized = True
+                        break
+                    curr = parent
+
+            if not is_authorized:
                 raise IdentitySecurityError(
                     f"Principal '{revoker.principal_id}' is not authorized to "
                     f"revoke grant '{grant_id}' issued by '{grant.delegator_id}'"
                 )
 
+            # Revoke target grant
             self._grants[grant_id] = DelegationGrant(
                 grant_id=grant.grant_id,
                 delegator_id=grant.delegator_id,
@@ -201,8 +542,55 @@ class DelegationRegistry:
                 parent_grant_id=grant.parent_grant_id,
                 revoked=True,
                 expires_at=grant.expires_at,
+                issued_at=grant.issued_at,
+                issuer=grant.issuer,
+                version=grant.version,
+                audience=grant.audience,
+                depth=grant.depth,
+                max_depth=grant.max_depth,
+                nonce=grant.nonce,
+                signature=grant.signature,
+                revoked_at=now,
+                revoked_by=revoker.principal_id,
+                revocation_reason=reason,
             )
+
+            # Cascading revocation: revoke all child grants recursively
+            self._cascade_revocation_under_lock(grant_id, revoker_id=revoker.principal_id, now=now)
             return True
+
+    def _cascade_revocation_under_lock(self, parent_id: str, revoker_id: str, now: float) -> None:
+        """Revoke all descendants of parent_id under existing lock."""
+        to_revoke: list[str] = [
+            gid
+            for gid, g in self._grants.items()
+            if g.parent_grant_id == parent_id and not g.revoked
+        ]
+        for child_id in to_revoke:
+            child = self._grants[child_id]
+            self._grants[child_id] = DelegationGrant(
+                grant_id=child.grant_id,
+                delegator_id=child.delegator_id,
+                delegatee_id=child.delegatee_id,
+                allowed_agents=child.allowed_agents,
+                scopes=child.scopes,
+                parent_grant_id=child.parent_grant_id,
+                revoked=True,
+                expires_at=child.expires_at,
+                issued_at=child.issued_at,
+                issuer=child.issuer,
+                version=child.version,
+                audience=child.audience,
+                depth=child.depth,
+                max_depth=child.max_depth,
+                nonce=child.nonce,
+                signature=child.signature,
+                revoked_at=now,
+                revoked_by=revoker_id,
+                revocation_reason=f"Cascading revocation from parent grant '{parent_id}'",
+            )
+            # Recurse down descendants
+            self._cascade_revocation_under_lock(child_id, revoker_id=revoker_id, now=now)
 
     def get_grant(self, grant_id: str) -> DelegationGrant | None:
         with self._lock:
@@ -214,24 +602,39 @@ class DelegationRegistry:
         delegator_id: str,
         delegatee_id: str,
         target_agent: str | None = None,
+        audience: str | None = None,
+        at_time: float | None = None,
     ) -> DelegationGrant | None:
+        """Find an active, valid grant matching delegator and delegatee."""
         clean_delegator = canonicalize_unicode(delegator_id).strip().lower()
         clean_delegatee = canonicalize_unicode(delegatee_id).strip().lower()
         clean_target = canonicalize_unicode(target_agent).strip().lower() if target_agent else None
-        now = time.time()
+        now = at_time if at_time is not None else time.time()
         with self._lock:
             for grant in self._grants.values():
-                target_allowed = not clean_target or clean_target in (
-                    a.lower() for a in grant.allowed_agents
-                )
-                if (
-                    grant.is_valid(now)
-                    and grant.delegator_id.lower() == clean_delegator
-                    and grant.delegatee_id.lower() == clean_delegatee
-                    and target_allowed
-                ):
-                    return grant
+                if not grant.is_valid(at_time=now, expected_audience=audience):
+                    continue
+                if grant.delegator_id.lower() != clean_delegator:
+                    continue
+                if grant.delegatee_id.lower() != clean_delegatee:
+                    continue
+                if clean_target and not grant.is_agent_allowed(clean_target):
+                    continue
+                return grant
         return None
+
+    def cleanup_expired_grants(self, at_time: float | None = None) -> int:
+        """Remove expired grants from the registry (retention cleanup)."""
+        now = at_time if at_time is not None else time.time()
+        with self._lock:
+            expired_ids = [
+                gid
+                for gid, g in self._grants.items()
+                if g.expires_at is not None and now > g.expires_at
+            ]
+            for gid in expired_ids:
+                del self._grants[gid]
+            return len(expired_ids)
 
     def clear(self) -> None:
         with self._lock:
@@ -249,9 +652,197 @@ def reset_default_delegation_registry() -> None:
     _DEFAULT_DELEGATION_REGISTRY.clear()
 
 
+def issue_signed_delegation_grant(
+    *,
+    delegator: CallerContext,
+    delegatee_id: str,
+    allowed_agents: tuple[str, ...] | list[str],
+    scopes: tuple[str, ...] | list[str],
+    privkey_pem: bytes,
+    ttl_seconds: float = 3600.0,
+    audience: str | None = None,
+    max_depth: int = 1,
+    parent_grant: DelegationGrant | None = None,
+    grant_id: str | None = None,
+) -> DelegationGrant:
+    """Issue and cryptographically sign an Ed25519 capability delegation grant."""
+    if not delegator.authenticated:
+        raise IdentitySecurityError("Unauthenticated caller cannot delegate authority")
+
+    clean_delegatee = canonicalize_unicode(delegatee_id).strip().lower()
+    if not clean_delegatee:
+        raise IdentitySecurityError("Delegatee identifier cannot be empty")
+    if clean_delegatee in _RESERVED_SYSTEM_IDENTIFIERS:
+        raise IdentitySecurityError(
+            f"Cannot delegate to reserved system identifier '{delegatee_id}'"
+        )
+
+    # Scopes attenuation check: Child cannot receive scopes delegator lacks
+    scopes_tuple = tuple(scopes)
+    for s in scopes_tuple:
+        if not delegator.has_scope(s):
+            raise IdentitySecurityError(
+                f"Delegation scope violation: delegator '{delegator.principal_id}' "
+                f"lacks scope '{s}' and cannot delegate it"
+            )
+
+    # Agent authority check: Child cannot represent agents delegator cannot represent
+    agents_tuple = tuple(allowed_agents)
+    for a in agents_tuple:
+        if not delegator.is_agent_allowed(a):
+            raise IdentitySecurityError(
+                f"Delegation agent violation: delegator '{delegator.principal_id}' "
+                f"is not authorized for agent '{a}' and cannot delegate it"
+            )
+
+    gid = grant_id or f"grant-{uuid.uuid4().hex[:12]}"
+    now = time.time()
+    expires_at = (now + ttl_seconds) if ttl_seconds > 0 else None
+
+    depth = 0
+    parent_gid = None
+    if parent_grant is not None:
+        if not parent_grant.is_valid(at_time=now):
+            raise IdentitySecurityError("Parent delegation grant is invalid or revoked")
+        if parent_grant.depth + 1 > parent_grant.max_depth:
+            raise IdentitySecurityError(
+                f"Delegation depth limit exceeded: "
+                f"{parent_grant.depth + 1} > {parent_grant.max_depth}"
+            )
+        depth = parent_grant.depth + 1
+        max_depth = min(max_depth, parent_grant.max_depth)
+        parent_gid = parent_grant.grant_id
+        if parent_grant.expires_at is not None:
+            expires_at = (
+                min(expires_at, parent_grant.expires_at)
+                if expires_at is not None
+                else parent_grant.expires_at
+            )
+        for s in scopes_tuple:
+            if not parent_grant.has_scope(s):
+                raise IdentitySecurityError(
+                    f"Delegation scope violation: scope '{s}' exceeds parent grant"
+                )
+        for a in agents_tuple:
+            if not parent_grant.is_agent_allowed(a):
+                raise IdentitySecurityError(
+                    f"Delegation agent violation: agent '{a}' exceeds parent grant"
+                )
+
+    unsigned = DelegationGrant(
+        grant_id=gid,
+        delegator_id=canonicalize_unicode(delegator.principal_id).strip(),
+        delegatee_id=clean_delegatee,
+        allowed_agents=agents_tuple,
+        scopes=scopes_tuple,
+        parent_grant_id=parent_gid,
+        revoked=False,
+        expires_at=expires_at,
+        issued_at=now,
+        issuer=canonicalize_unicode(delegator.principal_id).strip(),
+        version=1,
+        audience=canonicalize_unicode(audience).strip() if audience else None,
+        depth=depth,
+        max_depth=max_depth,
+        nonce=uuid.uuid4().hex,
+        signature=None,
+    )
+
+    try:
+        loaded_key = load_pem_private_key(privkey_pem, password=None)
+    except Exception as exc:
+        raise IdentitySecurityError(f"Failed to load Ed25519 private key: {exc}") from exc
+
+    if not isinstance(loaded_key, Ed25519PrivateKey):
+        raise IdentitySecurityError("Private key must be Ed25519")
+
+    sig_bytes = loaded_key.sign(unsigned.payload_bytes())
+    sig_b64 = base64.b64encode(sig_bytes).decode("ascii")
+
+    return DelegationGrant(
+        grant_id=unsigned.grant_id,
+        delegator_id=unsigned.delegator_id,
+        delegatee_id=unsigned.delegatee_id,
+        allowed_agents=unsigned.allowed_agents,
+        scopes=unsigned.scopes,
+        parent_grant_id=unsigned.parent_grant_id,
+        revoked=False,
+        expires_at=unsigned.expires_at,
+        issued_at=unsigned.issued_at,
+        issuer=unsigned.issuer,
+        version=unsigned.version,
+        audience=unsigned.audience,
+        depth=unsigned.depth,
+        max_depth=unsigned.max_depth,
+        nonce=unsigned.nonce,
+        signature=sig_b64,
+    )
+
+
+def verify_signed_delegation_grant(
+    grant: DelegationGrant,
+    pubkey_pem: bytes,
+    *,
+    expected_delegatee: str | None = None,
+    expected_delegator: str | None = None,
+    expected_audience: str | None = None,
+    at_time: float | None = None,
+) -> tuple[bool, str]:
+    """Verify cryptographic Ed25519 signature, expiration, and principal binding of a grant."""
+    if not grant.signature:
+        return False, "Delegation grant is unsigned"
+
+    try:
+        loaded_pub = load_pem_public_key(pubkey_pem)
+    except Exception as exc:
+        return False, f"Failed to load Ed25519 public key: {exc}"
+
+    if not isinstance(loaded_pub, Ed25519PublicKey):
+        return False, "Public key must be Ed25519"
+
+    try:
+        sig_bytes = base64.b64decode(grant.signature)
+        loaded_pub.verify(sig_bytes, grant.payload_bytes())
+    except (InvalidSignature, ValueError) as exc:
+        return False, f"Cryptographic signature invalid: {exc}"
+
+    if grant.revoked:
+        return False, f"Delegation grant '{grant.grant_id}' has been revoked"
+
+    now = at_time if at_time is not None else time.time()
+    if grant.expires_at is not None and now > grant.expires_at:
+        return False, f"Delegation grant '{grant.grant_id}' has expired"
+
+    if expected_delegatee is not None:
+        clean_exp_del = canonicalize_unicode(expected_delegatee).strip().lower()
+        if grant.delegatee_id.lower() != clean_exp_del:
+            return (
+                False,
+                f"Delegatee mismatch: expected '{expected_delegatee}', got '{grant.delegatee_id}'",
+            )
+
+    if expected_delegator is not None:
+        clean_exp_par = canonicalize_unicode(expected_delegator).strip().lower()
+        if grant.delegator_id.lower() != clean_exp_par:
+            return (
+                False,
+                f"Delegator mismatch: expected '{expected_delegator}', got '{grant.delegator_id}'",
+            )
+
+    if expected_audience is not None and grant.audience is not None:
+        clean_exp_aud = canonicalize_unicode(expected_audience).strip().lower()
+        if grant.audience.lower() != clean_exp_aud:
+            return (
+                False,
+                f"Audience mismatch: expected '{expected_audience}', got '{grant.audience}'",
+            )
+
+    return True, "Delegation grant valid"
+
+
 @dataclass(frozen=True, slots=True)
 class CallerContext:
-    """Authenticated caller context establishing trust boundaries."""
+    """Authenticated caller context establishing immutable trust boundaries."""
 
     principal_type: PrincipalType
     principal_id: str
@@ -261,6 +852,27 @@ class CallerContext:
     allowed_agents: tuple[str, ...] = ()
     delegated_by: str | None = None
     delegation_grant_id: str | None = None
+    claimed_identity: str | None = None
+    authenticated_principal_id: str | None = None
+    delegation_grant: DelegationGrant | None = None
+    audience: str | None = None
+
+    @property
+    def authenticated_identity(self) -> str:
+        """The immutable authenticated transport principal identity."""
+        return self.authenticated_principal_id or self.principal_id
+
+    @property
+    def delegated_principal_id(self) -> str | None:
+        """The verified delegating principal ID, if executing under delegation."""
+        return self.delegated_by
+
+    @property
+    def effective_principal_id(self) -> str:
+        """The canonical verified execution principal under whose authority the action runs."""
+        if self.claimed_identity and self.is_agent_allowed(self.claimed_identity):
+            return self.claimed_identity
+        return self.principal_id
 
     @property
     def is_trusted_operator(self) -> bool:
@@ -361,12 +973,20 @@ class CallerContext:
             )
 
     def bound_agent_id(self, requested_agent: str | None = None) -> str:
-        """Bind or resolve effective agent identifier."""
+        """Bind or resolve effective agent identifier, failing closed if unauthorized."""
         if requested_agent and requested_agent.strip():
-            return requested_agent.strip()
+            clean = canonicalize_unicode(requested_agent).strip()
+            if not self.is_agent_allowed(clean):
+                raise IdentitySecurityError(
+                    f"Principal '{self.principal_id}' is not authorized to "
+                    f"bind agent '{requested_agent}'"
+                )
+            return clean
         if self.principal_type == PrincipalType.AUTHENTICATED_AGENT:
             return self.principal_id
-        return requested_agent or self.principal_id or "default-agent"
+        if len(self.allowed_agents) == 1 and self.allowed_agents[0] != "*":
+            return self.allowed_agents[0]
+        return self.principal_id or "default-agent"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -378,6 +998,10 @@ class CallerContext:
             "allowed_agents": list(self.allowed_agents),
             "delegated_by": self.delegated_by,
             "delegation_grant_id": self.delegation_grant_id,
+            "claimed_identity": self.claimed_identity,
+            "authenticated_principal_id": self.authenticated_principal_id,
+            "effective_principal_id": self.effective_principal_id,
+            "audience": self.audience,
         }
 
 
@@ -390,12 +1014,13 @@ def make_local_caller_context(principal_id: str = "local_operator") -> CallerCon
         trust_domain="local_boundary",
         scopes=("*",),
         allowed_agents=("*",),
+        authenticated_principal_id=principal_id,
     )
 
 
 def _find_parent_in_principals(
     parent_id: str,
-    token_principals: dict[str, Any],
+    token_principals: Mapping[str, Any],
 ) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
     """Find scopes and allowed_agents of a parent principal in token_principals mapping."""
     clean_parent = canonicalize_unicode(parent_id).strip().lower()
@@ -424,7 +1049,7 @@ def resolve_http_caller_context(
     headers: dict[str, str],
     expected_token: str | None = None,
     remote_addr: str = "127.0.0.1",
-    token_principals: dict[str, CallerContext | dict[str, Any] | str] | None = None,
+    token_principals: Mapping[str, Any] | None = None,
     delegation_registry: DelegationRegistry | None = None,
 ) -> CallerContext:
     """Resolve caller context from HTTP headers, strictly verifying credentials and delegation."""
@@ -433,6 +1058,7 @@ def resolve_http_caller_context(
     header_delegated_by = headers.get("x-actentra-delegated-by", "").strip() or None
     header_parent = headers.get("x-actentra-parent", "").strip() or None
     header_grant_id = headers.get("x-actentra-delegation-grant", "").strip() or None
+    header_audience = headers.get("x-actentra-audience", "").strip() or None
 
     claimed_delegation = header_delegated_by or header_parent
     reg = delegation_registry or get_default_delegation_registry()
@@ -463,6 +1089,7 @@ def resolve_http_caller_context(
                         scopes=DEFAULT_AGENT_SCOPES,
                         allowed_agents=(mapped,),
                         delegated_by=None,
+                        authenticated_principal_id=mapped,
                     )
                 elif isinstance(mapped, dict):
                     p_type = PrincipalType(
@@ -511,6 +1138,8 @@ def resolve_http_caller_context(
                                 delegatee_id=p_id,
                                 allowed_agents=allowed_tuple,
                                 scopes=scopes_tuple,
+                                issuer="system_config",
+                                version=1,
                             )
                         )
 
@@ -522,6 +1151,7 @@ def resolve_http_caller_context(
                         scopes=scopes_tuple,
                         allowed_agents=allowed_tuple,
                         delegated_by=cfg_delegated_by,
+                        authenticated_principal_id=p_id,
                     )
                 else:
                     raise IdentitySecurityError(
@@ -529,34 +1159,55 @@ def resolve_http_caller_context(
                     )
 
                 # Validate caller-supplied delegation headers against authenticated context
-                if claimed_delegation:
+                if claimed_delegation or header_grant_id:
                     if ctx.delegated_by:
-                        if ctx.delegated_by.lower() != claimed_delegation.lower():
+                        if (
+                            claimed_delegation
+                            and ctx.delegated_by.lower() != claimed_delegation.lower()
+                        ):
                             raise IdentitySecurityError(
                                 f"Conflicting delegation: header asserts '{claimed_delegation}' "
                                 f"but principal is configured with delegator '{ctx.delegated_by}'"
                             )
+                        if header_grant_id:
+                            grant = reg.validate_grant_binding(
+                                header_grant_id,
+                                authenticated_delegatee_id=ctx.authenticated_identity,
+                                authenticated_delegator_id=ctx.delegated_by,
+                                audience=header_audience,
+                            )
                     else:
-                        # Caller is asserting delegation via header: MUST be verified in registry
-                        grant = (
-                            reg.get_grant(header_grant_id)
-                            if header_grant_id
-                            else reg.find_active_grant(
-                                delegator_id=claimed_delegation,
-                                delegatee_id=ctx.principal_id,
+                        # Dynamic delegation: strictly validate grant binding
+                        if header_grant_id:
+                            grant = reg.validate_grant_binding(
+                                header_grant_id,
+                                authenticated_delegatee_id=ctx.authenticated_identity,
+                                authenticated_delegator_id=claimed_delegation,
+                                audience=header_audience,
                             )
+                        else:
+                            active_grant = reg.find_active_grant(
+                                delegator_id=claimed_delegation or "",
+                                delegatee_id=ctx.authenticated_identity,
+                                audience=header_audience,
+                            )
+                            if active_grant is None:
+                                raise IdentitySecurityError(
+                                    f"Unauthorized caller-supplied delegation: "
+                                    f"'{ctx.authenticated_identity}' is not an authorized "
+                                    f"delegate of '{claimed_delegation}'"
+                                )
+                            grant = reg.validate_grant_binding(
+                                active_grant,
+                                authenticated_delegatee_id=ctx.authenticated_identity,
+                                authenticated_delegator_id=claimed_delegation,
+                                audience=header_audience,
+                            )
+
+                        # Scope attenuation: cannot receive more authority than granted
+                        effective_grant_scopes = tuple(
+                            dict.fromkeys(s for s in ctx.scopes if grant.has_scope(s))
                         )
-                        if grant is not None and not grant.is_valid():
-                            raise IdentitySecurityError(
-                                f"Delegation grant from '{claimed_delegation}' to "
-                                f"'{ctx.principal_id}' is invalid or revoked"
-                            )
-                        if grant is None:
-                            raise IdentitySecurityError(
-                                f"Unauthorized caller-supplied delegation: '{ctx.principal_id}' "
-                                f"is not an authorized delegate of '{claimed_delegation}'"
-                            )
-                        # Add granted agents and record delegation
                         new_allowed = tuple(
                             dict.fromkeys((*ctx.allowed_agents, *grant.allowed_agents))
                         )
@@ -565,10 +1216,14 @@ def resolve_http_caller_context(
                             principal_id=ctx.principal_id,
                             authenticated=True,
                             trust_domain=ctx.trust_domain,
-                            scopes=ctx.scopes,
+                            scopes=effective_grant_scopes,
                             allowed_agents=new_allowed,
-                            delegated_by=claimed_delegation,
+                            delegated_by=grant.delegator_id,
                             delegation_grant_id=grant.grant_id,
+                            claimed_identity=client_identity or None,
+                            authenticated_principal_id=ctx.authenticated_identity,
+                            delegation_grant=grant,
+                            audience=header_audience,
                         )
 
                 if client_identity and not ctx.is_agent_allowed(client_identity):
@@ -587,6 +1242,8 @@ def resolve_http_caller_context(
                     trust_domain="gateway_operator",
                     scopes=DEFAULT_OPERATOR_SCOPES,
                     allowed_agents=("*",),
+                    claimed_identity=client_identity or None,
+                    authenticated_principal_id=client_identity or f"token-operator@{remote_addr}",
                 )
 
             # When server authentication is configured, any other token fails closed
@@ -619,32 +1276,46 @@ def resolve_http_caller_context(
                         f"Cannot claim reserved system identity '{agent_name}'"
                     )
 
-                # Caller-supplied delegation check: must be verified in registry
+                # Caller-supplied delegation check: must be verified in registry with strict binding
                 allowed_tuple = (agent_name,)
                 active_delegator: str | None = None
                 dev_grant_id: str | None = None
-                if claimed_delegation:
-                    grant = (
-                        reg.get_grant(header_grant_id)
-                        if header_grant_id
-                        else reg.find_active_grant(
-                            delegator_id=claimed_delegation,
+                matched_grant: DelegationGrant | None = None
+                dev_scopes = DEFAULT_AGENT_SCOPES
+
+                if claimed_delegation or header_grant_id:
+                    if header_grant_id:
+                        grant = reg.validate_grant_binding(
+                            header_grant_id,
+                            authenticated_delegatee_id=agent_name,
+                            authenticated_delegator_id=claimed_delegation,
+                            audience=header_audience,
+                        )
+                    else:
+                        active_grant = reg.find_active_grant(
+                            delegator_id=claimed_delegation or "",
                             delegatee_id=agent_name,
+                            audience=header_audience,
                         )
-                    )
-                    if grant is not None and not grant.is_valid():
-                        raise IdentitySecurityError(
-                            f"Delegation grant from '{claimed_delegation}' to '{agent_name}' "
-                            "is invalid or revoked"
+                        if active_grant is None:
+                            raise IdentitySecurityError(
+                                f"Unauthorized caller-supplied delegation: '{agent_name}' "
+                                f"is not an authorized delegate of '{claimed_delegation}'"
+                            )
+                        grant = reg.validate_grant_binding(
+                            active_grant,
+                            authenticated_delegatee_id=agent_name,
+                            authenticated_delegator_id=claimed_delegation,
+                            audience=header_audience,
                         )
-                    if grant is None:
-                        raise IdentitySecurityError(
-                            f"Unauthorized caller-supplied delegation: '{agent_name}' "
-                            f"is not an authorized delegate of '{claimed_delegation}'"
-                        )
+
                     allowed_tuple = tuple(dict.fromkeys((agent_name, *grant.allowed_agents)))
-                    active_delegator = claimed_delegation
+                    dev_scopes = tuple(
+                        dict.fromkeys(s for s in DEFAULT_AGENT_SCOPES if grant.has_scope(s))
+                    )
+                    active_delegator = grant.delegator_id
                     dev_grant_id = grant.grant_id
+                    matched_grant = grant
 
                 ctx = CallerContext(
                     principal_type=(
@@ -655,10 +1326,14 @@ def resolve_http_caller_context(
                     principal_id=agent_name,
                     authenticated=True,
                     trust_domain="gateway_agent",
-                    scopes=DEFAULT_AGENT_SCOPES,
+                    scopes=dev_scopes,
                     allowed_agents=allowed_tuple,
                     delegated_by=active_delegator,
                     delegation_grant_id=dev_grant_id,
+                    claimed_identity=client_identity or None,
+                    authenticated_principal_id=agent_name,
+                    delegation_grant=matched_grant,
+                    audience=header_audience,
                 )
                 if client_identity and not ctx.is_agent_allowed(client_identity):
                     raise IdentitySecurityError(
@@ -675,7 +1350,7 @@ def resolve_http_caller_context(
         raise IdentitySecurityError("Invalid or unrecognized authentication token")
 
     # 2. No Bearer token provided
-    if claimed_delegation:
+    if claimed_delegation or header_grant_id:
         raise IdentitySecurityError("Unauthenticated caller cannot assert delegated authority")
 
     # In loopback mode without expected_token, classify as loopback caller
@@ -692,6 +1367,8 @@ def resolve_http_caller_context(
             trust_domain="local_loopback",
             scopes=loop_scopes,
             allowed_agents=(),
+            claimed_identity=client_identity or None,
+            authenticated_principal_id=None,
         )
 
     return CallerContext(
@@ -701,4 +1378,6 @@ def resolve_http_caller_context(
         trust_domain="untrusted_network",
         scopes=(),
         allowed_agents=(),
+        claimed_identity=client_identity or None,
+        authenticated_principal_id=None,
     )

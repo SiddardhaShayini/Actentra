@@ -28,6 +28,7 @@ from actentra_core.envelope import (
     compute_action_hash,
 )
 from actentra_core.evidence import EvidenceTier, build_evidence_record
+from actentra_core.identity import CallerContext
 from actentra_core.observations import ObservationRecord, build_observation
 from actentra_core.policy import PolicyEngine, PolicyPack, load_policy_file
 from actentra_core.receipts import ReceiptError, ReceiptStore
@@ -121,6 +122,7 @@ class Boundary:
         warrant_public_key: bytes | None = None,
         warrant_registry: WarrantRegistry | None = None,
         verifier: Any | None = None,
+        caller_context: CallerContext | None = None,
     ) -> None:
         self._engine = PolicyEngine(policy)
         self._store = receipt_store
@@ -133,6 +135,7 @@ class Boundary:
         self._approval_ttl = approval_ttl_seconds
         self._secrets_broker = secrets_broker
         self._warrant_public_key = warrant_public_key
+        self._caller_context = caller_context
         if warrant_registry is not None:
             self._warrant_registry = warrant_registry
             if self._warrant_registry.receipt_store is None:
@@ -157,6 +160,7 @@ class Boundary:
         warrant_public_key: bytes | None = None,
         warrant_registry: WarrantRegistry | None = None,
         verifier: Any | None = None,
+        caller_context: CallerContext | None = None,
     ) -> Boundary:
         policy = load_policy_file(policy_path)
         store = ReceiptStore(receipts_db)
@@ -170,6 +174,7 @@ class Boundary:
             warrant_public_key=warrant_public_key,
             warrant_registry=warrant_registry,
             verifier=verifier,
+            caller_context=caller_context,
         )
 
     @property
@@ -436,16 +441,64 @@ class Boundary:
         postcondition_claim: str = "exists",
         postcondition_expected_digest: str | None = None,
         raise_on_postcondition_failure: bool = False,
+        caller_context: CallerContext | None = None,
     ) -> Any:
         """Evaluate an action, record a durable decision, enforce verdict, and record outcome."""
+        ctx = caller_context or self._caller_context
+        if ctx is not None and ctx.authenticated:
+            if not ctx.is_agent_allowed(self._agent_id):
+                deny_decision = Decision(
+                    verdict=Verdict.DENY,
+                    rule_id="identity:unauthorized-principal",
+                    reason=(
+                        f"Principal '{ctx.principal_id}' is not authorized to "
+                        f"execute as agent '{self._agent_id}'"
+                    ),
+                    policy_version=self._engine.policy.policy_version,
+                    canonical_hash="sha256:" + ("0" * 64),
+                )
+                raise ActionBlockedError(deny_decision, "UNAUTHORIZED_PRINCIPAL")
+            if not ctx.has_scope("crossings:execute"):
+                deny_decision = Decision(
+                    verdict=Verdict.DENY,
+                    rule_id="identity:scope-denied",
+                    reason=f"Principal '{ctx.principal_id}' lacks scope 'crossings:execute'",
+                    policy_version=self._engine.policy.policy_version,
+                    canonical_hash="sha256:" + ("0" * 64),
+                )
+                raise ActionBlockedError(deny_decision, "SCOPE_DENIED")
+
         warrant_obj = self._check_warrant(
             warrant,
             tool=tool,
             resource=resource,
             effective_agent=self._agent_id,
         )
+        if ctx is not None and warrant_obj is not None:
+            clean_holder = warrant_obj.holder.strip().lower()
+            auth_id = ctx.authenticated_identity.lower()
+            del_id = ctx.delegated_by.lower() if ctx.delegated_by else None
+            if clean_holder != auth_id and clean_holder != del_id and not ctx.is_trusted_operator:
+                deny_decision = Decision(
+                    verdict=Verdict.DENY,
+                    rule_id="warrant:holder-mismatch",
+                    reason=(
+                        f"Warrant holder '{warrant_obj.holder}' mismatch with authenticated "
+                        f"principal '{ctx.principal_id}'"
+                    ),
+                    policy_version=self._engine.policy.policy_version,
+                    canonical_hash="sha256:" + ("0" * 64),
+                )
+                raise ActionBlockedError(deny_decision, "WARRANT_HOLDER_MISMATCH")
 
         prov_items = list(provenance)
+        if ctx is not None:
+            prov_items.append(
+                ProvenanceItem(
+                    source=f"principal:{ctx.authenticated_identity}",
+                    trust="trusted" if ctx.is_trusted_operator else "untrusted",
+                )
+            )
         if warrant_obj is not None:
             prov_items.append(
                 ProvenanceItem(source=f"warrant:{warrant_obj.warrant_id}", trust="trusted")
@@ -646,8 +699,7 @@ class Boundary:
                 status="unknown",
                 result_hash=result_hash,
                 error=(
-                    "Postcondition verification requested but no verifier is "
-                    "configured on Boundary"
+                    "Postcondition verification requested but no verifier is configured on Boundary"
                 ),
                 reason="postcondition_unverified",
                 evidence_status="unknown",
