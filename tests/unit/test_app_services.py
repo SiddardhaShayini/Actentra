@@ -383,16 +383,15 @@ def test_loopback_binding_and_token_auth(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Refusing to bind Actentra Gateway"):
         create_gateway_server(boundary, host="0.0.0.0", port=0, unsafe_allow_remote=False)
 
-    # Binding with explicit unsafe_allow_remote is permitted
-    srv = create_gateway_server(
-        boundary,
-        host="0.0.0.0",
-        port=0,
-        auth_token="secret-token-123",
-        unsafe_allow_remote=True,
-    )
-    assert srv.auth_token == "secret-token-123"
-    srv.server_close()
+    # Binding with explicit unsafe_allow_remote without TLS is rejected (ACT-02)
+    with pytest.raises(ValueError, match="without TLS"):
+        create_gateway_server(
+            boundary,
+            host="0.0.0.0",
+            port=0,
+            auth_token="secret-token-123",
+            unsafe_allow_remote=True,
+        )
 
 
 def test_export_audit_bundle(tmp_path: Path) -> None:

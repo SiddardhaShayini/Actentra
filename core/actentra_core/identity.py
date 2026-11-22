@@ -13,6 +13,7 @@ Provides a strict separation between:
 from __future__ import annotations
 
 import base64
+import hmac
 import threading
 import time
 import uuid
@@ -1077,9 +1078,23 @@ def resolve_http_caller_context(
 
         # When server authentication is configured, token MUST match server config
         if has_server_auth:
-            # Check configured token_principals mapping
-            if token_principals and token in token_principals:
-                mapped = token_principals[token]
+            # Check configured token_principals mapping using constant-time matching
+            matched_entry = None
+            if token_principals:
+                for cand_tok, entry in token_principals.items():
+                    if hmac.compare_digest(token, str(cand_tok)):
+                        matched_entry = entry
+                        break
+
+            if matched_entry is not None:
+                mapped = matched_entry
+                if isinstance(mapped, dict):
+                    if mapped.get("revoked"):
+                        raise IdentitySecurityError("Bearer token has been revoked")
+                    exp = mapped.get("expires_at")
+                    if exp is not None and time.time() > float(exp):
+                        raise IdentitySecurityError("Bearer token has expired")
+
                 if isinstance(mapped, CallerContext):
                     ctx = mapped
                 elif isinstance(mapped, str):
@@ -1110,7 +1125,9 @@ def resolve_http_caller_context(
 
                     # If delegation is configured in token_principals, validate parent attenuation
                     if cfg_delegated_by:
-                        parent_info = _find_parent_in_principals(cfg_delegated_by, token_principals)
+                        parent_info = _find_parent_in_principals(
+                            cfg_delegated_by, token_principals or {}
+                        )
                         if parent_info is not None:
                             parent_scopes, parent_allowed = parent_info
                             if "*" not in parent_scopes:
@@ -1156,9 +1173,7 @@ def resolve_http_caller_context(
                         authenticated_principal_id=p_id,
                     )
                 else:
-                    raise IdentitySecurityError(
-                        f"Invalid token principal mapping for token '{token}'"
-                    )
+                    raise IdentitySecurityError("Invalid token principal mapping configuration")
 
                 # Validate caller-supplied delegation headers against authenticated context
                 if claimed_delegation or header_grant_id:
@@ -1235,8 +1250,8 @@ def resolve_http_caller_context(
                     )
                 return ctx
 
-            # Check configured shared expected_token
-            if expected_token and token == expected_token:
+            # Check configured shared expected_token using constant-time comparison
+            if expected_token and hmac.compare_digest(token, expected_token):
                 return CallerContext(
                     principal_type=PrincipalType.AUTHENTICATED_OPERATOR,
                     principal_id=client_identity or f"token-operator@{remote_addr}",

@@ -94,6 +94,7 @@
 * **Invariant I9:** Sessions are server-controlled entities cryptographically bound to authenticated principals, trust domains, policy versions, and expiration timestamps. Cross-principal session access or session ID substitution is strictly rejected. Taint is durably bound to principal identity and cannot be reset or bypassed by arbitrary session recreation.
 * **Invariant I10:** Cumulative action, external call, and write byte limits are enforced across dual tiers (per-session and cumulative principal-wide). Counters are transactionally persisted in SQLite and survive process crashes, restarts, and concurrent executions.
 * **Invariant I11:** Every gateway HTTP route (GET, POST, DELETE) and internal service method requires explicit scope-based authorization or trusted operator credentials. Read endpoints querying sensitive resources enforce object-level authorization and redact sensitive execution parameters for non-owners.
+* **Invariant I12:** Remote gateway communication requires authenticated TLS transport (TLS 1.2+ with forward-secret ciphers). Binding to non-loopback network interfaces without TLS fails closed at startup; plaintext remote HTTP serving is strictly prohibited. Host header validation prevents DNS rebinding attacks, proxy forwarded headers are only trusted from explicitly authorized proxies, request bodies are bounded to 2 MiB (HTTP 413), and replay protection rejects duplicate nonces and excessive timestamp skew.
 
 ---
 

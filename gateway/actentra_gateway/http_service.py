@@ -6,14 +6,23 @@ execution continuation, canary diff simulations, and an embedded offline Web Con
 
 from __future__ import annotations
 
+import contextlib
+import hmac
 import json
 import os
+import ssl
+import threading
 import time
+from datetime import UTC, datetime
+from enum import StrEnum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
+
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
 
 from actentra.boundary import Boundary
 from actentra_core.causal import CycleDetectedError
@@ -33,6 +42,81 @@ from actentra_gateway.services import AppServices, ExecutorRegistry
 
 _MAX_BODY_BYTES = 2 * 1024 * 1024  # 2 MiB bound on HTTP request body
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
+
+
+class DeploymentMode(StrEnum):
+    LOCAL = "local"
+    PRIVATE_NETWORK = "private_network"
+    REMOTE = "remote"
+
+
+def validate_certificate(cert_path: Path) -> x509.Certificate:
+    """Validate that certificate exists, can be parsed, and is not expired/not yet valid."""
+    if not cert_path.exists():
+        raise FileNotFoundError(f"TLS certificate file not found: {cert_path}")
+    raw_data = cert_path.read_bytes()
+    try:
+        cert = x509.load_pem_x509_certificate(raw_data, default_backend())
+    except Exception as exc:
+        raise ValueError(f"Invalid TLS certificate in {cert_path}: {exc}") from exc
+
+    now = datetime.now(UTC)
+    if now < cert.not_valid_before_utc:
+        raise ValueError(
+            f"TLS certificate in {cert_path} is not yet valid "
+            f"(valid from {cert.not_valid_before_utc.isoformat()})"
+        )
+    if now > cert.not_valid_after_utc:
+        raise ValueError(
+            f"TLS certificate in {cert_path} has expired on "
+            f"{cert.not_valid_after_utc.isoformat()}"
+        )
+    return cert
+
+
+def create_tls_context(
+    *,
+    certfile: str | Path,
+    keyfile: str | Path,
+    key_password: str | None = None,
+    ca_certs: str | Path | None = None,
+    require_client_cert: bool = False,
+) -> ssl.SSLContext:
+    """Create a hardened TLS context enforcing TLS 1.2+ and secure cipher suites."""
+    cert_p = Path(certfile)
+    key_p = Path(keyfile)
+    if not key_p.exists():
+        raise FileNotFoundError(f"TLS private key file not found: {key_p}")
+    # Validate certificate validity dates and format
+    validate_certificate(cert_p)
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    # Minimum TLS 1.2 enforces modern cryptographic transport
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.options |= ssl.OP_NO_COMPRESSION
+    ctx.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20")
+
+    try:
+        ctx.load_cert_chain(certfile=str(cert_p), keyfile=str(key_p), password=key_password)
+    except Exception as exc:
+        raise ValueError(f"Failed to load TLS certificate or private key: {exc}") from exc
+
+    if ca_certs:
+        ca_p = Path(ca_certs)
+        if not ca_p.exists():
+            raise FileNotFoundError(f"CA certificate file not found: {ca_p}")
+        validate_certificate(ca_p)
+        ctx.load_verify_locations(cafile=str(ca_p))
+        if require_client_cert:
+            ctx.verify_mode = ssl.CERT_REQUIRED
+        else:
+            ctx.verify_mode = ssl.CERT_OPTIONAL
+    elif require_client_cert:
+        raise ValueError(
+            "require_client_cert=True requires ca_certs to be configured "
+            "for client certificate verification"
+        )
+    return ctx
 
 
 class PendingCrossing:
@@ -170,6 +254,25 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
 
     server: ActentraHTTPServer
 
+    def setup(self) -> None:
+        super().setup()
+        timeout = getattr(self.server, "request_timeout", 30.0)
+        if hasattr(self, "connection") and self.connection and timeout:
+            with contextlib.suppress(Exception):
+                self.connection.settimeout(timeout)
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except (
+            TimeoutError,
+            ssl.SSLError,
+            ssl.SSLEOFError,
+            ConnectionResetError,
+            BrokenPipeError,
+        ):
+            self.close_connection = True
+
     def log_message(self, format: str, *args: Any) -> None:
         # Suppress default noisy access logs to keep terminal output clean
         pass
@@ -229,16 +332,33 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         )
         return False, caller_ctx
 
+    def _get_effective_client_ip(self) -> str:
+        client_addr = getattr(self, "client_address", None)
+        remote_ip = (
+            client_addr[0] if isinstance(client_addr, tuple) and client_addr else "127.0.0.1"
+        )
+        server_obj = getattr(self, "server", None)
+        raw_proxies: Any = getattr(server_obj, "trusted_proxies", frozenset())
+        trusted_proxies = (
+            raw_proxies
+            if isinstance(raw_proxies, (set, frozenset, tuple, list))
+            else frozenset()
+        )
+        if remote_ip in trusted_proxies and hasattr(self, "headers") and self.headers:
+            xff = self.headers.get("X-Forwarded-For")
+            if xff:
+                hops = [ip.strip() for ip in xff.split(",") if ip.strip()]
+                if hops:
+                    return hops[-1]
+        return remote_ip
+
     def _get_caller_context(self) -> CallerContext:
         headers_dict = (
             {k.lower(): v for k, v in self.headers.items()}
             if hasattr(self, "headers") and self.headers
             else {}
         )
-        client_addr = getattr(self, "client_address", None)
-        remote_ip = (
-            client_addr[0] if isinstance(client_addr, tuple) and client_addr else "127.0.0.1"
-        )
+        remote_ip = self._get_effective_client_ip()
         server_obj = getattr(self, "server", None)
         raw_token = getattr(server_obj, "auth_token", None)
         expected_token = raw_token if isinstance(raw_token, str) else None
@@ -264,6 +384,216 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             delegation_registry=delegation_reg,
         )
 
+    def _validate_host_header(self) -> bool:
+        """Validate Host header against allowed hosts and defend against DNS rebinding."""
+        protocol = getattr(self, "request_version", "HTTP/1.1")
+        host_hdr = self.headers.get("Host") if hasattr(self, "headers") and self.headers else None
+        server_obj = getattr(self, "server", None)
+        raw_allowed = getattr(server_obj, "allowed_hosts", ())
+        allowed = raw_allowed if isinstance(raw_allowed, (tuple, list, set, frozenset)) else ()
+        raw_mode = getattr(server_obj, "deployment_mode", DeploymentMode.LOCAL)
+        deployment_mode = (
+            raw_mode if isinstance(raw_mode, (DeploymentMode, str)) else DeploymentMode.LOCAL
+        )
+
+        if protocol == "HTTP/1.1" and not host_hdr and (
+            deployment_mode != DeploymentMode.LOCAL or allowed
+        ):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": "Missing Host header in HTTP/1.1 request",
+                    "code": "missing_host_header",
+                },
+            )
+            return False
+
+        if host_hdr:
+            clean_host = host_hdr.strip().split(":")[0].strip().lower()
+
+            if allowed:
+                allowed_normalized = [h.strip().lower() for h in allowed]
+                if clean_host not in allowed_normalized and clean_host not in _LOOPBACK_HOSTS:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": f"Invalid Host header: host {clean_host!r} is not allowed",
+                            "code": "invalid_host_header",
+                        },
+                    )
+                    return False
+            elif deployment_mode == DeploymentMode.LOCAL and (
+                clean_host not in _LOOPBACK_HOSTS and clean_host not in ("testserver", "localhost")
+            ):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": (
+                            f"Invalid Host header: host {clean_host!r} "
+                            "is not permitted in local mode"
+                        ),
+                        "code": "invalid_host_header",
+                    },
+                )
+                return False
+        return True
+
+    def _validate_smuggling_headers(self) -> bool:
+        """Check for conflicting or malformed Content-Length and Transfer-Encoding headers."""
+        if not hasattr(self, "headers") or not self.headers:
+            return True
+        cl = self.headers.get("Content-Length")
+        te = self.headers.get("Transfer-Encoding")
+
+        if cl is not None and te is not None:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": "Conflicting Content-Length and Transfer-Encoding headers (RFC 7230)",
+                    "code": "invalid_transfer_encoding",
+                },
+            )
+            return False
+
+        if hasattr(self.headers, "get_all"):
+            all_cls = self.headers.get_all("Content-Length")
+            if all_cls and len(set(c.strip() for c in all_cls)) > 1:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": "Duplicate conflicting Content-Length headers",
+                        "code": "invalid_content_length",
+                    },
+                )
+                return False
+
+        if te is not None and te.strip().lower() not in ("chunked", "identity"):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": f"Unsupported or invalid Transfer-Encoding: {te!r}",
+                    "code": "invalid_transfer_encoding",
+                },
+            )
+            return False
+
+        return True
+
+    def _validate_client_cert(self) -> bool:
+        """Verify peer certificate when mutual TLS (mTLS) is enforced."""
+        server_obj = getattr(self, "server", None)
+        raw_req = getattr(server_obj, "require_client_cert", False)
+        require_client_cert = bool(raw_req) if isinstance(raw_req, bool) else False
+        if require_client_cert:
+            conn = getattr(self, "connection", None)
+            if not isinstance(conn, ssl.SSLSocket):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "error": "Client certificate required: connection is not TLS",
+                        "code": "mtls_certificate_required",
+                    },
+                )
+                return False
+            peer_cert = conn.getpeercert()
+            if not peer_cert:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "error": "Mutual TLS client certificate required and none was provided",
+                        "code": "mtls_certificate_required",
+                    },
+                )
+                return False
+        return True
+
+    def _validate_request(self) -> bool:
+        """Run all network-layer validations (Host, smuggling, mTLS, max size)."""
+        if not self._validate_host_header():
+            return False
+        if not self._validate_smuggling_headers():
+            return False
+        if not self._validate_client_cert():
+            return False
+        cl_hdr = (
+            self.headers.get("Content-Length")
+            if hasattr(self, "headers") and self.headers
+            else None
+        )
+        if cl_hdr:
+            try:
+                if int(cl_hdr) > _MAX_BODY_BYTES:
+                    self._send_json(
+                        HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                        {
+                            "error": f"Request body exceeds {_MAX_BODY_BYTES} bytes limit",
+                            "code": "payload_too_large",
+                        },
+                    )
+                    return False
+            except ValueError:
+                pass
+        return True
+
+    def _validate_nonce_and_timestamp(self) -> bool:
+        """Validate request timestamp skew and sliding-window replay protection nonce."""
+        ts_hdr = (
+            self.headers.get("X-Actentra-Timestamp")
+            if hasattr(self, "headers") and self.headers
+            else None
+        )
+        if ts_hdr:
+            try:
+                req_ts = float(ts_hdr)
+            except ValueError:
+                try:
+                    dt = datetime.fromisoformat(ts_hdr.strip())
+                    req_ts = dt.timestamp()
+                except Exception:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": "Invalid X-Actentra-Timestamp header format",
+                            "code": "invalid_timestamp",
+                        },
+                    )
+                    return False
+            now = time.time()
+            if abs(now - req_ts) > 300.0:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": (
+                            f"Request timestamp out of bounds "
+                            f"(skew {abs(now - req_ts):.1f}s > 300s)"
+                        ),
+                        "code": "timestamp_skew",
+                    },
+                )
+                return False
+
+        nonce_hdr = (
+            self.headers.get("X-Actentra-Nonce")
+            if hasattr(self, "headers") and self.headers
+            else None
+        )
+        if nonce_hdr:
+            server_obj = getattr(self, "server", None)
+            if server_obj and hasattr(server_obj, "check_and_record_nonce"):
+                chk_fn = server_obj.check_and_record_nonce
+                if callable(chk_fn):
+                    chk_res = chk_fn(nonce_hdr.strip())
+                    if isinstance(chk_res, bool) and chk_res is False:
+                        self._send_json(
+                            HTTPStatus.CONFLICT,
+                            {
+                                "error": "Request replay detected: nonce has already been used",
+                                "code": "replay_detected",
+                            },
+                        )
+                        return False
+        return True
+
     def _check_auth(self) -> bool:
         server_obj = getattr(self, "server", None)
         raw_token = getattr(server_obj, "auth_token", None)
@@ -280,28 +610,72 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         if not auth_hdr.startswith("Bearer "):
             self._send_json(
                 HTTPStatus.UNAUTHORIZED,
-                {"error": "Unauthorized: missing or invalid Bearer token"},
+                {"error": "Unauthorized: missing or invalid Bearer token", "code": "unauthorized"},
             )
             return False
         token = auth_hdr[len("Bearer ") :].strip()
         if not token:
             self._send_json(
                 HTTPStatus.UNAUTHORIZED,
-                {"error": "Unauthorized: missing or invalid Bearer token"},
+                {"error": "Unauthorized: missing or invalid Bearer token", "code": "unauthorized"},
             )
             return False
-        if server_token and token == server_token:
+
+        if server_obj and hasattr(server_obj, "is_token_revoked"):
+            rev_fn = server_obj.is_token_revoked
+            if callable(rev_fn):
+                rev_res = rev_fn(token)
+                if isinstance(rev_res, bool) and rev_res is True:
+                    self._send_json(
+                        HTTPStatus.UNAUTHORIZED,
+                        {
+                            "error": "Unauthorized: Bearer token has been revoked",
+                            "code": "token_revoked",
+                        },
+                    )
+                    return False
+
+        if server_token and hmac.compare_digest(token, server_token):
             return True
-        if token_principals and token in token_principals:
-            return True
+
+        if token_principals:
+            for cand_token, pdata in token_principals.items():
+                if hmac.compare_digest(token, str(cand_token)):
+                    if isinstance(pdata, dict):
+                        if pdata.get("revoked", False):
+                            self._send_json(
+                                HTTPStatus.UNAUTHORIZED,
+                                {
+                                    "error": "Unauthorized: Bearer token has been revoked",
+                                    "code": "token_revoked",
+                                },
+                            )
+                            return False
+                        exp = pdata.get("expires_at")
+                        if exp is not None:
+                            try:
+                                exp_ts = float(exp)
+                                if time.time() > exp_ts:
+                                    self._send_json(
+                                        HTTPStatus.UNAUTHORIZED,
+                                        {
+                                            "error": "Unauthorized: Bearer token has expired",
+                                            "code": "token_expired",
+                                        },
+                                    )
+                                    return False
+                            except (ValueError, TypeError):
+                                pass
+                    return True
+
         self._send_json(
             HTTPStatus.UNAUTHORIZED,
-            {"error": "Unauthorized: missing or invalid Bearer token"},
+            {"error": "Unauthorized: missing or invalid Bearer token", "code": "unauthorized"},
         )
         return False
 
     def _allowed_origin(self) -> str | None:
-        origin = self.headers.get("Origin")
+        origin = self.headers.get("Origin") if hasattr(self, "headers") and self.headers else None
         if not origin:
             return None
         clean = origin.strip().lower()
@@ -309,8 +683,19 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             clean.startswith("http://127.0.0.1:")
             or clean.startswith("http://localhost:")
             or clean in ("http://127.0.0.1", "http://localhost")
+            or clean.startswith("https://127.0.0.1:")
+            or clean.startswith("https://localhost:")
+            or clean in ("https://127.0.0.1", "https://localhost")
         ):
             return origin
+
+        server_obj = getattr(self, "server", None)
+        allowed = getattr(server_obj, "allowed_hosts", ())
+        if allowed:
+            for host in allowed:
+                h_clean = host.strip().lower()
+                if clean == f"https://{h_clean}" or clean.startswith(f"https://{h_clean}:"):
+                    return origin
         return None
 
     def _send_json(self, status: int, payload: dict[str, Any] | list[Any]) -> None:
@@ -322,10 +707,11 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         if allowed_origin:
             self.send_header("Access-Control-Allow-Origin", allowed_origin)
             self.send_header("Vary", "Origin")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
         self.send_header(
             "Access-Control-Allow-Headers",
-            "Content-Type, Authorization, X-Actentra-Client",
+            "Content-Type, Authorization, X-Actentra-Client, "
+            "X-Actentra-Timestamp, X-Actentra-Nonce",
         )
         self.end_headers()
         self.wfile.write(body)
@@ -348,6 +734,18 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
     def _send_forbidden(self, error: str, code: str = "unauthorized_principal") -> None:
         self._send_json(HTTPStatus.FORBIDDEN, {"error": error, "code": code})
 
+    def _handle_body_error(self, exc: Exception) -> None:
+        if "exceeds" in str(exc):
+            self._send_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                {"error": str(exc), "code": "payload_too_large"},
+            )
+        else:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": f"Invalid body: {exc}", "code": "invalid_body"},
+            )
+
     def _read_json_body(self) -> dict[str, Any]:
         content_len_header = self.headers.get("Content-Length")
         if not content_len_header:
@@ -367,19 +765,24 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         return parsed
 
     def do_OPTIONS(self) -> None:
+        if not self._validate_request():
+            return
         self.send_response(HTTPStatus.NO_CONTENT)
         allowed_origin = self._allowed_origin()
         if allowed_origin:
             self.send_header("Access-Control-Allow-Origin", allowed_origin)
             self.send_header("Vary", "Origin")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
         self.send_header(
             "Access-Control-Allow-Headers",
-            "Content-Type, Authorization, X-Actentra-Client",
+            "Content-Type, Authorization, X-Actentra-Client, "
+            "X-Actentra-Timestamp, X-Actentra-Nonce",
         )
         self.end_headers()
 
     def do_GET(self) -> None:
+        if not self._validate_request():
+            return
         if not self._check_auth():
             return
 
@@ -692,6 +1095,10 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Route '{path}' not found"})
 
     def do_POST(self) -> None:
+        if not self._validate_request():
+            return
+        if not self._validate_nonce_and_timestamp():
+            return
         if not self._check_auth():
             return
 
@@ -1490,6 +1897,10 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Route '{path}' not found"})
 
     def do_DELETE(self) -> None:
+        if not self._validate_request():
+            return
+        if not self._validate_nonce_and_timestamp():
+            return
         if not self._check_auth():
             return
 
@@ -1575,7 +1986,7 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
 
 
 class ActentraHTTPServer(ThreadingHTTPServer):
-    """Threading HTTPServer for Actentra gateway with persistence and scoped executors."""
+    """Threading HTTPServer for Actentra gateway with persistence, TLS, and scoped executors."""
 
     def __init__(
         self,
@@ -1587,15 +1998,33 @@ class ActentraHTTPServer(ThreadingHTTPServer):
         auth_token: str | None = None,
         token_principals: dict[str, Any] | None = None,
         unsafe_allow_remote: bool = False,
+        deployment_mode: DeploymentMode | str = DeploymentMode.LOCAL,
+        ssl_context: ssl.SSLContext | None = None,
+        certfile: str | Path | None = None,
+        keyfile: str | Path | None = None,
+        key_password: str | None = None,
+        ca_certs: str | Path | None = None,
+        require_client_cert: bool = False,
+        allowed_hosts: tuple[str, ...] | list[str] | None = None,
+        trusted_proxies: tuple[str, ...] | list[str] | None = None,
+        request_timeout: float = 30.0,
     ) -> None:
         host = server_address[0]
-        effective_token = auth_token or os.environ.get("ACTENTRA_GATEWAY_TOKEN")
-        is_remote_allowed = unsafe_allow_remote or bool(
-            os.environ.get("ACTENTRA_UNSAFE_ALLOW_REMOTE")
+        mode = (
+            DeploymentMode(deployment_mode)
+            if isinstance(deployment_mode, str)
+            else deployment_mode
         )
+        effective_token = auth_token or os.environ.get("ACTENTRA_GATEWAY_TOKEN")
+        is_remote_allowed = (
+            unsafe_allow_remote
+            or bool(os.environ.get("ACTENTRA_UNSAFE_ALLOW_REMOTE"))
+            or mode != DeploymentMode.LOCAL
+        )
+        is_remote_mode = mode in (DeploymentMode.REMOTE, DeploymentMode.PRIVATE_NETWORK)
 
-        if host not in _LOOPBACK_HOSTS:
-            if not is_remote_allowed:
+        if host not in _LOOPBACK_HOSTS or is_remote_mode:
+            if not is_remote_allowed and not is_remote_mode:
                 raise ValueError(
                     f"Refusing to bind Actentra Gateway to non-loopback address {host!r} "
                     "without explicit remote authorization (--unsafe-allow-remote)"
@@ -1607,17 +2036,93 @@ class ActentraHTTPServer(ThreadingHTTPServer):
                     "token authentication."
                 )
 
+            # Enforce TLS on non-loopback or remote deployment modes (ACT-02)
+            if ssl_context is None:
+                if certfile and keyfile:
+                    ssl_context = create_tls_context(
+                        certfile=certfile,
+                        keyfile=keyfile,
+                        key_password=key_password,
+                        ca_certs=ca_certs,
+                        require_client_cert=require_client_cert,
+                    )
+                else:
+                    addr_desc = (
+                        f"non-loopback address {host!r}"
+                        if host not in _LOOPBACK_HOSTS
+                        else f"deployment mode '{mode}'"
+                    )
+                    raise ValueError(
+                        f"Refusing to bind Actentra Gateway to {addr_desc} "
+                        "without TLS. Remote communication must use authenticated TLS transport. "
+                        "Plaintext remote HTTP is prohibited."
+                    )
+        elif ssl_context is None and certfile and keyfile:
+            ssl_context = create_tls_context(
+                certfile=certfile,
+                keyfile=keyfile,
+                key_password=key_password,
+                ca_certs=ca_certs,
+                require_client_cert=require_client_cert,
+            )
+
         super().__init__(server_address, ActentraHTTPHandler)
+        self.deployment_mode = mode
         self.boundary = boundary
         self.approval_ttl_seconds = approval_ttl_seconds
         self.auth_token = effective_token
         self.token_principals = token_principals
+        self.require_client_cert = require_client_cert
+        self.allowed_hosts = tuple(allowed_hosts) if allowed_hosts else ()
+        self.trusted_proxies = frozenset(trusted_proxies) if trusted_proxies else frozenset()
+        self.request_timeout = request_timeout
+
+        self._revoked_tokens: set[str] = set()
+        self._token_lock = threading.Lock()
+        self._seen_nonces: dict[str, float] = {}
+        self._nonce_lock = threading.Lock()
+
+        self.ssl_context: ssl.SSLContext | None = ssl_context
+        self.is_tls: bool = ssl_context is not None
+        if ssl_context is not None:
+            self.socket = ssl_context.wrap_socket(self.socket, server_side=True)
+
         self.services = AppServices(
             boundary,
             executor_registry=executor_registry,
             approval_ttl_seconds=approval_ttl_seconds,
         )
         self.delegation_registry = self.services.delegation_registry
+
+    def revoke_token(self, token: str) -> None:
+        """Revoke a bearer token dynamically."""
+        with self._token_lock:
+            self._revoked_tokens.add(token)
+
+    def rotate_token(self, old_token: str, new_token: str) -> None:
+        """Rotate server authentication token, revoking the previous one."""
+        with self._token_lock:
+            self._revoked_tokens.add(old_token)
+            self.auth_token = new_token
+
+    def is_token_revoked(self, token: str) -> bool:
+        """Check whether a token has been revoked."""
+        with self._token_lock:
+            return token in self._revoked_tokens
+
+    def check_and_record_nonce(self, nonce: str, max_age_seconds: float = 300.0) -> bool:
+        """Check if nonce has been seen. If fresh, record and return True. If seen, return False."""
+        now = time.time()
+        with self._nonce_lock:
+            cutoff = now - max_age_seconds
+            expired = [n for n, ts in self._seen_nonces.items() if ts < cutoff]
+            for n in expired:
+                del self._seen_nonces[n]
+
+            if nonce in self._seen_nonces:
+                return False
+            self._seen_nonces[nonce] = now
+            return True
 
     def add_pending(self, envelope: Any, decision: Any) -> None:
         """Add pending approval to persistent SQLite store."""
@@ -1685,6 +2190,16 @@ def create_gateway_server(
     auth_token: str | None = None,
     token_principals: dict[str, Any] | None = None,
     unsafe_allow_remote: bool = False,
+    deployment_mode: DeploymentMode | str = DeploymentMode.LOCAL,
+    ssl_context: ssl.SSLContext | None = None,
+    certfile: str | Path | None = None,
+    keyfile: str | Path | None = None,
+    key_password: str | None = None,
+    ca_certs: str | Path | None = None,
+    require_client_cert: bool = False,
+    allowed_hosts: tuple[str, ...] | list[str] | None = None,
+    trusted_proxies: tuple[str, ...] | list[str] | None = None,
+    request_timeout: float = 30.0,
 ) -> ActentraHTTPServer:
     """Create a configured ActentraHTTPServer ready to serve."""
     return ActentraHTTPServer(
@@ -1695,6 +2210,16 @@ def create_gateway_server(
         auth_token=auth_token,
         token_principals=token_principals,
         unsafe_allow_remote=unsafe_allow_remote,
+        deployment_mode=deployment_mode,
+        ssl_context=ssl_context,
+        certfile=certfile,
+        keyfile=keyfile,
+        key_password=key_password,
+        ca_certs=ca_certs,
+        require_client_cert=require_client_cert,
+        allowed_hosts=allowed_hosts,
+        trusted_proxies=trusted_proxies,
+        request_timeout=request_timeout,
     )
 
 
@@ -1708,6 +2233,16 @@ def serve_http(
     auth_token: str | None = None,
     token_principals: dict[str, Any] | None = None,
     unsafe_allow_remote: bool = False,
+    deployment_mode: DeploymentMode | str = DeploymentMode.LOCAL,
+    ssl_context: ssl.SSLContext | None = None,
+    certfile: str | Path | None = None,
+    keyfile: str | Path | None = None,
+    key_password: str | None = None,
+    ca_certs: str | Path | None = None,
+    require_client_cert: bool = False,
+    allowed_hosts: tuple[str, ...] | list[str] | None = None,
+    trusted_proxies: tuple[str, ...] | list[str] | None = None,
+    request_timeout: float = 30.0,
 ) -> None:
     """Run the Actentra HTTP Gateway service synchronously."""
     server = create_gateway_server(
@@ -1719,8 +2254,19 @@ def serve_http(
         auth_token=auth_token,
         token_principals=token_principals,
         unsafe_allow_remote=unsafe_allow_remote,
+        deployment_mode=deployment_mode,
+        ssl_context=ssl_context,
+        certfile=certfile,
+        keyfile=keyfile,
+        key_password=key_password,
+        ca_certs=ca_certs,
+        require_client_cert=require_client_cert,
+        allowed_hosts=allowed_hosts,
+        trusted_proxies=trusted_proxies,
+        request_timeout=request_timeout,
     )
-    print(f"Actentra Gateway serving on http://{host}:{port} (Console: http://{host}:{port}/ui)")
+    scheme = "https" if server.is_tls else "http"
+    print(f"Actentra Gateway serving on {scheme}://{host}:{port} (Console: {scheme}://{host}:{port}/ui)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

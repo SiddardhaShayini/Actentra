@@ -769,6 +769,27 @@ def serve_cmd(
         Path | None,
         typer.Option("--workspace", "-w", help="Mount local filesystem executor at path."),
     ] = None,
+    cert: Annotated[
+        Path | None, typer.Option("--cert", help="Path to TLS certificate PEM file.")
+    ] = None,
+    key: Annotated[
+        Path | None, typer.Option("--key", help="Path to TLS private key PEM file.")
+    ] = None,
+    ca_certs: Annotated[
+        Path | None,
+        typer.Option("--ca-certs", help="Path to CA certificate PEM file for mutual TLS."),
+    ] = None,
+    require_client_cert: Annotated[
+        bool, typer.Option("--require-client-cert", help="Require mTLS client certificate.")
+    ] = False,
+    mode: Annotated[
+        str,
+        typer.Option("--mode", help="Deployment mode: local, private_network, remote."),
+    ] = "local",
+    allowed_hosts: Annotated[
+        str | None,
+        typer.Option("--allowed-hosts", help="Comma-separated allowed Host header names."),
+    ] = None,
 ) -> None:
     """Run the Actentra HTTP Gateway service and Operator Console."""
     try:
@@ -789,15 +810,31 @@ def serve_cmd(
     if workspace is not None:
         registry.register_fs(workspace)
 
-    serve_http(
-        boundary=boundary,
-        host=host,
-        port=port,
-        executor_registry=registry,
-        approval_ttl_seconds=ttl,
-        auth_token=auth_token,
-        unsafe_allow_remote=unsafe_allow_remote,
+    allowed_hosts_list = (
+        [h.strip() for h in allowed_hosts.split(",") if h.strip()]
+        if allowed_hosts
+        else None
     )
+
+    try:
+        serve_http(
+            boundary=boundary,
+            host=host,
+            port=port,
+            executor_registry=registry,
+            approval_ttl_seconds=ttl,
+            auth_token=auth_token,
+            unsafe_allow_remote=unsafe_allow_remote,
+            deployment_mode=mode,
+            certfile=cert,
+            keyfile=key,
+            ca_certs=ca_certs,
+            require_client_cert=require_client_cert,
+            allowed_hosts=allowed_hosts_list,
+        )
+    except Exception as exc:
+        typer.echo(f"GATEWAY STARTUP ERROR: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 @approvals_app.command("list")
