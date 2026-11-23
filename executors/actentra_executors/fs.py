@@ -7,7 +7,12 @@ and honors ``ALLOW_WITH_CONSTRAINTS`` limits.
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import os
+import stat
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +24,32 @@ from actentra_core.verdict import Decision
 _DEFAULT_MAX_READ_BYTES = 1_048_576  # 1 MiB
 _DEFAULT_MAX_WRITE_BYTES = 1_048_576  # 1 MiB
 _DEFAULT_MAX_LIST_ENTRIES = 500
+
+
+def _get_fd_real_path(fd: int) -> str | None:
+    """Retrieve the canonical real path of an open file descriptor across platforms."""
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle = msvcrt.get_osfhandle(fd)
+            buf = ctypes.create_unicode_buffer(32768)
+            # Flag 0x0 specifies FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+            res = ctypes.windll.kernel32.GetFinalPathNameByHandleW(handle, buf, len(buf), 0)
+            if res == 0:
+                return None
+            path_str = buf.value
+            if path_str.startswith("\\\\?\\UNC\\"):
+                return "\\\\" + path_str[8:]
+            if path_str.startswith("\\\\?\\"):
+                return path_str[4:]
+            return path_str
+        proc_fd = f"/proc/self/fd/{fd}"
+        if os.path.exists(proc_fd):
+            return os.path.realpath(proc_fd)
+    except (OSError, AttributeError, RuntimeError):
+        return None
+    return None
 
 
 class ExecutorError(RuntimeError):
@@ -45,6 +76,17 @@ class LocalFSExecutor:
     def workspace_root(self) -> str:
         return self._workspace_root
 
+    def _verify_containment(self, path: Path | str) -> None:
+        """Verify that a path or directory strictly resides within workspace_root."""
+        try:
+            canonicalize_windows_path(
+                str(path),
+                base_dir=self._workspace_root,
+                resolve_fs=True,
+            )
+        except CanonicalizationError as exc:
+            raise ExecutorError(f"Filesystem path escapes workspace boundary: {exc}") from exc
+
     def _resolve_target(self, envelope: ActionEnvelope) -> Path:
         resource = envelope.action.resource
         if not resource.startswith("path:"):
@@ -60,20 +102,12 @@ class LocalFSExecutor:
             raise ExecutorError(f"Filesystem path blocked at execution boundary: {exc}") from exc
 
         target = Path(canon.replace("/", "\\"))
-        # Also verify the immediate parent does not escape workspace via symlink/junction.
-        if target != self._root_path:
-            parent = target.parent
-            if parent.exists():
-                try:
-                    canonicalize_windows_path(
-                        str(parent),
-                        base_dir=self._workspace_root,
-                        resolve_fs=True,
-                    )
-                except CanonicalizationError as exc:
-                    raise ExecutorError(
-                        f"Parent directory escapes workspace boundary: {exc}"
-                    ) from exc
+        # Verify containment of all existing ancestor directories down to target.
+        curr = target if target.exists() else target.parent
+        while curr != self._root_path and curr.parent != curr:
+            if curr.exists():
+                self._verify_containment(curr)
+            curr = curr.parent
         return target
 
     def _check_constraints(
@@ -108,6 +142,9 @@ class LocalFSExecutor:
                 raise ExecutorError("Directory does not exist")
             if not target.is_dir():
                 raise ExecutorError("Target path is not a directory")
+
+            self._verify_containment(os.path.realpath(str(target)))
+
             max_entries = int(constraints.get("max_entries", _DEFAULT_MAX_LIST_ENTRIES))
             entries: list[dict[str, str]] = []
             for entry in sorted(target.iterdir(), key=lambda p: p.name.lower()):
@@ -122,24 +159,50 @@ class LocalFSExecutor:
             if not target.exists():
                 raise ExecutorError("File does not exist")
             if target.is_symlink():
-                # Re-verify symlink target strictly inside workspace_root.
-                try:
-                    canonicalize_windows_path(
-                        os.path.realpath(target),
-                        base_dir=self._workspace_root,
-                        resolve_fs=True,
-                    )
-                except CanonicalizationError as exc:
-                    raise ExecutorError(f"Symlink target escapes workspace: {exc}") from exc
-            if not target.is_file():
+                self._verify_containment(os.path.realpath(str(target)))
+            if target.is_dir():
                 raise ExecutorError("Target path is not a regular file")
+
             max_bytes = int(constraints.get("max_read_bytes", self._default_max_read_bytes))
-            size = target.stat().st_size
-            if size > max_bytes:
-                raise ExecutorError(
-                    f"File size ({size} bytes) exceeds max_read_bytes ({max_bytes})"
-                )
-            return target.read_text(encoding="utf-8")
+
+            # Open file descriptor for safe, post-open verified read
+            try:
+                flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+                fd = os.open(str(target), flags)
+            except FileNotFoundError as exc:
+                raise ExecutorError("File does not exist") from exc
+            except (PermissionError, IsADirectoryError) as exc:
+                if target.is_dir():
+                    raise ExecutorError("Target path is not a regular file") from exc
+                raise ExecutorError(f"Cannot open file: {exc}") from exc
+
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise ExecutorError("Target path is not a regular file")
+                if st.st_size > max_bytes:
+                    raise ExecutorError(
+                        f"File size ({st.st_size} bytes) exceeds max_read_bytes ({max_bytes})"
+                    )
+
+                # Verify opened descriptor target does not escape workspace
+                fd_real = _get_fd_real_path(fd)
+                if fd_real is not None:
+                    self._verify_containment(fd_real)
+                self._verify_containment(os.path.realpath(str(target)))
+
+                # Read safely bounded by max_bytes
+                raw = os.read(fd, max_bytes + 1)
+                if len(raw) > max_bytes:
+                    raise ExecutorError(
+                        f"File size ({len(raw)} bytes) exceeds max_read_bytes ({max_bytes})"
+                    )
+                try:
+                    return raw.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ExecutorError(f"File content is not valid UTF-8: {exc}") from exc
+            finally:
+                os.close(fd)
 
         if tool == "fs.write":
             constraints = self._check_constraints("write", target, decision)
@@ -147,6 +210,9 @@ class LocalFSExecutor:
                 raise ExecutorError("Cannot overwrite workspace root")
             if target.exists() and target.is_dir():
                 raise ExecutorError("Cannot overwrite a directory")
+            if target.is_symlink():
+                raise ExecutorError("Cannot overwrite symlink")
+
             content = params.get("content")
             if not isinstance(content, str):
                 raise ExecutorError("fs.write requires string 'content' parameter")
@@ -156,11 +222,46 @@ class LocalFSExecutor:
                 raise ExecutorError(
                     f"Write payload ({len(encoded)} bytes) exceeds max_write_bytes ({max_bytes})"
                 )
+
             if bool(params.get("create_parents", False)):
                 target.parent.mkdir(parents=True, exist_ok=True)
             elif not target.parent.exists():
                 raise ExecutorError("Parent directory does not exist")
-            target.write_bytes(encoded)
+
+            # Verify parent directory containment
+            self._verify_containment(target.parent)
+
+            # Atomic write via temporary file in the same parent directory
+            parent_dir = target.parent
+            temp_fd, temp_path_str = tempfile.mkstemp(
+                dir=str(parent_dir),
+                prefix=".actentra_tmp_",
+            )
+            temp_path = Path(temp_path_str)
+            try:
+                # Post-open handle check for temp file
+                temp_real = _get_fd_real_path(temp_fd)
+                if temp_real is not None:
+                    self._verify_containment(temp_real)
+                self._verify_containment(os.path.realpath(temp_path_str))
+
+                os.write(temp_fd, encoded)
+                os.fsync(temp_fd)
+                os.close(temp_fd)
+                temp_fd = -1
+
+                # Atomic replace
+                os.replace(temp_path, target)
+            finally:
+                if temp_fd != -1:
+                    with contextlib.suppress(OSError):
+                        os.close(temp_fd)
+                if temp_path.exists():
+                    with contextlib.suppress(OSError):
+                        temp_path.unlink()
+
+            # Post-replace verification
+            self._verify_containment(os.path.realpath(str(target)))
             return {"written_bytes": len(encoded), "path": str(target)}
 
         if tool == "fs.delete":
@@ -171,6 +272,13 @@ class LocalFSExecutor:
                 raise ExecutorError("File does not exist")
             if target.is_dir():
                 raise ExecutorError("Directory deletion is not permitted by fs.delete")
+
+            self._verify_containment(target.parent)
+            if target.is_symlink():
+                self._verify_containment(target)
+            else:
+                self._verify_containment(os.path.realpath(str(target)))
+
             target.unlink()
             return {"deleted": True, "path": str(target)}
 

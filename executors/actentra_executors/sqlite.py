@@ -19,6 +19,51 @@ _FORBIDDEN_SQL_RE = re.compile(
     re.IGNORECASE,
 )
 
+_ALWAYS_DENIED_ACTIONS: frozenset[int] = frozenset({
+    sqlite3.SQLITE_ATTACH,       # 24: ATTACH DATABASE
+    sqlite3.SQLITE_DETACH,       # 25: DETACH DATABASE
+    sqlite3.SQLITE_PRAGMA,       # 19: PRAGMA statements and pragma_* table queries
+    sqlite3.SQLITE_REINDEX,      # 27: REINDEX
+    sqlite3.SQLITE_ANALYZE,      # 28: ANALYZE
+})
+
+_MUTATION_ACTIONS: frozenset[int] = frozenset({
+    sqlite3.SQLITE_INSERT,       # 18
+    sqlite3.SQLITE_UPDATE,       # 23
+    sqlite3.SQLITE_DELETE,       # 9
+})
+
+_SCHEMA_ACTIONS: frozenset[int] = frozenset({
+    sqlite3.SQLITE_CREATE_INDEX,         # 1
+    sqlite3.SQLITE_CREATE_TABLE,         # 2
+    sqlite3.SQLITE_CREATE_TEMP_INDEX,    # 3
+    sqlite3.SQLITE_CREATE_TEMP_TABLE,    # 4
+    sqlite3.SQLITE_CREATE_TEMP_TRIGGER,  # 5
+    sqlite3.SQLITE_CREATE_TEMP_VIEW,     # 6
+    sqlite3.SQLITE_CREATE_TRIGGER,       # 7
+    sqlite3.SQLITE_CREATE_VIEW,          # 8
+    sqlite3.SQLITE_DROP_INDEX,           # 10
+    sqlite3.SQLITE_DROP_TABLE,           # 11
+    sqlite3.SQLITE_DROP_TEMP_INDEX,      # 12
+    sqlite3.SQLITE_DROP_TEMP_TABLE,      # 13
+    sqlite3.SQLITE_DROP_TEMP_TRIGGER,    # 14
+    sqlite3.SQLITE_DROP_TEMP_VIEW,       # 15
+    sqlite3.SQLITE_DROP_TRIGGER,         # 16
+    sqlite3.SQLITE_DROP_VIEW,            # 17
+    sqlite3.SQLITE_ALTER_TABLE,          # 26
+    sqlite3.SQLITE_CREATE_VTABLE,        # 29
+    sqlite3.SQLITE_DROP_VTABLE,          # 30
+})
+
+_TABLE_ACCESS_ACTIONS: frozenset[int] = frozenset({
+    sqlite3.SQLITE_READ,                 # 20
+    sqlite3.SQLITE_INSERT,               # 18
+    sqlite3.SQLITE_UPDATE,               # 23
+    sqlite3.SQLITE_DELETE,               # 9
+})
+
+_FORBIDDEN_FUNCTIONS: frozenset[str] = frozenset({"load_extension", "fts3_tokenizer"})
+
 
 def _validate_single_statement(sql: str) -> str:
     """Validate that SQL contains exactly one statement and no dangerous SQLite commands."""
@@ -266,12 +311,67 @@ class ScopedSQLiteExecutor:
         if max_rows < 1:
             raise ExecutorError("max_rows constraint must be >= 1")
 
+        authorized_tables: set[str] | None = None
+        if "#" in res:
+            fragment = res.split("#", 1)[1].strip()
+            if fragment:
+                authorized_tables = {t.strip().lower() for t in fragment.split(",") if t.strip()}
+            else:
+                authorized_tables = set()
+
+        constraint_tables = constraints.get("allowed_tables")
+        if constraint_tables is not None:
+            if isinstance(constraint_tables, str):
+                c_set = {t.strip().lower() for t in constraint_tables.split(",") if t.strip()}
+            elif isinstance(constraint_tables, (list, tuple, set)):
+                c_set = {str(t).strip().lower() for t in constraint_tables if str(t).strip()}
+            else:
+                c_set = set()
+            authorized_tables = (
+                c_set if authorized_tables is None else authorized_tables & c_set
+            )
+
+        param_table = params.get("table")
+        if isinstance(param_table, str) and param_table.strip():
+            p_set = {param_table.strip().lower()}
+            authorized_tables = (
+                p_set if authorized_tables is None else authorized_tables & p_set
+            )
+
+        allow_ddl = bool(constraints.get("allow_ddl", False))
+
+        def _authorizer(
+            action: int,
+            arg1: str | None,
+            arg2: str | None,
+            db_name: str | None,
+            trigger_or_view: str | None,
+        ) -> int:
+            if action in _ALWAYS_DENIED_ACTIONS:
+                return sqlite3.SQLITE_DENY
+            if action == sqlite3.SQLITE_FUNCTION and arg2 and arg2.lower() in _FORBIDDEN_FUNCTIONS:
+                return sqlite3.SQLITE_DENY
+            if effective_ro and action in _MUTATION_ACTIONS:
+                return sqlite3.SQLITE_DENY
+            if (not allow_ddl or effective_ro) and action in _SCHEMA_ACTIONS:
+                return sqlite3.SQLITE_DENY
+            if (
+                authorized_tables is not None
+                and action in _TABLE_ACCESS_ACTIONS
+                and arg1 is not None
+                and arg1.lower() not in authorized_tables
+            ):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
         if effective_ro:
             uri = f"{self._db_path.as_uri()}?mode=ro"
             conn = sqlite3.connect(uri, uri=True, timeout=5.0)
             conn.execute("PRAGMA query_only = ON;")
         else:
             conn = sqlite3.connect(self._db_path, timeout=5.0)
+
+        conn.set_authorizer(_authorizer)
 
         try:
             cur = conn.execute(sql, args)
@@ -293,6 +393,9 @@ class ScopedSQLiteExecutor:
                 "lastrowid": cur.lastrowid,
             }
         except sqlite3.Error as exc:
+            msg = str(exc).lower()
+            if "prohibited" in msg or "not authorized" in msg:
+                raise ExecutorError(f"Unauthorized table or SQL operation: {exc}") from exc
             raise ExecutorError(f"SQLite execution error ({type(exc).__name__})") from exc
         finally:
             conn.close()
