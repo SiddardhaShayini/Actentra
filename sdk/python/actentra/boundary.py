@@ -14,6 +14,13 @@ from typing import Any, Literal, TypeVar, cast
 from actentra.secrets import SecretsBroker
 from actentra_core.canonicalize import CanonicalizationError, hash_canonical
 from actentra_core.causal import CausalLink, generate_link_id
+from actentra_core.context import (
+    ContextError,
+    PostconditionSpec,
+    build_execution_context,
+    compute_content_digest,
+    validate_postcondition_semantics,
+)
 from actentra_core.coordination import (
     LeaseMode,
     ResourceLease,
@@ -524,9 +531,10 @@ class Boundary:
         warrant: Warrant | dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         verify_postcondition: bool = False,
-        postcondition_claim: str = "exists",
+        postcondition_claim: str | None = None,
         postcondition_expected_digest: str | None = None,
         raise_on_postcondition_failure: bool = False,
+        strict_postconditions: bool = False,
         caller_context: CallerContext | None = None,
     ) -> Any:
         """Evaluate an action, record a durable decision, enforce verdict, and record outcome."""
@@ -742,12 +750,148 @@ class Boundary:
                 envelope.crossing_id,
             )
 
+        # Phase 5 (ACT-06): Policy-mandated postconditions and execution integrity binding
+        policy_require_post = bool(
+            decision.constraints.get("require_postcondition")
+            or "postcondition" in decision.constraints
+            or "required_postconditions" in decision.constraints
+            or decision.constraints.get("strict_postconditions")
+        )
+        effective_verify_postcondition = verify_postcondition or policy_require_post
+        is_strict = strict_postconditions or policy_require_post
+
+        policy_post_claim = decision.constraints.get("postcondition")
+        policy_expected_digest = decision.constraints.get("expected_digest")
+
+        effective_expected_digest = postcondition_expected_digest
+
+        if policy_post_claim:
+            if (
+                postcondition_claim is not None
+                and postcondition_claim != policy_post_claim
+            ):
+                err_msg = (
+                    f"Postcondition claim substitution rejected: policy requires "
+                    f"'{policy_post_claim}', caller requested '{postcondition_claim}'"
+                )
+                self._store.record_outcome(
+                    crossing_id=envelope.crossing_id,
+                    session_id=envelope.session_id,
+                    canonical_hash=envelope.canonical_hash,
+                    policy_version=decision.policy_version,
+                    status="failure",
+                    error=err_msg,
+                    reason="postcondition_substitution_rejected",
+                    evidence_status="locally_observed",
+                )
+                raise PostconditionFailedError(None, "failure", err_msg)
+            effective_claim = str(policy_post_claim)
+        else:
+            effective_claim = postcondition_claim or "exists"
+
+        if policy_expected_digest:
+            if (
+                postcondition_expected_digest
+                and postcondition_expected_digest.lower() != str(policy_expected_digest).lower()
+            ):
+                err_msg = (
+                    f"Postcondition expected digest substitution rejected: policy requires "
+                    f"'{policy_expected_digest}', caller requested "
+                    f"'{postcondition_expected_digest}'"
+                )
+                self._store.record_outcome(
+                    crossing_id=envelope.crossing_id,
+                    session_id=envelope.session_id,
+                    canonical_hash=envelope.canonical_hash,
+                    policy_version=decision.policy_version,
+                    status="failure",
+                    error=err_msg,
+                    reason="postcondition_substitution_rejected",
+                    evidence_status="locally_observed",
+                )
+                raise PostconditionFailedError(None, "failure", err_msg)
+            effective_expected_digest = str(policy_expected_digest)
+
+        validated_postcondition: PostconditionSpec | None = None
+        if effective_verify_postcondition or postcondition_claim != "exists" or is_strict:
+            try:
+                validated_postcondition = validate_postcondition_semantics(
+                    tool=envelope.action.tool,
+                    verb=envelope.action.verb,
+                    resource=envelope.action.resource,
+                    claim=effective_claim,
+                    params=envelope.action.params,
+                    expected_digest=effective_expected_digest,
+                    strict=is_strict,
+                )
+                effective_claim = validated_postcondition.claim
+                effective_expected_digest = validated_postcondition.expected_digest
+            except ContextError as exc:
+                err_msg = f"Invalid postcondition semantics: {exc}"
+                self._store.record_outcome(
+                    crossing_id=envelope.crossing_id,
+                    session_id=envelope.session_id,
+                    canonical_hash=envelope.canonical_hash,
+                    policy_version=decision.policy_version,
+                    status="failure",
+                    error=err_msg,
+                    reason="invalid_postcondition_semantics",
+                    evidence_status="locally_observed",
+                )
+                raise PostconditionFailedError(None, "failure", err_msg) from exc
+
+        # Bind into AuthorizedExecutionContext (Phase 5: Invariant I14)
+        principal_id = ctx.authenticated_identity if ctx else envelope.agent.id
+        executor_id = getattr(self._verifier, "verifier_id", "in-process-executor")
+        approval_id = (
+            f"approval:{envelope.crossing_id}"
+            if decision.rule_id.endswith(":approved")
+            else None
+        )
+        post_specs = [validated_postcondition] if validated_postcondition else []
+
+        exec_ctx = build_execution_context(
+            crossing_id=envelope.crossing_id,
+            tool=envelope.action.tool,
+            verb=envelope.action.verb,
+            resource=envelope.action.resource,
+            params=envelope.action.params,
+            principal_id=principal_id,
+            executor_id=executor_id,
+            approval_id=approval_id,
+            policy_version=decision.policy_version,
+            required_postconditions=post_specs,
+            expected_result_constraints=decision.constraints.get("expected_result", {}),
+        )
+
+        appr_or_war = (
+            approval_id
+            or (f"warrant:{warrant_obj.warrant_id}" if warrant_obj else None)
+        )
+        claim = self._store.issue_execution_claim(
+            crossing_id=envelope.crossing_id,
+            executor_principal_id=principal_id,
+            session_id=envelope.session_id,
+            canonical_hash=envelope.canonical_hash,
+            approval_or_warrant_id=appr_or_war,
+            context_hash=exec_ctx.context_hash,
+        )
+
         try:
             result = fn(envelope, decision)
         except Exception as exc:
             err_label = type(exc).__name__
             if self._secrets_broker is not None:
                 err_label = self._secrets_broker.redact(err_label)
+            with contextlib.suppress(Exception):
+                self._store.consume_execution_claim(
+                    claim.claim_id,
+                    executor_principal_id=principal_id,
+                    crossing_id=envelope.crossing_id,
+                    canonical_hash=envelope.canonical_hash,
+                    approval_or_warrant_id=claim.approval_or_warrant_id,
+                    verification_status="error",
+                )
             self._store.record_outcome(
                 crossing_id=envelope.crossing_id,
                 session_id=envelope.session_id,
@@ -766,7 +910,17 @@ class Boundary:
         except (TypeError, ValueError, CanonicalizationError):
             result_hash = None
 
-        if not verify_postcondition:
+        if not effective_verify_postcondition:
+            with contextlib.suppress(Exception):
+                self._store.consume_execution_claim(
+                    claim.claim_id,
+                    executor_principal_id=principal_id,
+                    crossing_id=envelope.crossing_id,
+                    canonical_hash=envelope.canonical_hash,
+                    approval_or_warrant_id=claim.approval_or_warrant_id,
+                    result_digest=result_hash,
+                    verification_status="unverified",
+                )
             self._store.record_outcome(
                 crossing_id=envelope.crossing_id,
                 session_id=envelope.session_id,
@@ -781,6 +935,16 @@ class Boundary:
 
         # Postcondition verification requested: finalize outcome strictly after verification
         if self._verifier is None:
+            with contextlib.suppress(Exception):
+                self._store.consume_execution_claim(
+                    claim.claim_id,
+                    executor_principal_id=principal_id,
+                    crossing_id=envelope.crossing_id,
+                    canonical_hash=envelope.canonical_hash,
+                    approval_or_warrant_id=claim.approval_or_warrant_id,
+                    result_digest=result_hash,
+                    verification_status="unknown",
+                )
             self._store.record_outcome(
                 crossing_id=envelope.crossing_id,
                 session_id=envelope.session_id,
@@ -804,25 +968,37 @@ class Boundary:
             return result
 
         obs: ObservationRecord | None = None
+        target_claim = validated_postcondition.claim if validated_postcondition else effective_claim
+        target_res = (
+            validated_postcondition.resource
+            if validated_postcondition
+            else envelope.action.resource
+        )
+        target_digest = (
+            validated_postcondition.expected_digest
+            if validated_postcondition
+            else effective_expected_digest
+        )
+
         try:
             kwargs: dict[str, Any] = {"crossing_id": envelope.crossing_id}
-            if postcondition_expected_digest is not None:
-                kwargs["expected_digest"] = postcondition_expected_digest
+            if target_digest is not None:
+                kwargs["expected_digest"] = target_digest
             try:
                 obs = self._verifier.verify(
-                    resource=envelope.action.resource,
-                    claim=postcondition_claim,
+                    resource=target_res,
+                    claim=target_claim,
                     **kwargs,
                 )
             except TypeError:
                 obs = self._verifier.verify(
-                    resource=envelope.action.resource,
-                    claim=postcondition_claim,
+                    resource=target_res,
+                    claim=target_claim,
                 )
         except Exception as exc:
             obs = build_observation(
-                subject_resource=envelope.action.resource,
-                claim=postcondition_claim,
+                subject_resource=target_res,
+                claim=target_claim,
                 status="error",
                 verifier_id=getattr(self._verifier, "verifier_id", "actentra.verifier.unknown"),
                 verifier_version=getattr(self._verifier, "verifier_version", "1.0.0"),
@@ -832,6 +1008,17 @@ class Boundary:
             )
 
         if obs.status == "verified":
+            with contextlib.suppress(Exception):
+                self._store.consume_execution_claim(
+                    claim.claim_id,
+                    executor_principal_id=principal_id,
+                    crossing_id=envelope.crossing_id,
+                    canonical_hash=envelope.canonical_hash,
+                    approval_or_warrant_id=claim.approval_or_warrant_id,
+                    result_digest=result_hash,
+                    evidence_id=obs.observation_id,
+                    verification_status="verified",
+                )
             self._store.record_outcome(
                 crossing_id=envelope.crossing_id,
                 session_id=envelope.session_id,
@@ -877,9 +1064,20 @@ class Boundary:
             return result
 
         elif obs.status == "refuted":
+            with contextlib.suppress(Exception):
+                self._store.consume_execution_claim(
+                    claim.claim_id,
+                    executor_principal_id=principal_id,
+                    crossing_id=envelope.crossing_id,
+                    canonical_hash=envelope.canonical_hash,
+                    approval_or_warrant_id=claim.approval_or_warrant_id,
+                    result_digest=result_hash,
+                    evidence_id=obs.observation_id,
+                    verification_status="refuted",
+                )
             err_msg = (
-                f"Postcondition refuted: claim '{postcondition_claim}' on resource "
-                f"'{envelope.action.resource}'"
+                f"Postcondition refuted: claim '{target_claim}' on resource "
+                f"'{target_res}'"
             )
             if obs.error:
                 err_msg += f" ({obs.error})"
@@ -901,9 +1099,20 @@ class Boundary:
 
         else:
             status_label = obs.status
+            with contextlib.suppress(Exception):
+                self._store.consume_execution_claim(
+                    claim.claim_id,
+                    executor_principal_id=principal_id,
+                    crossing_id=envelope.crossing_id,
+                    canonical_hash=envelope.canonical_hash,
+                    approval_or_warrant_id=claim.approval_or_warrant_id,
+                    result_digest=result_hash,
+                    evidence_id=obs.observation_id,
+                    verification_status=status_label,
+                )
             err_msg = (
                 f"Postcondition verification status is '{status_label}' for claim "
-                f"'{postcondition_claim}'"
+                f"'{target_claim}'"
             )
             if obs.error:
                 err_msg += f": {obs.error}"
@@ -923,6 +1132,119 @@ class Boundary:
             if raise_on_postcondition_failure:
                 raise PostconditionFailedError(obs, "unknown", err_msg)
             return result
+
+    def reconcile_outcome(
+        self,
+        crossing_id: str,
+        observation: ObservationRecord | None = None,
+    ) -> Any:
+        """Safely reconcile an uncertain outcome receipt using independent verification (Phase 5).
+
+        Only outcome receipts in 'unknown' state may be reconciled.
+        Terminal 'success' (externally verified) and 'failure' receipts cannot be overwritten.
+        """
+        outcome = self._store.get_outcome_receipt(crossing_id, apply_reconciliation=False)
+        if outcome is None:
+            raise ReceiptError(f"No outcome receipt found for crossing '{crossing_id}'")
+        if outcome.status != "unknown":
+            raise ReceiptError(
+                f"Cannot reconcile outcome with terminal status '{outcome.status}' "
+                f"(crossing_id='{crossing_id}')"
+            )
+
+        env_dict = self._store.get_envelope(crossing_id)
+        if env_dict is None:
+            raise ReceiptError(f"Envelope for crossing '{crossing_id}' not found")
+
+        obs = observation
+        if obs is None:
+            if self._verifier is None:
+                raise ValueError(
+                    "Cannot reconcile outcome: no verifier configured and no observation provided"
+                )
+            action_data = env_dict.get("action", {})
+            res = str(action_data.get("resource", ""))
+            verb = str(action_data.get("verb", "other")).lower()
+            tool = str(action_data.get("tool", "")).lower()
+            params = action_data.get("params") or {}
+
+            # Determine claim & expected digest
+            if verb == "write" or tool == "fs.write":
+                claim = "digest_match"
+                content = params.get("content")
+                expected_dig = (
+                    compute_content_digest(content)
+                    if isinstance(content, (str, bytes))
+                    else None
+                )
+            elif verb == "delete" or tool == "fs.delete":
+                claim = "absent"
+                expected_dig = None
+            else:
+                claim = "exists"
+                expected_dig = None
+
+            obs = self._verifier.verify(
+                resource=res,
+                claim=claim,
+                crossing_id=crossing_id,
+                expected_digest=expected_dig,
+            )
+
+        self._store.record_observation(obs)
+
+        if obs.status == "verified":
+            reconciled = self._store.record_reconciliation(
+                crossing_id=crossing_id,
+                status="success",
+                evidence_status="externally_verified",
+                reason="reconciled_verified",
+                observation=obs,
+            )
+            ev = build_evidence_record(
+                crossing_id=crossing_id,
+                tier=EvidenceTier.EXTERNALLY_VERIFIED,
+                trust_domain="verifier:workspace",
+                collector=obs.verifier_id,
+                details={
+                    "observation_id": obs.observation_id,
+                    "resource": obs.subject_resource,
+                    "claim": obs.claim,
+                    "status": obs.status,
+                    "observed_digest": obs.observed_digest,
+                    "reconciled": True,
+                },
+                expires_at=obs.expires_at,
+            )
+            self._store.record_evidence(ev)
+            link = CausalLink(
+                link_id=generate_link_id(),
+                link_version="1",
+                source_id=crossing_id,
+                source_type="crossing",
+                relation="verifies",
+                target_id=obs.observation_id,
+                target_type="observation",
+                created_at=utc_iso(),
+            )
+            self._store.record_causal_link(link)
+            return reconciled
+        elif obs.status == "refuted":
+            return self._store.record_reconciliation(
+                crossing_id=crossing_id,
+                status="failure",
+                evidence_status="locally_observed",
+                reason="reconciled_refuted",
+                observation=obs,
+            )
+        else:
+            return self._store.record_reconciliation(
+                crossing_id=crossing_id,
+                status="unknown",
+                evidence_status="stale" if obs.status == "stale" else "unknown",
+                reason=f"reconciled_unverified_{obs.status}",
+                observation=obs,
+            )
 
     def acquire_lease(
         self,

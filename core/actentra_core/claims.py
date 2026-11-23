@@ -42,6 +42,11 @@ def compute_claim_hash(
     canonical_hash: str,
     issued_at: str,
     expires_at: float,
+    approval_or_warrant_id: str | None = None,
+    result_digest: str | None = None,
+    evidence_id: str | None = None,
+    verification_status: str = "unverified",
+    context_hash: str | None = None,
 ) -> str:
     """Compute deterministic SHA-256 canonical hash of execution claim metadata."""
     payload = {
@@ -52,6 +57,27 @@ def compute_claim_hash(
         "canonical_hash": canonicalize_unicode(canonical_hash).strip(),
         "issued_at": canonicalize_unicode(issued_at).strip(),
         "expires_at": str(round(expires_at, 3)),
+        "approval_or_warrant_id": (
+            canonicalize_unicode(approval_or_warrant_id).strip()
+            if approval_or_warrant_id is not None
+            else None
+        ),
+        "result_digest": (
+            canonicalize_unicode(result_digest).strip()
+            if result_digest is not None
+            else None
+        ),
+        "evidence_id": (
+            canonicalize_unicode(evidence_id).strip()
+            if evidence_id is not None
+            else None
+        ),
+        "verification_status": canonicalize_unicode(verification_status).strip().lower(),
+        "context_hash": (
+            canonicalize_unicode(context_hash).strip()
+            if context_hash is not None
+            else None
+        ),
     }
     return hash_canonical(payload)
 
@@ -69,6 +95,11 @@ class ExecutionClaim:
     issued_at: str
     expires_at: float
     consumed_at: str | None = None
+    approval_or_warrant_id: str | None = None
+    result_digest: str | None = None
+    evidence_id: str | None = None
+    verification_status: str = "unverified"
+    context_hash: str | None = None
     claim_hash: str = ""
 
     def is_expired(self, now: float | None = None) -> bool:
@@ -88,5 +119,10 @@ class ExecutionClaim:
             "issued_at": self.issued_at,
             "expires_at": self.expires_at,
             "consumed_at": self.consumed_at,
+            "approval_or_warrant_id": self.approval_or_warrant_id,
+            "result_digest": self.result_digest,
+            "evidence_id": self.evidence_id,
+            "verification_status": self.verification_status,
+            "context_hash": self.context_hash,
             "claim_hash": self.claim_hash,
         }

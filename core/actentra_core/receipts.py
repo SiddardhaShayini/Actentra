@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import sqlite3
 import time
+import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -621,16 +623,55 @@ class ReceiptStore:
                     issued_at TEXT NOT NULL,
                     expires_at REAL NOT NULL,
                     consumed_at TEXT,
+                    approval_or_warrant_id TEXT,
+                    result_digest TEXT,
+                    evidence_id TEXT,
+                    verification_status TEXT DEFAULT 'unverified',
+                    context_hash TEXT,
                     claim_hash TEXT NOT NULL
                 );
                 """
             )
+            # Add columns if migrating existing database
+            for col, col_type in (
+                ("approval_or_warrant_id", "TEXT"),
+                ("result_digest", "TEXT"),
+                ("evidence_id", "TEXT"),
+                ("verification_status", "TEXT DEFAULT 'unverified'"),
+                ("context_hash", "TEXT"),
+            ):
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute(f"ALTER TABLE execution_claims ADD COLUMN {col} {col_type};")
+
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_claim_crossing ON execution_claims(crossing_id);"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_claim_executor ON execution_claims("
                 "executor_principal_id, status);"
+            )
+
+            # Phase 5: Durable outcome reconciliations for uncertain outcomes (ACT-06)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS outcome_reconciliations (
+                    reconciliation_id TEXT PRIMARY KEY,
+                    crossing_id TEXT NOT NULL,
+                    original_status TEXT NOT NULL,
+                    reconciled_status TEXT NOT NULL CHECK (
+                        reconciled_status IN ('success', 'failure', 'unknown')
+                    ),
+                    evidence_status TEXT NOT NULL,
+                    reason TEXT,
+                    observation_id TEXT,
+                    reconciled_at TEXT NOT NULL,
+                    reconciler_id TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_reconciliations_crossing "
+                "ON outcome_reconciliations(crossing_id);"
             )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to initialize receipt store: {exc}") from exc
@@ -945,7 +986,9 @@ class ReceiptStore:
         finally:
             conn.close()
 
-    def get_outcome_receipt(self, crossing_id: str) -> ReceiptRecord | None:
+    def get_outcome_receipt(
+        self, crossing_id: str, *, apply_reconciliation: bool = True
+    ) -> ReceiptRecord | None:
         """Fetch the outcome receipt record for a crossing_id if one exists."""
         conn = self._connect()
         try:
@@ -963,9 +1006,151 @@ class ReceiptStore:
             ).fetchone()
             if row is None:
                 return None
-            return _row_to_receipt_record(row)
+            rec = _row_to_receipt_record(row)
+            if apply_reconciliation:
+                recon_row = conn.execute(
+                    """
+                    SELECT reconciled_status, evidence_status, reason
+                    FROM outcome_reconciliations
+                    WHERE crossing_id = ?
+                    ORDER BY rowid DESC LIMIT 1;
+                    """,
+                    (crossing_id,),
+                ).fetchone()
+                if recon_row is not None:
+                    reconciled_status, ev_status, recon_reason = recon_row
+                    safe_reason = f"{rec.reason or ''} [reconciled: {recon_reason}]".strip()
+                    return dataclasses.replace(
+                        rec,
+                        status=str(reconciled_status),
+                        evidence_status=str(ev_status),
+                        reason=safe_reason,
+                    )
+            return rec
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to fetch outcome receipt: {exc}") from exc
+        finally:
+            conn.close()
+
+    def record_reconciliation(
+        self,
+        *,
+        crossing_id: str,
+        status: OutcomeStatus,
+        evidence_status: str,
+        reason: str,
+        observation: ObservationRecord | None = None,
+        reconciler_id: str = "boundary",
+    ) -> ReceiptRecord:
+        """Safely record an outcome reconciliation for an existing unknown outcome."""
+        existing = self.get_outcome_receipt(crossing_id, apply_reconciliation=False)
+        if existing is None:
+            raise ReceiptError(
+                f"No existing outcome found to reconcile for crossing '{crossing_id}'"
+            )
+        if existing.status not in ("unknown", None):
+            raise ReceiptError(
+                f"Cannot reconcile outcome with terminal status '{existing.status}' "
+                f"for crossing '{crossing_id}'"
+            )
+
+        reconciliation_id = f"recon_{uuid.uuid4().hex[:16]}"
+        now_ts = utc_now_iso()
+        obs_id = observation.observation_id if observation is not None else None
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            if observation is not None:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO observations (
+                        observation_id, crossing_id, subject_resource, claim, status,
+                        observed_digest, observed_at, expires_at, verifier_id,
+                        verifier_version, trust_domain, metadata_json, error, observation_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        observation.observation_id,
+                        observation.crossing_id,
+                        observation.subject_resource,
+                        observation.claim,
+                        observation.status,
+                        observation.observed_digest,
+                        observation.observed_at,
+                        observation.expires_at,
+                        observation.verifier_id,
+                        observation.verifier_version,
+                        observation.trust_domain,
+                        json.dumps(observation.metadata, ensure_ascii=False),
+                        observation.error,
+                        observation.observation_hash,
+                    ),
+                )
+            conn.execute(
+                """
+                INSERT INTO outcome_reconciliations (
+                    reconciliation_id, crossing_id, original_status, reconciled_status,
+                    evidence_status, reason, observation_id, reconciled_at, reconciler_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    reconciliation_id,
+                    crossing_id,
+                    existing.status or "unknown",
+                    status,
+                    evidence_status,
+                    reason,
+                    obs_id,
+                    now_ts,
+                    reconciler_id,
+                ),
+            )
+            conn.execute("COMMIT;")
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to record outcome reconciliation: {exc}") from exc
+        finally:
+            conn.close()
+
+        safe_reason = f"{existing.reason or ''} [reconciled: {reason}]".strip()
+        return dataclasses.replace(
+            existing,
+            status=status,
+            evidence_status=evidence_status,
+            reason=safe_reason,
+        )
+
+    def get_reconciliation(self, crossing_id: str) -> dict[str, Any] | None:
+        """Fetch latest outcome reconciliation record for a crossing if one exists."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT reconciliation_id, crossing_id, original_status, reconciled_status,
+                       evidence_status, reason, observation_id, reconciled_at, reconciler_id
+                FROM outcome_reconciliations
+                WHERE crossing_id = ?
+                ORDER BY rowid DESC LIMIT 1;
+                """,
+                (crossing_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "reconciliation_id": str(row[0]),
+                "crossing_id": str(row[1]),
+                "original_status": str(row[2]),
+                "reconciled_status": str(row[3]),
+                "evidence_status": str(row[4]),
+                "reason": str(row[5]) if row[5] is not None else None,
+                "observation_id": str(row[6]) if row[6] is not None else None,
+                "reconciled_at": str(row[7]),
+                "reconciler_id": str(row[8]),
+            }
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch reconciliation: {exc}") from exc
         finally:
             conn.close()
 
@@ -3145,6 +3330,11 @@ class ReceiptStore:
         session_id: str,
         canonical_hash: str,
         ttl_seconds: float = 300.0,
+        approval_or_warrant_id: str | None = None,
+        result_digest: str | None = None,
+        evidence_id: str | None = None,
+        verification_status: str = "unverified",
+        context_hash: str | None = None,
     ) -> ExecutionClaim:
         """Atomically issue a one-time execution claim for an allowed crossing."""
         now = time.time()
@@ -3159,6 +3349,11 @@ class ReceiptStore:
             canonical_hash=canonical_hash,
             issued_at=now_iso,
             expires_at=exp_ts,
+            approval_or_warrant_id=approval_or_warrant_id,
+            result_digest=result_digest,
+            evidence_id=evidence_id,
+            verification_status=verification_status,
+            context_hash=context_hash,
         )
 
         conn = self._connect()
@@ -3183,8 +3378,10 @@ class ReceiptStore:
                 """
                 INSERT INTO execution_claims (
                     claim_id, crossing_id, executor_principal_id, session_id,
-                    canonical_hash, status, issued_at, expires_at, consumed_at, claim_hash
-                ) VALUES (?, ?, ?, ?, ?, 'issued', ?, ?, NULL, ?);
+                    canonical_hash, status, issued_at, expires_at, consumed_at,
+                    approval_or_warrant_id, result_digest, evidence_id,
+                    verification_status, context_hash, claim_hash
+                ) VALUES (?, ?, ?, ?, ?, 'issued', ?, ?, NULL, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     claim_id,
@@ -3194,6 +3391,11 @@ class ReceiptStore:
                     canonical_hash,
                     now_iso,
                     exp_ts,
+                    approval_or_warrant_id,
+                    result_digest,
+                    evidence_id,
+                    verification_status,
+                    context_hash,
                     claim_hash,
                 ),
             )
@@ -3207,6 +3409,11 @@ class ReceiptStore:
                 status="issued",
                 issued_at=now_iso,
                 expires_at=exp_ts,
+                approval_or_warrant_id=approval_or_warrant_id,
+                result_digest=result_digest,
+                evidence_id=evidence_id,
+                verification_status=verification_status,
+                context_hash=context_hash,
                 claim_hash=claim_hash,
             )
         except Exception:
@@ -3223,7 +3430,9 @@ class ReceiptStore:
             row = conn.execute(
                 """
                 SELECT claim_id, crossing_id, executor_principal_id, session_id,
-                       canonical_hash, status, issued_at, expires_at, consumed_at, claim_hash
+                       canonical_hash, status, issued_at, expires_at, consumed_at,
+                       approval_or_warrant_id, result_digest, evidence_id,
+                       verification_status, context_hash, claim_hash
                 FROM execution_claims
                 WHERE claim_id = ? LIMIT 1;
                 """,
@@ -3241,7 +3450,12 @@ class ReceiptStore:
                 issued_at=str(row[6]),
                 expires_at=float(row[7]),
                 consumed_at=str(row[8]) if row[8] is not None else None,
-                claim_hash=str(row[9]),
+                approval_or_warrant_id=str(row[9]) if row[9] is not None else None,
+                result_digest=str(row[10]) if row[10] is not None else None,
+                evidence_id=str(row[11]) if row[11] is not None else None,
+                verification_status=str(row[12]) if row[12] is not None else "unverified",
+                context_hash=str(row[13]) if row[13] is not None else None,
+                claim_hash=str(row[14]),
             )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to fetch execution claim: {exc}") from exc
@@ -3255,7 +3469,9 @@ class ReceiptStore:
             row = conn.execute(
                 """
                 SELECT claim_id, crossing_id, executor_principal_id, session_id,
-                       canonical_hash, status, issued_at, expires_at, consumed_at, claim_hash
+                       canonical_hash, status, issued_at, expires_at, consumed_at,
+                       approval_or_warrant_id, result_digest, evidence_id,
+                       verification_status, context_hash, claim_hash
                 FROM execution_claims
                 WHERE crossing_id = ?
                 ORDER BY ROWID DESC LIMIT 1;
@@ -3274,7 +3490,12 @@ class ReceiptStore:
                 issued_at=str(row[6]),
                 expires_at=float(row[7]),
                 consumed_at=str(row[8]) if row[8] is not None else None,
-                claim_hash=str(row[9]),
+                approval_or_warrant_id=str(row[9]) if row[9] is not None else None,
+                result_digest=str(row[10]) if row[10] is not None else None,
+                evidence_id=str(row[11]) if row[11] is not None else None,
+                verification_status=str(row[12]) if row[12] is not None else "unverified",
+                context_hash=str(row[13]) if row[13] is not None else None,
+                claim_hash=str(row[14]),
             )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to fetch execution claim for crossing: {exc}") from exc
@@ -3287,6 +3508,11 @@ class ReceiptStore:
         *,
         executor_principal_id: str,
         crossing_id: str,
+        canonical_hash: str | None = None,
+        approval_or_warrant_id: str | None = None,
+        result_digest: str | None = None,
+        evidence_id: str | None = None,
+        verification_status: str | None = None,
     ) -> ExecutionClaim:
         """Atomically validate and consume an execution claim for outcome reporting."""
         conn = self._connect()
@@ -3295,7 +3521,9 @@ class ReceiptStore:
             row = conn.execute(
                 """
                 SELECT claim_id, crossing_id, executor_principal_id, session_id,
-                       canonical_hash, status, issued_at, expires_at, consumed_at, claim_hash
+                       canonical_hash, status, issued_at, expires_at, consumed_at,
+                       approval_or_warrant_id, result_digest, evidence_id,
+                       verification_status, context_hash, claim_hash
                 FROM execution_claims
                 WHERE claim_id = ?;
                 """,
@@ -3314,13 +3542,24 @@ class ReceiptStore:
                 issued_at=str(row[6]),
                 expires_at=float(row[7]),
                 consumed_at=str(row[8]) if row[8] is not None else None,
-                claim_hash=str(row[9]),
+                approval_or_warrant_id=str(row[9]) if row[9] is not None else None,
+                result_digest=str(row[10]) if row[10] is not None else None,
+                evidence_id=str(row[11]) if row[11] is not None else None,
+                verification_status=str(row[12]) if row[12] is not None else "unverified",
+                context_hash=str(row[13]) if row[13] is not None else None,
+                claim_hash=str(row[14]),
             )
 
             if claim.crossing_id != crossing_id:
                 raise ExecutionClaimError(
                     f"Execution claim '{claim_id}' was issued for crossing '{claim.crossing_id}', "
                     f"not '{crossing_id}'"
+                )
+
+            if canonical_hash is not None and claim.canonical_hash != canonical_hash:
+                raise ExecutionClaimError(
+                    f"Execution claim '{claim_id}' was issued for action hash "
+                    f"'{claim.canonical_hash}', not '{canonical_hash}'"
                 )
 
             # Check executor principal match
@@ -3331,6 +3570,26 @@ class ReceiptStore:
                 raise ExecutionClaimError(
                     f"Execution claim '{claim_id}' was issued to executor "
                     f"'{claim.executor_principal_id}', not caller '{executor_principal_id}'"
+                )
+
+            if (
+                approval_or_warrant_id is not None
+                and claim.approval_or_warrant_id
+                and claim.approval_or_warrant_id != approval_or_warrant_id
+            ):
+                raise ExecutionClaimError(
+                    f"Approval/warrant ID '{approval_or_warrant_id}' does not match "
+                    f"claim binding '{claim.approval_or_warrant_id}'"
+                )
+
+            if (
+                result_digest is not None
+                and claim.result_digest
+                and claim.result_digest.lower() != result_digest.lower()
+            ):
+                raise ExecutionClaimError(
+                    f"Result digest mismatch on execution claim: expected "
+                    f"'{claim.result_digest}', got '{result_digest}'"
                 )
 
             if claim.status == "consumed":
@@ -3347,14 +3606,23 @@ class ReceiptStore:
                 raise ExecutionClaimError(f"Execution claim '{claim_id}' has expired")
 
             now_iso = utc_now_iso()
-            conn.execute(
+            final_res_dig = result_digest or claim.result_digest
+            final_ev_id = evidence_id or claim.evidence_id
+            final_ver_status = verification_status or claim.verification_status
+            cur = conn.execute(
                 """
                 UPDATE execution_claims
-                SET status = 'consumed', consumed_at = ?
-                WHERE claim_id = ?;
+                SET status = 'consumed', consumed_at = ?, result_digest = ?,
+                    evidence_id = ?, verification_status = ?
+                WHERE claim_id = ? AND status = 'issued';
                 """,
-                (now_iso, claim_id),
+                (now_iso, final_res_dig, final_ev_id, final_ver_status, claim_id),
             )
+            if cur.rowcount == 0:
+                raise ExecutionClaimError(
+                    f"Execution claim '{claim_id}' could not be consumed "
+                    "(concurrent outcome finalization or already consumed)"
+                )
             conn.execute("COMMIT;")
             return ExecutionClaim(
                 claim_id=claim.claim_id,
@@ -3366,6 +3634,11 @@ class ReceiptStore:
                 issued_at=claim.issued_at,
                 expires_at=claim.expires_at,
                 consumed_at=now_iso,
+                approval_or_warrant_id=claim.approval_or_warrant_id,
+                result_digest=claim.result_digest,
+                evidence_id=claim.evidence_id,
+                verification_status=verification_status or claim.verification_status,
+                context_hash=claim.context_hash,
                 claim_hash=claim.claim_hash,
             )
         except Exception:

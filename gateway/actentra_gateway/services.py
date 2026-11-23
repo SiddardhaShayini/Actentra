@@ -924,6 +924,7 @@ class AppServices:
         result_hash: str | None = None,
         error: str | None = None,
         caller_context: CallerContext | None = None,
+        require_claim: bool = False,
     ) -> dict[str, Any]:
         """Record outcome receipt for an externally executed crossing with bound claim."""
         dec_rec = self.boundary.receipt_store.get_decision_receipt(crossing_id)
@@ -955,6 +956,53 @@ class AppServices:
         if raw_env is None:
             return {"error": f"Crossing '{crossing_id}' not found in store", "code": "not_found"}
 
+        # Inspect decision constraints by reconstructing envelope and evaluating
+        dec_constraints: dict[str, Any] = {}
+        try:
+            action_data = raw_env.get("action") or {}
+            agent_data = raw_env.get("agent") or {}
+            prov_items = [
+                ProvenanceItem(source=item["source"], trust=item["trust"])
+                for item in raw_env.get("provenance", [])
+                if isinstance(item, dict) and "source" in item and "trust" in item
+            ]
+            env = build_envelope(
+                tool=str(action_data.get("tool", "")),
+                verb=str(action_data.get("verb", "other")),
+                resource=str(action_data.get("resource", "")),
+                params=action_data.get("params") or {},
+                session_id=str(raw_env.get("session_id", "default")),
+                agent_id=str(agent_data.get("id", "http-client")),
+                provenance=prov_items,
+                crossing_id=crossing_id,
+            )
+            eval_dec = self.boundary.engine.evaluate(env)
+            dec_constraints = dict(eval_dec.constraints)
+        except Exception:
+            dec_constraints = {}
+
+        # Phase 5: Prevent false success promotion if postcondition verification was mandated
+        if status == "success" and (
+            dec_constraints.get("require_postcondition")
+            or "postcondition" in dec_constraints
+            or "required_postconditions" in dec_constraints
+        ):
+            ev_records = self.boundary.receipt_store.list_evidence(crossing_id=crossing_id)
+            has_verified = any(ev.tier == EvidenceTier.EXTERNALLY_VERIFIED for ev in ev_records)
+            if not has_verified:
+                obs_records = self.boundary.receipt_store.list_observations(crossing_id=crossing_id)
+                has_verified = any(obs.status == "verified" for obs in obs_records)
+
+            if not has_verified:
+                return {
+                    "error": (
+                        f"False success promotion rejected: crossing '{crossing_id}' requires "
+                        "independent postcondition verification, but no verified state observation "
+                        "was found"
+                    ),
+                    "code": "unverified_postcondition",
+                }
+
         executor_principal = "anonymous_executor"
         if caller_context is not None:
             if not caller_context.has_scope("crossings:outcome") and not caller_context.has_scope(
@@ -969,7 +1017,7 @@ class AppServices:
                 }
             executor_principal = caller_context.principal_id
 
-        # Validate and consume execution claim (Finding 5)
+        # Validate and consume execution claim (Finding 5 & Phase 5)
         clean_claim_id = str(claim_id).strip() if claim_id is not None else None
         if clean_claim_id:
             try:
@@ -977,6 +1025,8 @@ class AppServices:
                     clean_claim_id,
                     executor_principal_id=executor_principal,
                     crossing_id=crossing_id,
+                    canonical_hash=raw_env["canonical_hash"],
+                    result_digest=result_hash,
                 )
             except ExecutionClaimError as exc:
                 err_msg = str(exc)
@@ -990,7 +1040,12 @@ class AppServices:
                 elif "expired" in err_msg.lower():
                     code = "expired"
                 return {"error": err_msg, "code": code}
-        elif caller_context is not None:
+        elif (
+            caller_context is not None
+            or require_claim
+            or dec_constraints.get("require_postcondition")
+            or dec_constraints.get("require_claim")
+        ):
             return {
                 "error": (
                     "Missing required 'claim_id': external outcome reporting requires a valid "
@@ -1011,6 +1066,8 @@ class AppServices:
                     internal_claim.claim_id,
                     executor_principal_id=executor_principal,
                     crossing_id=crossing_id,
+                    canonical_hash=raw_env["canonical_hash"],
+                    result_digest=result_hash,
                 )
                 clean_claim_id = internal_claim.claim_id
             except ExecutionClaimError as exc:
