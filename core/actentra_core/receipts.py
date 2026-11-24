@@ -50,6 +50,20 @@ from actentra_core.envelope import (
 )
 from actentra_core.evidence import EvidenceRecord, EvidenceTier
 from actentra_core.handoffs import TaskHandoffRecord
+from actentra_core.lifecycle import (
+    ActionLifecycleRecord,
+    ActionLifecycleState,
+    ActionTransitionRecord,
+    DatabaseUnavailableError,
+    IdempotencyConflictError,
+    IdempotencyInFlightError,
+    IdempotencyRecord,
+    IdempotencyStatus,
+    InvalidStateTransitionError,
+    ReconciliationRequiredError,
+    validate_lifecycle_transition,
+)
+from actentra_core.observability import get_global_metrics
 from actentra_core.observations import ObservationRecord
 from actentra_core.verdict import Decision
 
@@ -273,11 +287,23 @@ class ReceiptStore:
         return self._db_path
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, timeout=15.0, isolation_level=None)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute(f"PRAGMA synchronous={self._synchronous};")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        return conn
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=15.0, isolation_level=None)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute(f"PRAGMA synchronous={self._synchronous};")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            conn.execute("PRAGMA busy_timeout=15000;")
+            return conn
+        except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+            err_msg = str(exc).lower()
+            if any(
+                term in err_msg
+                for term in ("malformed", "not a database", "corrupt", "disk i/o error")
+            ):
+                raise DatabaseUnavailableError(
+                    f"Persistent database is corrupted or unavailable: {exc}"
+                ) from exc
+            raise
 
     def _init_db(self) -> None:
         conn = self._connect()
@@ -536,9 +562,7 @@ class ReceiptStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sessions_principal ON sessions(principal_id);"
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);"
-            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);")
 
             # Phase 2 Hardening: Persistent principal cumulative budgets
             conn.execute(
@@ -681,6 +705,101 @@ class ReceiptStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_reconciliations_crossing "
                 "ON outcome_reconciliations(crossing_id);"
+            )
+
+            # Phase 7: Action lifecycle state machine table (Invariant I16)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS action_lifecycle (
+                    crossing_id TEXT PRIMARY KEY,
+                    current_state TEXT NOT NULL CHECK (
+                        current_state IN (
+                            'created', 'authorized', 'approved', 'claimed', 'executing',
+                            'verification_pending', 'succeeded', 'failed', 'unknown',
+                            'reconciliation_required'
+                        )
+                    ),
+                    session_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    canonical_hash TEXT NOT NULL,
+                    idempotency_key TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}'
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lifecycle_state ON action_lifecycle(current_state);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lifecycle_session "
+                "ON action_lifecycle(session_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lifecycle_principal "
+                "ON action_lifecycle(principal_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lifecycle_idempotency "
+                "ON action_lifecycle(idempotency_key);"
+            )
+
+            # Phase 7: Immutable audit log of action state transitions
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS action_transitions (
+                    transition_id TEXT PRIMARY KEY,
+                    crossing_id TEXT NOT NULL,
+                    from_state TEXT NOT NULL,
+                    to_state TEXT NOT NULL,
+                    transitioned_at TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    reason TEXT
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_transitions_crossing "
+                "ON action_transitions(crossing_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_transitions_time "
+                "ON action_transitions(transitioned_at);"
+            )
+
+            # Phase 7: Durable idempotency records preventing replay side-effects
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS idempotency_records (
+                    idempotency_key TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    canonical_hash TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    verb TEXT NOT NULL,
+                    crossing_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('in_flight', 'completed', 'failed', 'reconciliation_required')
+                    ),
+                    result_hash TEXT,
+                    response_json TEXT,
+                    created_at TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    PRIMARY KEY (principal_id, idempotency_key)
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_idempotency_crossing "
+                "ON idempotency_records(crossing_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_idempotency_status "
+                "ON idempotency_records(status);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_idempotency_expires "
+                "ON idempotency_records(expires_at);"
             )
         except sqlite3.Error as exc:
             raise ReceiptError(f"Failed to initialize receipt store: {exc}") from exc
@@ -1115,6 +1234,52 @@ class ReceiptStore:
                     now_ts,
                     reconciler_id,
                 ),
+            )
+
+            # Phase 7: Synchronize action_lifecycle state upon reconciliation
+            target_lifecycle_state = (
+                "succeeded"
+                if status == "success"
+                else ("failed" if status == "failure" else "unknown")
+            )
+            lf_row = conn.execute(
+                "SELECT current_state FROM action_lifecycle WHERE crossing_id = ?;",
+                (crossing_id,),
+            ).fetchone()
+            if lf_row is not None:
+                from_lf_state = str(lf_row[0])
+                conn.execute(
+                    "UPDATE action_lifecycle SET current_state = ?, updated_at = ? "
+                    "WHERE crossing_id = ?;",
+                    (target_lifecycle_state, now_ts, crossing_id),
+                )
+                tr_id = f"tr_{uuid.uuid4().hex[:16]}"
+                conn.execute(
+                    "INSERT INTO action_transitions "
+                    "(transition_id, crossing_id, from_state, to_state, "
+                    "transitioned_at, actor_id, reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?);",
+                    (
+                        tr_id,
+                        crossing_id,
+                        from_lf_state,
+                        target_lifecycle_state,
+                        now_ts,
+                        reconciler_id,
+                        f"reconciled: {reason}",
+                    ),
+                )
+
+            # Phase 7: Finalize any associated idempotency record
+            idemp_status = (
+                "completed"
+                if status == "success"
+                else ("failed" if status == "failure" else "reconciliation_required")
+            )
+            conn.execute(
+                "UPDATE idempotency_records SET status = ?, response_json = ? "
+                "WHERE crossing_id = ?;",
+                (idemp_status, json.dumps({"status": status, "reason": reason}), crossing_id),
             )
             conn.execute("COMMIT;")
         except sqlite3.Error as exc:
@@ -3700,6 +3865,600 @@ class ReceiptStore:
             verify_envelopes=verify_envelopes,
             require_checkpoints=require_checkpoints,
         )
+
+    # =========================================================================
+    # Phase 7: Action Execution Lifecycle & Durable Idempotency
+    # =========================================================================
+
+    def _row_to_lifecycle_record(self, row: tuple[Any, ...]) -> ActionLifecycleRecord:
+        details_dict = json.loads(str(row[8])) if len(row) > 8 and row[8] else {}
+        return ActionLifecycleRecord(
+            crossing_id=str(row[0]),
+            current_state=str(row[1]),  # type: ignore[arg-type]
+            session_id=str(row[2]),
+            principal_id=str(row[3]),
+            canonical_hash=str(row[4]),
+            idempotency_key=str(row[5]) if row[5] is not None else None,
+            created_at=str(row[6]),
+            updated_at=str(row[7]),
+            details=details_dict,
+        )
+
+    def _row_to_transition_record(self, row: tuple[Any, ...]) -> ActionTransitionRecord:
+        return ActionTransitionRecord(
+            transition_id=str(row[0]),
+            crossing_id=str(row[1]),
+            from_state=str(row[2]),
+            to_state=str(row[3]),
+            transitioned_at=str(row[4]),
+            actor_id=str(row[5]),
+            reason=str(row[6]) if row[6] is not None else None,
+        )
+
+    def _row_to_idempotency_record(self, row: tuple[Any, ...]) -> IdempotencyRecord:
+        resp_dict = json.loads(str(row[8])) if row[8] else None
+        return IdempotencyRecord(
+            idempotency_key=str(row[0]),
+            principal_id=str(row[1]),
+            canonical_hash=str(row[2]),
+            tool=str(row[3]),
+            verb=str(row[4]),
+            crossing_id=str(row[5]),
+            status=str(row[6]),  # type: ignore[arg-type]
+            result_hash=str(row[7]) if row[7] is not None else None,
+            response=resp_dict,
+            created_at=str(row[9]),
+            expires_at=float(row[10]),
+        )
+
+    def create_action_lifecycle(
+        self,
+        *,
+        crossing_id: str,
+        session_id: str,
+        principal_id: str,
+        canonical_hash: str,
+        idempotency_key: str | None = None,
+        initial_state: ActionLifecycleState = "created",
+        details: dict[str, Any] | None = None,
+    ) -> ActionLifecycleRecord:
+        """Transactionally initialize the lifecycle state machine for an action."""
+        now_ts = utc_now_iso()
+        details_json = canonicalize_json(details or {})
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            row = conn.execute(
+                """
+                SELECT crossing_id, current_state, session_id, principal_id,
+                       canonical_hash, idempotency_key, created_at, updated_at, details_json
+                FROM action_lifecycle WHERE crossing_id = ?;
+                """,
+                (crossing_id,),
+            ).fetchone()
+            if row is not None:
+                conn.execute("COMMIT;")
+                return self._row_to_lifecycle_record(row)
+
+            conn.execute(
+                """
+                INSERT INTO action_lifecycle (
+                    crossing_id, current_state, session_id, principal_id,
+                    canonical_hash, idempotency_key, created_at, updated_at, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    crossing_id,
+                    initial_state,
+                    session_id,
+                    principal_id,
+                    canonical_hash,
+                    idempotency_key,
+                    now_ts,
+                    now_ts,
+                    details_json,
+                ),
+            )
+            tr_id = f"tr_{uuid.uuid4().hex[:16]}"
+            conn.execute(
+                """
+                INSERT INTO action_transitions (
+                    transition_id, crossing_id, from_state,
+                    to_state, transitioned_at, actor_id, reason
+                ) VALUES (?, ?, 'none', ?, ?, ?, 'initial_creation');
+                """,
+                (tr_id, crossing_id, initial_state, now_ts, principal_id),
+            )
+            conn.execute("COMMIT;")
+            get_global_metrics().increment("lifecycle_transitions_total")
+            return ActionLifecycleRecord(
+                crossing_id=crossing_id,
+                current_state=initial_state,
+                session_id=session_id,
+                principal_id=principal_id,
+                canonical_hash=canonical_hash,
+                idempotency_key=idempotency_key,
+                created_at=now_ts,
+                updated_at=now_ts,
+                details=details or {},
+            )
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to create action lifecycle: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_action_lifecycle(self, crossing_id: str) -> ActionLifecycleRecord | None:
+        """Fetch current action lifecycle record for a crossing."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT crossing_id, current_state, session_id, principal_id,
+                       canonical_hash, idempotency_key, created_at, updated_at, details_json
+                FROM action_lifecycle WHERE crossing_id = ?;
+                """,
+                (crossing_id,),
+            ).fetchone()
+            return self._row_to_lifecycle_record(row) if row is not None else None
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch action lifecycle: {exc}") from exc
+        finally:
+            conn.close()
+
+    def transition_action_state(
+        self,
+        crossing_id: str,
+        to_state: ActionLifecycleState,
+        *,
+        actor_id: str,
+        reason: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> ActionLifecycleRecord:
+        """Atomically validate and record a state transition in the action lifecycle."""
+        now_ts = utc_now_iso()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            row = conn.execute(
+                """
+                SELECT crossing_id, current_state, session_id, principal_id,
+                       canonical_hash, idempotency_key, created_at, updated_at, details_json
+                FROM action_lifecycle WHERE crossing_id = ?;
+                """,
+                (crossing_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK;")
+                raise ReceiptError(
+                    f"Action lifecycle record for crossing '{crossing_id}' not found"
+                )
+
+            current_rec = self._row_to_lifecycle_record(row)
+            from_state = current_rec.current_state
+
+            # Validate legal transition
+            try:
+                validate_lifecycle_transition(from_state, to_state, crossing_id=crossing_id)
+            except InvalidStateTransitionError:
+                conn.execute("ROLLBACK;")
+                get_global_metrics().increment("lifecycle_invalid_transitions_blocked")
+                raise
+
+            merged_details = dict(current_rec.details)
+            if details:
+                merged_details.update(details)
+            details_json = canonicalize_json(merged_details)
+
+            conn.execute(
+                """
+                UPDATE action_lifecycle
+                SET current_state = ?, updated_at = ?, details_json = ?
+                WHERE crossing_id = ?;
+                """,
+                (to_state, now_ts, details_json, crossing_id),
+            )
+            tr_id = f"tr_{uuid.uuid4().hex[:16]}"
+            conn.execute(
+                """
+                INSERT INTO action_transitions (
+                    transition_id, crossing_id, from_state,
+                    to_state, transitioned_at, actor_id, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                (tr_id, crossing_id, from_state, to_state, now_ts, actor_id, reason),
+            )
+            conn.execute("COMMIT;")
+            get_global_metrics().increment("lifecycle_transitions_total")
+            return ActionLifecycleRecord(
+                crossing_id=current_rec.crossing_id,
+                current_state=to_state,
+                session_id=current_rec.session_id,
+                principal_id=current_rec.principal_id,
+                canonical_hash=current_rec.canonical_hash,
+                idempotency_key=current_rec.idempotency_key,
+                created_at=current_rec.created_at,
+                updated_at=now_ts,
+                details=merged_details,
+            )
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to transition action state: {exc}") from exc
+        finally:
+            conn.close()
+
+    def list_action_transitions(self, crossing_id: str) -> list[ActionTransitionRecord]:
+        """List all transitions recorded for a crossing in chronological order."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT transition_id, crossing_id, from_state, to_state,
+                       transitioned_at, actor_id, reason
+                FROM action_transitions
+                WHERE crossing_id = ?
+                ORDER BY rowid ASC;
+                """,
+                (crossing_id,),
+            ).fetchall()
+            return [self._row_to_transition_record(r) for r in rows]
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to list action transitions: {exc}") from exc
+        finally:
+            conn.close()
+
+    def register_idempotency_key(
+        self,
+        *,
+        idempotency_key: str,
+        principal_id: str,
+        canonical_hash: str,
+        tool: str,
+        verb: str,
+        crossing_id: str,
+        ttl_seconds: float = 86400.0,
+    ) -> IdempotencyRecord | None:
+        """Register an idempotency key or retrieve existing cached result (Invariant I16).
+
+        Returns:
+            IdempotencyRecord if execution previously completed/failed and can be replayed safely.
+            None if this is a new execution registered as 'in_flight'.
+
+        Raises:
+            IdempotencyConflictError: if the key is reused with a different canonical_hash.
+            IdempotencyInFlightError: if an execution with this key is already running.
+            ReconciliationRequiredError: if the previous execution ended uncertainly.
+        """
+        now = time.time()
+        now_iso = utc_now_iso()
+        expires_at = now + ttl_seconds
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            row = conn.execute(
+                """
+                SELECT idempotency_key, principal_id, canonical_hash, tool, verb,
+                       crossing_id, status, result_hash, response_json, created_at, expires_at
+                FROM idempotency_records
+                WHERE principal_id = ? AND idempotency_key = ?;
+                """,
+                (principal_id, idempotency_key),
+            ).fetchone()
+
+            if row is not None:
+                rec = self._row_to_idempotency_record(row)
+                # 1. Conflict check: canonical action hash must match
+                if rec.canonical_hash != canonical_hash:
+                    conn.execute("ROLLBACK;")
+                    get_global_metrics().increment("idempotency_conflicts")
+                    raise IdempotencyConflictError(
+                        idempotency_key,
+                        principal_id,
+                        f"Action payload mismatch (existing hash {rec.canonical_hash} "
+                        f"!= requested hash {canonical_hash})",
+                    )
+
+                # 2. In-flight check
+                if rec.status == "in_flight":
+                    if rec.is_expired:
+                        # Expired while in flight -> mark reconciliation required
+                        conn.execute(
+                            """
+                            UPDATE idempotency_records SET status = 'reconciliation_required'
+                            WHERE principal_id = ? AND idempotency_key = ?;
+                            """,
+                            (principal_id, idempotency_key),
+                        )
+                        conn.execute("COMMIT;")
+                        get_global_metrics().increment("idempotency_reconciliation_required")
+                        raise ReconciliationRequiredError(
+                            idempotency_key, principal_id, rec.crossing_id
+                        )
+                    conn.execute("ROLLBACK;")
+                    get_global_metrics().increment("idempotency_in_flight_blocks")
+                    raise IdempotencyInFlightError(idempotency_key, principal_id, rec.crossing_id)
+
+                # 3. Uncertain check
+                if rec.status == "reconciliation_required":
+                    conn.execute("ROLLBACK;")
+                    get_global_metrics().increment("idempotency_reconciliation_required")
+                    raise ReconciliationRequiredError(
+                        idempotency_key, principal_id, rec.crossing_id
+                    )
+
+                # 4. Completed or failed -> replay cached result
+                conn.execute("COMMIT;")
+                get_global_metrics().increment("idempotency_cached_hits")
+                return rec
+
+            # Fresh registration: insert as in_flight
+            conn.execute(
+                """
+                INSERT INTO idempotency_records (
+                    idempotency_key, principal_id, canonical_hash, tool, verb,
+                    crossing_id, status, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'in_flight', ?, ?);
+                """,
+                (
+                    idempotency_key,
+                    principal_id,
+                    canonical_hash,
+                    tool,
+                    verb,
+                    crossing_id,
+                    now_iso,
+                    expires_at,
+                ),
+            )
+            conn.execute("COMMIT;")
+            get_global_metrics().increment("idempotency_registered")
+            return None
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to register idempotency key: {exc}") from exc
+        finally:
+            conn.close()
+
+    def get_idempotency_record(
+        self, principal_id: str, idempotency_key: str
+    ) -> IdempotencyRecord | None:
+        """Fetch idempotency record for principal and key if one exists."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT idempotency_key, principal_id, canonical_hash, tool, verb,
+                       crossing_id, status, result_hash, response_json, created_at, expires_at
+                FROM idempotency_records
+                WHERE principal_id = ? AND idempotency_key = ?;
+                """,
+                (principal_id, idempotency_key),
+            ).fetchone()
+            return self._row_to_idempotency_record(row) if row is not None else None
+        except sqlite3.Error as exc:
+            raise ReceiptError(f"Failed to fetch idempotency record: {exc}") from exc
+        finally:
+            conn.close()
+
+    def finalize_idempotency_key(
+        self,
+        *,
+        idempotency_key: str,
+        principal_id: str,
+        crossing_id: str,
+        status: IdempotencyStatus,
+        result_hash: str | None = None,
+        response: dict[str, Any] | None = None,
+    ) -> None:
+        """Transactionally finalize an idempotency record upon completion or failure."""
+        resp_json = canonicalize_json(response) if response is not None else None
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                UPDATE idempotency_records
+                SET status = ?, result_hash = ?, response_json = ?
+                WHERE principal_id = ? AND idempotency_key = ? AND crossing_id = ?;
+                """,
+                (status, result_hash, resp_json, principal_id, idempotency_key, crossing_id),
+            )
+            conn.execute("COMMIT;")
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to finalize idempotency key: {exc}") from exc
+        finally:
+            conn.close()
+
+    def cleanup_expired_idempotency_records(self) -> int:
+        """Purge completed/failed idempotency records whose retention TTL has elapsed."""
+        now = time.time()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            cur = conn.execute(
+                """
+                DELETE FROM idempotency_records
+                WHERE expires_at < ? AND status IN ('completed', 'failed');
+                """,
+                (now,),
+            )
+            deleted = cur.rowcount
+            conn.execute("COMMIT;")
+            return deleted
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to cleanup expired idempotency records: {exc}") from exc
+        finally:
+            conn.close()
+
+    def cleanup_expired_leases(self, now: float | None = None) -> int:
+        """Atomically expire active resource leases whose expiration timestamp has passed."""
+        curr_time = now if now is not None else time.time()
+        now_iso = utc_lease_iso(curr_time)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            cur = conn.execute(
+                "UPDATE resource_leases SET status = 'expired' "
+                "WHERE status = 'active' AND expires_at <= ?;",
+                (now_iso,),
+            )
+            count = cur.rowcount
+            conn.execute("COMMIT;")
+            return count
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to cleanup expired leases: {exc}") from exc
+        finally:
+            conn.close()
+
+    def cleanup_expired_claims(self, now: float | None = None) -> int:
+        """Atomically expire active execution claims whose expiration timestamp has passed."""
+        curr_time = now if now is not None else time.time()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            cur = conn.execute(
+                "UPDATE execution_claims SET status = 'expired' "
+                "WHERE status = 'issued' AND expires_at < ?;",
+                (curr_time,),
+            )
+            count = cur.rowcount
+            conn.execute("COMMIT;")
+            return count
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to cleanup expired execution claims: {exc}") from exc
+        finally:
+            conn.close()
+
+    def validate_database_integrity(self) -> tuple[bool, str]:
+        """Validate SQLite B-tree structure, receipt sequence continuity, and hash chaining."""
+        conn = self._connect()
+        try:
+            # 1. SQLite low-level integrity check
+            check_row = conn.execute("PRAGMA quick_check;").fetchone()
+            if not check_row or check_row[0] != "ok":
+                detail = check_row[0] if check_row else "unknown error"
+                get_global_metrics().increment("storage_integrity_checks_failed")
+                return (False, f"SQLite integrity check failed: {detail}")
+
+            # 2. Receipt sequence and hash chain continuity check
+            rows = conn.execute(
+                "SELECT seq, prev_hash, entry_hash FROM receipts ORDER BY seq ASC;"
+            ).fetchall()
+            expected_seq = 1
+            expected_prev = GENESIS_HASH
+            for row in rows:
+                seq, prev_hash, entry_hash = int(row[0]), str(row[1]), str(row[2])
+                if seq != expected_seq:
+                    get_global_metrics().increment("storage_integrity_checks_failed")
+                    return (
+                        False,
+                        f"Sequence gap in receipts: expected {expected_seq}, found {seq}",
+                    )
+                if prev_hash != expected_prev:
+                    get_global_metrics().increment("storage_integrity_checks_failed")
+                    return (
+                        False,
+                        f"Hash chain break at seq {seq}: "
+                        f"expected prev_hash {expected_prev}, found {prev_hash}",
+                    )
+                expected_seq += 1
+                expected_prev = entry_hash
+
+            get_global_metrics().increment("storage_integrity_checks_passed")
+            return (True, "OK")
+        except sqlite3.Error as exc:
+            get_global_metrics().increment("storage_integrity_checks_failed")
+            return (False, f"Database error during integrity check: {exc}")
+        finally:
+            conn.close()
+
+    def recover_system_state(self) -> dict[str, Any]:
+        """Unified startup recovery reconciling state from any prior crashes or abrupt restarts."""
+        # 1. Stale approvals cleanup
+        recovered_approvals = self.cleanup_expired_approvals()
+
+        # 2. Stale resource leases cleanup
+        recovered_leases = self.cleanup_expired_leases()
+
+        # 3. Stale execution claims cleanup
+        recovered_claims = self.cleanup_expired_claims()
+
+        # 4. In-flight action lifecycles and idempotency records recovery
+        conn = self._connect()
+        recovered_actions = 0
+        recovered_idempotencies = 0
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            in_flight_actions = conn.execute(
+                "SELECT crossing_id, current_state FROM action_lifecycle "
+                "WHERE current_state IN ('executing', 'verification_pending');"
+            ).fetchall()
+            now_iso = utc_now_iso()
+            for cid, st in in_flight_actions:
+                cid_str = str(cid)
+                conn.execute(
+                    "UPDATE action_lifecycle SET current_state = 'reconciliation_required', "
+                    "updated_at = ? WHERE crossing_id = ?;",
+                    (now_iso, cid_str),
+                )
+                tr_id = f"tr_{uuid.uuid4().hex[:16]}"
+                conn.execute(
+                    "INSERT INTO action_transitions "
+                    "(transition_id, crossing_id, from_state, to_state, "
+                    "transitioned_at, actor_id, reason) "
+                    "VALUES (?, ?, ?, 'reconciliation_required', ?, "
+                    "'system:recovery', 'recovered_during_startup');",
+                    (tr_id, cid_str, str(st), now_iso),
+                )
+                recovered_actions += 1
+
+            cur = conn.execute(
+                "UPDATE idempotency_records SET status = 'reconciliation_required' "
+                "WHERE status = 'in_flight';"
+            )
+            recovered_idempotencies = cur.rowcount
+            conn.execute("COMMIT;")
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise ReceiptError(f"Failed to recover in-flight lifecycle state: {exc}") from exc
+        finally:
+            conn.close()
+
+        # 5. Interrupted execution decisions without outcomes
+        recovered_outcomes = self.recover_pending_outcomes()
+
+        # 6. Cleanup leftover checkpoint temp files (.tmp_*)
+        tmp_cleaned = 0
+        parent_dir = self._db_path.parent
+        if parent_dir.exists():
+            for tmp_file in parent_dir.glob(".tmp_*"):
+                with contextlib.suppress(OSError):
+                    tmp_file.unlink()
+                    tmp_cleaned += 1
+
+        get_global_metrics().increment("storage_recoveries_completed")
+
+        return {
+            "approvals_expired": recovered_approvals,
+            "leases_expired": recovered_leases,
+            "claims_expired": recovered_claims,
+            "actions_reconciled": recovered_actions,
+            "idempotency_reconciled": recovered_idempotencies,
+            "outcomes_recovered": len(recovered_outcomes),
+            "temporary_files_cleaned": tmp_cleaned,
+        }
 
 
 def verify_log(

@@ -52,6 +52,12 @@ from actentra_core.identity import (
     get_default_delegation_registry,
     make_local_caller_context,
 )
+from actentra_core.lifecycle import (
+    IdempotencyConflictError,
+    IdempotencyInFlightError,
+    ReconciliationRequiredError,
+)
+from actentra_core.observability import get_global_metrics
 from actentra_core.policy import lint_policy, load_policy_yaml
 from actentra_core.receipts import GENESIS_HASH, SessionRecord, verify_log
 from actentra_core.verdict import Decision, Verdict
@@ -132,8 +138,9 @@ class AppServices:
             self.file_verifier = WorkspaceFileVerifier(self.registry.workspace_root)
         else:
             self.file_verifier = None
-        # Clean up expired approvals upon service startup (idempotent, restart-safe)
-        self.boundary.receipt_store.recover_pending_approvals()
+        # Recover system state upon service startup
+        # (approvals, leases, claims, in-flight lifecycles, pending outcomes)
+        self.boundary.receipt_store.recover_system_state()
         self._crossing_lock = threading.RLock()
 
     def _validate_caller_context(self, caller_context: CallerContext | None) -> None:
@@ -215,19 +222,22 @@ class AppServices:
         """Return runtime health, policy state, and receipt store integrity."""
         db_path = self.boundary.receipt_store.db_path
         pending_list = self.boundary.receipt_store.list_pending_approvals(status="pending")
+        db_integrity_ok, db_msg = self.boundary.receipt_store.validate_database_integrity()
         if full_verify:
             vr = verify_log(db_path, verify_envelopes=True)
             total_records = vr.total_records
-            integrity_ok = vr.ok
+            integrity_ok = vr.ok and db_integrity_ok
             last_hash = vr.last_hash
         else:
             latest = self.boundary.receipt_store.get_latest_record()
             total_records = self.boundary.receipt_store.record_count()
-            integrity_ok = True
+            integrity_ok = db_integrity_ok
             last_hash = latest.entry_hash if latest else GENESIS_HASH
 
         return {
-            "status": "ok",
+            "status": "ok" if db_integrity_ok else "degraded",
+            "db_status": "healthy" if db_integrity_ok else f"corrupt: {db_msg}",
+            "db_integrity_ok": db_integrity_ok,
             "policy_id": self.boundary.engine.policy.policy_id,
             "policy_version": self.boundary.engine.policy.policy_version,
             "mode": self.boundary.engine.policy.mode,
@@ -238,6 +248,14 @@ class AppServices:
             "pending_approvals_count": len(pending_list),
             "registered_executors": self.registry.list_registered_tools(),
         }
+
+    def get_metrics(self) -> dict[str, Any]:
+        """Return operational telemetry, failure counters, and latency measurements."""
+        snapshot = get_global_metrics().snapshot()
+        db_ok, _ = self.boundary.receipt_store.validate_database_integrity()
+        snapshot["storage"]["database_healthy"] = db_ok
+        snapshot["storage"]["database_path"] = str(self.boundary.receipt_store.db_path)
+        return snapshot
 
     # --- 2. Crossing Submission & Lifecycle ---
 
@@ -319,9 +337,8 @@ class AppServices:
                     "canonical_hash": "sha256:" + ("0" * 64),
                     "risk_tags": ["spoofing-attempt"],
                 }
-            if (
-                not caller_context.has_scope("crossings:propose")
-                and not caller_context.has_scope("crossings:submit")
+            if not caller_context.has_scope("crossings:propose") and not caller_context.has_scope(
+                "crossings:submit"
             ):
                 return {
                     "verdict": Verdict.DENY.value,
@@ -348,9 +365,7 @@ class AppServices:
         # Phase 2: Server-controlled session identity and ownership validation
         raw_session_id = data.get("session_id")
         caller_principal = (
-            caller_context.authenticated_identity
-            if caller_context
-            else agent_id_claim
+            caller_context.authenticated_identity if caller_context else agent_id_claim
         )
         if raw_session_id is not None and str(raw_session_id).strip():
             candidate_sid = str(raw_session_id).strip()
@@ -379,8 +394,27 @@ class AppServices:
                     "risk_tags": ["spoofing-attempt", "session-hijack"],
                 }
         else:
-            session_rec = self.create_session_record(caller_context=caller_context)
-            session_id = session_rec.session_id
+            # Phase 7: If idempotent replay without explicit session_id, reuse original session
+            idemp_key_cand = data.get("idempotency_key")
+            existing_idemp_rec = (
+                self.boundary.receipt_store.get_idempotency_record(
+                    caller_principal, str(idemp_key_cand).strip()
+                )
+                if idemp_key_cand
+                else None
+            )
+            if existing_idemp_rec is not None:
+                orig_lf = self.boundary.receipt_store.get_action_lifecycle(
+                    existing_idemp_rec.crossing_id
+                )
+                session_id = (
+                    orig_lf.session_id
+                    if orig_lf is not None
+                    else self.create_session_record(caller_context=caller_context).session_id
+                )
+            else:
+                session_rec = self.create_session_record(caller_context=caller_context)
+                session_id = session_rec.session_id
 
         prov_items = [
             ProvenanceItem(source=p["source"], trust=p["trust"])
@@ -414,6 +448,74 @@ class AppServices:
                 "canonical_hash": "sha256:" + ("0" * 64),
                 "risk_tags": [],
             }
+
+        # Phase 7 (Invariant I16): Durable Idempotency Check & Registration
+        effective_principal = caller_principal or envelope.agent.id
+        if envelope.action.idempotency_key:
+            try:
+                cached_idemp = self.boundary.receipt_store.register_idempotency_key(
+                    idempotency_key=envelope.action.idempotency_key,
+                    principal_id=effective_principal,
+                    canonical_hash=envelope.canonical_hash,
+                    tool=envelope.action.tool,
+                    verb=envelope.action.verb,
+                    crossing_id=envelope.crossing_id,
+                )
+                if cached_idemp is not None:
+                    if cached_idemp.status == "completed":
+                        return {
+                            "verdict": Verdict.ALLOW.value,
+                            "rule_id": "idempotency:cached-completed",
+                            "crossing_id": cached_idemp.crossing_id,
+                            "canonical_hash": cached_idemp.canonical_hash,
+                            "executed": True,
+                            "outcome": {
+                                "status": "success",
+                                "result": cached_idemp.response.get("result")
+                                if cached_idemp.response
+                                else None,
+                            },
+                            "cached": True,
+                        }
+                    elif cached_idemp.status == "failed":
+                        return {
+                            "verdict": Verdict.DENY.value,
+                            "rule_id": "idempotency:cached-failed",
+                            "crossing_id": cached_idemp.crossing_id,
+                            "canonical_hash": cached_idemp.canonical_hash,
+                            "executed": False,
+                            "outcome": {
+                                "status": "failure",
+                                "error": cached_idemp.response.get("error", "Action failed")
+                                if cached_idemp.response
+                                else "Action failed",
+                            },
+                            "cached": True,
+                        }
+            except (
+                IdempotencyConflictError,
+                IdempotencyInFlightError,
+                ReconciliationRequiredError,
+            ) as exc:
+                return {
+                    "verdict": Verdict.HOLD.value,
+                    "error": str(exc),
+                    "code": type(exc).__name__,
+                    "rule_id": f"idempotency:{type(exc).__name__}",
+                    "canonical_hash": envelope.canonical_hash,
+                    "crossing_id": envelope.crossing_id,
+                    "risk_tags": [],
+                }
+
+        # Phase 7: Initialize action lifecycle state machine (CREATED)
+        self.boundary.receipt_store.create_action_lifecycle(
+            crossing_id=envelope.crossing_id,
+            session_id=envelope.session_id,
+            principal_id=effective_principal,
+            canonical_hash=envelope.canonical_hash,
+            idempotency_key=envelope.action.idempotency_key,
+            initial_state="created",
+        )
 
         # Update session and principal taint tracker if this action is untrusted (Phase 2)
         if envelope.max_taint == "untrusted":
@@ -458,6 +560,30 @@ class AppServices:
         resp: dict[str, Any] = decision.to_dict()
         resp["crossing_id"] = envelope.crossing_id
 
+        # Phase 7: Transition action lifecycle based on evaluation verdict
+        if decision.verdict.permits_execution:
+            self.boundary.receipt_store.transition_action_state(
+                envelope.crossing_id,
+                "authorized",
+                actor_id="policy",
+                reason=decision.reason,
+            )
+        elif decision.verdict != Verdict.ASK:
+            self.boundary.receipt_store.transition_action_state(
+                envelope.crossing_id,
+                "failed",
+                actor_id="policy",
+                reason=decision.reason,
+            )
+            if envelope.action.idempotency_key:
+                self.boundary.receipt_store.finalize_idempotency_key(
+                    idempotency_key=envelope.action.idempotency_key,
+                    principal_id=effective_principal,
+                    crossing_id=envelope.crossing_id,
+                    status="failed",
+                    response={"error": decision.reason},
+                )
+
         # Handle ASK
         if decision.verdict == Verdict.ASK:
             self.boundary.receipt_store.add_pending_approval(
@@ -473,6 +599,13 @@ class AppServices:
         if execute and decision.verdict.permits_execution:
             executor = self.registry.get_executor(envelope.action.tool)
             if executor is not None:
+                # Phase 7: Transition to CLAIMED before dispatching execution
+                self.boundary.receipt_store.transition_action_state(
+                    envelope.crossing_id,
+                    "claimed",
+                    actor_id=effective_principal,
+                    reason="claim_issued",
+                )
                 try:
                     exec_result = self._dispatch_and_record(
                         envelope, decision, executor, caller_context=caller_context
@@ -527,6 +660,45 @@ class AppServices:
                 envelope.crossing_id,
             )
 
+        effective_principal = (
+            caller_context.authenticated_identity if caller_context else envelope.agent.id
+        )
+
+        cur_lf = self.boundary.receipt_store.get_action_lifecycle(envelope.crossing_id)
+        if cur_lf is None:
+            self.boundary.receipt_store.create_action_lifecycle(
+                crossing_id=envelope.crossing_id,
+                session_id=envelope.session_id,
+                principal_id=effective_principal,
+                canonical_hash=envelope.canonical_hash,
+                initial_state="claimed",
+            )
+        elif cur_lf.current_state != "claimed":
+            if cur_lf.current_state == "created":
+                self.boundary.receipt_store.transition_action_state(
+                    envelope.crossing_id, "authorized", actor_id="policy", reason="auto_progression"
+                )
+            if (
+                cur_lf.current_state in ("created", "authorized")
+                or cur_lf.current_state == "approved"
+            ):
+                self.boundary.receipt_store.transition_action_state(
+                    envelope.crossing_id,
+                    "claimed",
+                    actor_id=effective_principal,
+                    reason="claim_issued",
+                )
+
+        # Phase 7: Transition to EXECUTING
+        self.boundary.receipt_store.transition_action_state(
+            envelope.crossing_id,
+            "executing",
+            actor_id=effective_principal,
+            reason="gateway_dispatch",
+        )
+        get_global_metrics().increment("executions_dispatched")
+        t0 = time.time()
+
         try:
             result = executor(envelope, decision)
         except Exception as exc:
@@ -542,6 +714,21 @@ class AppServices:
                 error=err_label,
                 evidence_status="locally_observed",
             )
+            self.boundary.receipt_store.transition_action_state(
+                envelope.crossing_id,
+                "failed",
+                actor_id=effective_principal,
+                reason=err_label,
+            )
+            if envelope.action.idempotency_key:
+                self.boundary.receipt_store.finalize_idempotency_key(
+                    idempotency_key=envelope.action.idempotency_key,
+                    principal_id=effective_principal,
+                    crossing_id=envelope.crossing_id,
+                    status="failed",
+                    response={"error": err_label},
+                )
+            get_global_metrics().increment("executions_failed")
             raise
 
         res_hash: str | None = None
@@ -559,6 +746,23 @@ class AppServices:
             result_hash=res_hash,
             evidence_status="locally_observed",
         )
+        self.boundary.receipt_store.transition_action_state(
+            envelope.crossing_id,
+            "succeeded",
+            actor_id=effective_principal,
+            reason="gateway_execution_completed",
+        )
+        if envelope.action.idempotency_key:
+            self.boundary.receipt_store.finalize_idempotency_key(
+                idempotency_key=envelope.action.idempotency_key,
+                principal_id=effective_principal,
+                crossing_id=envelope.crossing_id,
+                status="completed",
+                result_hash=res_hash,
+                response={"result": result, "status": "success"},
+            )
+        get_global_metrics().increment("executions_succeeded")
+        get_global_metrics().record_latency(f"gateway:{envelope.action.tool}", time.time() - t0)
         with contextlib.suppress(Exception):
             ev = build_evidence_record(
                 crossing_id=envelope.crossing_id,
@@ -572,9 +776,7 @@ class AppServices:
         self.boundary.engine.budget_tracker.record_usage(
             envelope,
             principal_id=(
-                caller_context.authenticated_identity
-                if caller_context
-                else envelope.agent.id
+                caller_context.authenticated_identity if caller_context else envelope.agent.id
             ),
         )
         return result
@@ -693,6 +895,24 @@ class AppServices:
                 canonical_hash=res.canonical_hash,
                 session_id=res.session_id,
             )
+            approver = caller_context.principal_id if caller_context else "operator"
+            cur_lf = self.boundary.receipt_store.get_action_lifecycle(crossing_id)
+            if cur_lf:
+                if cur_lf.current_state == "created":
+                    self.boundary.receipt_store.transition_action_state(
+                        crossing_id, "authorized", actor_id="policy", reason="ask_evaluated"
+                    )
+                if cur_lf.current_state in ("created", "authorized"):
+                    self.boundary.receipt_store.transition_action_state(
+                        crossing_id, "approved", actor_id=approver, reason="human_approved"
+                    )
+        else:
+            approver = caller_context.principal_id if caller_context else "operator"
+            cur_lf = self.boundary.receipt_store.get_action_lifecycle(crossing_id)
+            if cur_lf and cur_lf.current_state in ("created", "authorized"):
+                self.boundary.receipt_store.transition_action_state(
+                    crossing_id, "failed", actor_id=approver, reason="human_rejected"
+                )
 
         resp: dict[str, Any] = {
             "crossing_id": crossing_id,
@@ -1318,14 +1538,11 @@ class AppServices:
             auth_id = caller_context.authenticated_identity.lower()
             for r in records:
                 sess = (
-                    self.boundary.receipt_store.get_session(r.session_id)
-                    if r.session_id
-                    else None
+                    self.boundary.receipt_store.get_session(r.session_id) if r.session_id else None
                 )
                 if (
-                    (sess and sess.principal_id.lower() == auth_id)
-                    or caller_context.is_agent_allowed(r.session_id)
-                ):
+                    sess and sess.principal_id.lower() == auth_id
+                ) or caller_context.is_agent_allowed(r.session_id):
                     filtered_records.append(r)
             records = filtered_records
             total = len(records)
@@ -2072,11 +2289,7 @@ class AppServices:
         ttl_seconds: float = 3600.0,
     ) -> SessionRecord:
         """Create a server-controlled session record bound to authenticated principal."""
-        principal_id = (
-            caller_context.authenticated_identity
-            if caller_context
-            else "local_operator"
-        )
+        principal_id = caller_context.authenticated_identity if caller_context else "local_operator"
         if not session_id:
             session_id = f"sess-{uuid.uuid4().hex[:16]}"
         policy_version = self.boundary.engine.policy.policy_version
@@ -2229,8 +2442,7 @@ class AppServices:
             existing = self.boundary.receipt_store.get_session(session_id)
             if (
                 existing
-                and existing.principal_id.lower()
-                != caller_context.authenticated_identity.lower()
+                and existing.principal_id.lower() != caller_context.authenticated_identity.lower()
             ):
                 raise IdentitySecurityError(
                     f"Principal '{caller_context.principal_id}' cannot revoke session "

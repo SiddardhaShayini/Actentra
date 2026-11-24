@@ -478,9 +478,7 @@ def create_key_record(
 ) -> KeyRecord:
     """Helper to construct a KeyRecord from public key bytes or string."""
     pem_str = (
-        public_key_pem.decode("utf-8")
-        if isinstance(public_key_pem, bytes)
-        else public_key_pem
+        public_key_pem.decode("utf-8") if isinstance(public_key_pem, bytes) else public_key_pem
     )
     loaded = serialization.load_pem_public_key(pem_str.encode("utf-8"))
     if not isinstance(loaded, Ed25519PublicKey):
@@ -814,9 +812,7 @@ def verify_audit_trail(
         else:
             ok_key, key_err = ring.validate_key_at_time(cp.key_id, cp.created_at)
             if not ok_key:
-                errors.append(
-                    f"Checkpoint {cp.checkpoint_id} key validation failed: {key_err}"
-                )
+                errors.append(f"Checkpoint {cp.checkpoint_id} key validation failed: {key_err}")
                 if "revoked" in key_err.lower():
                     divergence = divergence or "REVOKED_KEY"
                 elif "expired" in key_err.lower():

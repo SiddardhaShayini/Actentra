@@ -400,12 +400,14 @@ def test_successful_tls_remote_server_startup_and_https_requests(tmp_path: Path)
 
         # 2. POST /v1/crossings over HTTPS with valid Bearer token
         conn = http.client.HTTPSConnection("127.0.0.1", port, context=client_ctx, timeout=5.0)
-        req_body = json.dumps({
-            "tool": "calc",
-            "verb": "read",
-            "resource": "tool:calc",
-            "params": {"a": 10, "b": 20},
-        })
+        req_body = json.dumps(
+            {
+                "tool": "calc",
+                "verb": "read",
+                "resource": "tool:calc",
+                "params": {"a": 10, "b": 20},
+            }
+        )
         conn.request(
             "POST",
             "/v1/crossings",

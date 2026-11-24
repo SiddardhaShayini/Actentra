@@ -36,6 +36,7 @@ from actentra_core.envelope import (
 )
 from actentra_core.evidence import EvidenceTier, build_evidence_record
 from actentra_core.identity import CallerContext
+from actentra_core.observability import get_global_metrics
 from actentra_core.observations import ObservationRecord, build_observation
 from actentra_core.policy import PolicyEngine, PolicyPack, load_policy_file
 from actentra_core.receipts import ReceiptError, ReceiptStore
@@ -154,6 +155,8 @@ class Boundary:
         self._lock = threading.Lock()
         self._approvals: dict[tuple[str, str], ApprovalGrant] = {}
         self._session_taints: dict[str, str] = {}
+        # Phase 7: Automatically recover and reconcile system state on startup
+        self._store.recover_system_state()
 
     @classmethod
     def from_files(
@@ -628,6 +631,42 @@ class Boundary:
             )
             raise ActionBlockedError(hold_decision, "INVALID") from exc
 
+        # Phase 7 (Invariant I16): Durable Idempotency Check & Registration
+        effective_principal_id = ctx.authenticated_identity if ctx else envelope.agent.id
+        if idempotency_key:
+            cached_idemp = self._store.register_idempotency_key(
+                idempotency_key=idempotency_key,
+                principal_id=effective_principal_id,
+                canonical_hash=envelope.canonical_hash,
+                tool=envelope.action.tool,
+                verb=envelope.action.verb,
+                crossing_id=envelope.crossing_id,
+            )
+            if cached_idemp is not None:
+                if cached_idemp.status == "completed":
+                    if cached_idemp.response and "result" in cached_idemp.response:
+                        return cached_idemp.response["result"]
+                    return None
+                elif cached_idemp.status == "failed":
+                    err_msg = (
+                        cached_idemp.response.get("error", "Action previously failed")
+                        if cached_idemp.response
+                        else "Action previously failed"
+                    )
+                    raise ActentraError(
+                        f"Cached failure for idempotency key '{idempotency_key}': {err_msg}"
+                    )
+
+        # Phase 7: Initialize action lifecycle state machine (CREATED)
+        self._store.create_action_lifecycle(
+            crossing_id=envelope.crossing_id,
+            session_id=envelope.session_id,
+            principal_id=effective_principal_id,
+            canonical_hash=envelope.canonical_hash,
+            idempotency_key=idempotency_key,
+            initial_state="created",
+        )
+
         # Multi-agent coordination conflict check:
         # mutating operations check for active lease conflicts
         if envelope.action.verb in ("write", "delete", "exec", "admin"):
@@ -649,6 +688,20 @@ class Boundary:
                     canonical_hash=envelope.canonical_hash,
                 )
                 self._store.record_decision(envelope, deny_decision)
+                self._store.transition_action_state(
+                    envelope.crossing_id,
+                    "failed",
+                    actor_id="policy",
+                    reason="coordination:resource-locked",
+                )
+                if idempotency_key:
+                    self._store.finalize_idempotency_key(
+                        idempotency_key=idempotency_key,
+                        principal_id=effective_principal_id,
+                        crossing_id=envelope.crossing_id,
+                        status="failed",
+                        response={"error": "coordination:resource-locked"},
+                    )
                 raise ActionBlockedError(deny_decision, envelope.crossing_id)
 
         # Update session and principal taint tracker if this action is untrusted
@@ -660,6 +713,15 @@ class Boundary:
             )
 
         decision = self._engine.evaluate(envelope)
+        get_global_metrics().increment("crossings_total")
+        if decision.verdict == Verdict.ALLOW:
+            get_global_metrics().increment("crossings_allowed")
+        elif decision.verdict == Verdict.DENY:
+            get_global_metrics().increment("crossings_denied")
+        elif decision.verdict == Verdict.ASK:
+            get_global_metrics().increment("crossings_asked")
+        elif decision.verdict == Verdict.HOLD:
+            get_global_metrics().increment("crossings_held")
 
         # Handle ASK escalation bound to (session_id, canonical_hash) (I4).
         if decision.verdict == Verdict.ASK:
@@ -670,6 +732,18 @@ class Boundary:
                 except Exception:
                     approved = False
             if approved:
+                self._store.transition_action_state(
+                    envelope.crossing_id,
+                    "authorized",
+                    actor_id="policy",
+                    reason=decision.reason,
+                )
+                self._store.transition_action_state(
+                    envelope.crossing_id,
+                    "approved",
+                    actor_id="human",
+                    reason="human_approved",
+                )
                 decision = Decision(
                     verdict=Verdict.ALLOW,
                     rule_id=f"{decision.rule_id}:approved",
@@ -681,6 +755,23 @@ class Boundary:
                     shadow=decision.shadow,
                     would_verdict=decision.would_verdict,
                 )
+            else:
+                self._store.record_decision(envelope, decision)
+                self._store.transition_action_state(
+                    envelope.crossing_id,
+                    "failed",
+                    actor_id="policy",
+                    reason="ask_unapproved",
+                )
+                if idempotency_key:
+                    self._store.finalize_idempotency_key(
+                        idempotency_key=idempotency_key,
+                        principal_id=effective_principal_id,
+                        crossing_id=envelope.crossing_id,
+                        status="failed",
+                        response={"error": "ask_unapproved"},
+                    )
+                raise ActionBlockedError(decision, envelope.crossing_id)
 
         # I5: No action may execute unless its decision record is durable.
         try:
@@ -694,10 +785,48 @@ class Boundary:
                 canonical_hash=envelope.canonical_hash,
                 risk_tags=decision.risk_tags,
             )
+            self._store.transition_action_state(
+                envelope.crossing_id,
+                "failed",
+                actor_id="kernel",
+                reason="receipt_unavailable",
+            )
+            if idempotency_key:
+                self._store.finalize_idempotency_key(
+                    idempotency_key=idempotency_key,
+                    principal_id=effective_principal_id,
+                    crossing_id=envelope.crossing_id,
+                    status="failed",
+                    response={"error": "receipt_unavailable"},
+                )
             raise ActionBlockedError(hold_decision, envelope.crossing_id) from exc
 
         if not decision.verdict.permits_execution:
+            self._store.transition_action_state(
+                envelope.crossing_id,
+                "failed",
+                actor_id="policy",
+                reason=decision.reason,
+            )
+            if idempotency_key:
+                self._store.finalize_idempotency_key(
+                    idempotency_key=idempotency_key,
+                    principal_id=effective_principal_id,
+                    crossing_id=envelope.crossing_id,
+                    status="failed",
+                    response={"error": decision.reason},
+                )
             raise ActionBlockedError(decision, envelope.crossing_id)
+
+        # Transition to authorized (if not already transitioned via approval)
+        cur_lf = self._store.get_action_lifecycle(envelope.crossing_id)
+        if cur_lf and cur_lf.current_state == "created":
+            self._store.transition_action_state(
+                envelope.crossing_id,
+                "authorized",
+                actor_id="policy",
+                reason=decision.reason,
+            )
 
         # Record warrant consumption if registry is configured
         if self._warrant_registry is not None and warrant_obj is not None:
@@ -766,10 +895,7 @@ class Boundary:
         effective_expected_digest = postcondition_expected_digest
 
         if policy_post_claim:
-            if (
-                postcondition_claim is not None
-                and postcondition_claim != policy_post_claim
-            ):
+            if postcondition_claim is not None and postcondition_claim != policy_post_claim:
                 err_msg = (
                     f"Postcondition claim substitution rejected: policy requires "
                     f"'{policy_post_claim}', caller requested '{postcondition_claim}'"
@@ -844,9 +970,7 @@ class Boundary:
         principal_id = ctx.authenticated_identity if ctx else envelope.agent.id
         executor_id = getattr(self._verifier, "verifier_id", "in-process-executor")
         approval_id = (
-            f"approval:{envelope.crossing_id}"
-            if decision.rule_id.endswith(":approved")
-            else None
+            f"approval:{envelope.crossing_id}" if decision.rule_id.endswith(":approved") else None
         )
         post_specs = [validated_postcondition] if validated_postcondition else []
 
@@ -864,10 +988,7 @@ class Boundary:
             expected_result_constraints=decision.constraints.get("expected_result", {}),
         )
 
-        appr_or_war = (
-            approval_id
-            or (f"warrant:{warrant_obj.warrant_id}" if warrant_obj else None)
-        )
+        appr_or_war = approval_id or (f"warrant:{warrant_obj.warrant_id}" if warrant_obj else None)
         claim = self._store.issue_execution_claim(
             crossing_id=envelope.crossing_id,
             executor_principal_id=principal_id,
@@ -876,6 +997,21 @@ class Boundary:
             approval_or_warrant_id=appr_or_war,
             context_hash=exec_ctx.context_hash,
         )
+        self._store.transition_action_state(
+            envelope.crossing_id,
+            "claimed",
+            actor_id=principal_id,
+            reason="execution_claim_issued",
+        )
+
+        self._store.transition_action_state(
+            envelope.crossing_id,
+            "executing",
+            actor_id=principal_id,
+            reason="dispatching_execution",
+        )
+        get_global_metrics().increment("executions_dispatched")
+        t0 = time.time()
 
         try:
             result = fn(envelope, decision)
@@ -901,6 +1037,21 @@ class Boundary:
                 error=err_label,
                 evidence_status="locally_observed",
             )
+            self._store.transition_action_state(
+                envelope.crossing_id,
+                "failed",
+                actor_id=principal_id,
+                reason=err_label,
+            )
+            if idempotency_key:
+                self._store.finalize_idempotency_key(
+                    idempotency_key=idempotency_key,
+                    principal_id=effective_principal_id,
+                    crossing_id=envelope.crossing_id,
+                    status="failed",
+                    response={"error": err_label},
+                )
+            get_global_metrics().increment("executions_failed")
             raise
 
         result_hash: str | None = None
@@ -930,10 +1081,33 @@ class Boundary:
                 result_hash=result_hash,
                 evidence_status="locally_observed",
             )
+            self._store.transition_action_state(
+                envelope.crossing_id,
+                "succeeded",
+                actor_id=principal_id,
+                reason="execution_completed",
+            )
+            if idempotency_key:
+                self._store.finalize_idempotency_key(
+                    idempotency_key=idempotency_key,
+                    principal_id=effective_principal_id,
+                    crossing_id=envelope.crossing_id,
+                    status="completed",
+                    result_hash=result_hash,
+                    response={"result": result, "status": "success"},
+                )
+            get_global_metrics().increment("executions_succeeded")
+            get_global_metrics().record_latency(f"tool:{envelope.action.tool}", time.time() - t0)
             self._engine.budget_tracker.record_usage(envelope)
             return result
 
         # Postcondition verification requested: finalize outcome strictly after verification
+        self._store.transition_action_state(
+            envelope.crossing_id,
+            "verification_pending",
+            actor_id=principal_id,
+            reason="verifying_postcondition",
+        )
         if self._verifier is None:
             with contextlib.suppress(Exception):
                 self._store.consume_execution_claim(
@@ -958,6 +1132,22 @@ class Boundary:
                 reason="postcondition_unverified",
                 evidence_status="unknown",
             )
+            self._store.transition_action_state(
+                envelope.crossing_id,
+                "unknown",
+                actor_id=principal_id,
+                reason="postcondition_unverified",
+            )
+            if idempotency_key:
+                self._store.finalize_idempotency_key(
+                    idempotency_key=idempotency_key,
+                    principal_id=effective_principal_id,
+                    crossing_id=envelope.crossing_id,
+                    status="reconciliation_required",
+                    result_hash=result_hash,
+                    response={"status": "unknown"},
+                )
+            get_global_metrics().increment("executions_unknown")
             if raise_on_postcondition_failure:
                 raise PostconditionFailedError(
                     None,
@@ -1029,6 +1219,23 @@ class Boundary:
                 evidence_status="externally_verified",
                 observation=obs,
             )
+            self._store.transition_action_state(
+                envelope.crossing_id,
+                "succeeded",
+                actor_id=obs.verifier_id,
+                reason="postcondition_verified",
+            )
+            if idempotency_key:
+                self._store.finalize_idempotency_key(
+                    idempotency_key=idempotency_key,
+                    principal_id=effective_principal_id,
+                    crossing_id=envelope.crossing_id,
+                    status="completed",
+                    result_hash=result_hash,
+                    response={"result": result, "status": "success"},
+                )
+            get_global_metrics().increment("executions_succeeded")
+            get_global_metrics().record_latency(f"tool:{envelope.action.tool}", time.time() - t0)
             # Update session and principal cumulative budgets only on verified success
             self._engine.budget_tracker.record_usage(
                 envelope,
@@ -1075,10 +1282,7 @@ class Boundary:
                     evidence_id=obs.observation_id,
                     verification_status="refuted",
                 )
-            err_msg = (
-                f"Postcondition refuted: claim '{target_claim}' on resource "
-                f"'{target_res}'"
-            )
+            err_msg = f"Postcondition refuted: claim '{target_claim}' on resource '{target_res}'"
             if obs.error:
                 err_msg += f" ({obs.error})"
             self._store.record_outcome(
@@ -1093,6 +1297,21 @@ class Boundary:
                 evidence_status="locally_observed",
                 observation=obs,
             )
+            self._store.transition_action_state(
+                envelope.crossing_id,
+                "failed",
+                actor_id=obs.verifier_id,
+                reason="postcondition_refuted",
+            )
+            if idempotency_key:
+                self._store.finalize_idempotency_key(
+                    idempotency_key=idempotency_key,
+                    principal_id=effective_principal_id,
+                    crossing_id=envelope.crossing_id,
+                    status="failed",
+                    response={"error": "postcondition_refuted"},
+                )
+            get_global_metrics().increment("executions_failed")
             if raise_on_postcondition_failure:
                 raise PostconditionFailedError(obs, "failure", err_msg)
             return result
@@ -1111,8 +1330,7 @@ class Boundary:
                     verification_status=status_label,
                 )
             err_msg = (
-                f"Postcondition verification status is '{status_label}' for claim "
-                f"'{target_claim}'"
+                f"Postcondition verification status is '{status_label}' for claim '{target_claim}'"
             )
             if obs.error:
                 err_msg += f": {obs.error}"
@@ -1129,6 +1347,22 @@ class Boundary:
                 evidence_status=ev_status,
                 observation=obs,
             )
+            self._store.transition_action_state(
+                envelope.crossing_id,
+                "unknown",
+                actor_id=obs.verifier_id,
+                reason=f"postcondition_{status_label}",
+            )
+            if idempotency_key:
+                self._store.finalize_idempotency_key(
+                    idempotency_key=idempotency_key,
+                    principal_id=effective_principal_id,
+                    crossing_id=envelope.crossing_id,
+                    status="reconciliation_required",
+                    result_hash=result_hash,
+                    response={"status": "unknown", "error": obs.error},
+                )
+            get_global_metrics().increment("executions_unknown")
             if raise_on_postcondition_failure:
                 raise PostconditionFailedError(obs, "unknown", err_msg)
             return result
@@ -1173,9 +1407,7 @@ class Boundary:
                 claim = "digest_match"
                 content = params.get("content")
                 expected_dig = (
-                    compute_content_digest(content)
-                    if isinstance(content, (str, bytes))
-                    else None
+                    compute_content_digest(content) if isinstance(content, (str, bytes)) else None
                 )
             elif verb == "delete" or tool == "fs.delete":
                 claim = "absent"

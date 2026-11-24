@@ -41,10 +41,7 @@ class ContextError(ValueError):
 
 def _canonicalize_value(val: Any) -> Any:
     if isinstance(val, dict):
-        return {
-            canonicalize_unicode(k).strip(): _canonicalize_value(v)
-            for k, v in val.items()
-        }
+        return {canonicalize_unicode(k).strip(): _canonicalize_value(v) for k, v in val.items()}
     if isinstance(val, (list, tuple)):
         return [_canonicalize_value(v) for v in val]
     if isinstance(val, str):
@@ -137,8 +134,7 @@ def validate_postcondition_semantics(
     # Strict rule 2: Delete operations must verify resource absence
     if strict and (clean_verb == "delete" or clean_tool == "fs.delete") and clean_claim != "absent":
         raise ContextError(
-            f"Invalid postcondition claim {clean_claim!r} for delete operation; "
-            f"expected 'absent'"
+            f"Invalid postcondition claim {clean_claim!r} for delete operation; expected 'absent'"
         )
 
     # Derive expected digest from params['content'] if not explicitly passed
@@ -188,9 +184,7 @@ def compute_context_hash(
             canonicalize_unicode(approval_id).strip() if approval_id is not None else None
         ),
         "policy_version": canonicalize_unicode(policy_version).strip(),
-        "required_postconditions": [
-            _canonicalize_value(p) for p in required_postconditions
-        ],
+        "required_postconditions": [_canonicalize_value(p) for p in required_postconditions],
         "expected_result_constraints": _canonicalize_value(expected_result_constraints),
     }
     return hash_canonical(payload)

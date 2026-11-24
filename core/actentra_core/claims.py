@@ -63,20 +63,14 @@ def compute_claim_hash(
             else None
         ),
         "result_digest": (
-            canonicalize_unicode(result_digest).strip()
-            if result_digest is not None
-            else None
+            canonicalize_unicode(result_digest).strip() if result_digest is not None else None
         ),
         "evidence_id": (
-            canonicalize_unicode(evidence_id).strip()
-            if evidence_id is not None
-            else None
+            canonicalize_unicode(evidence_id).strip() if evidence_id is not None else None
         ),
         "verification_status": canonicalize_unicode(verification_status).strip().lower(),
         "context_hash": (
-            canonicalize_unicode(context_hash).strip()
-            if context_hash is not None
-            else None
+            canonicalize_unicode(context_hash).strip() if context_hash is not None else None
         ),
     }
     return hash_canonical(payload)

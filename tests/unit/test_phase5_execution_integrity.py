@@ -298,9 +298,7 @@ def test_external_outcome_requires_claim(tmp_path: Path) -> None:
     cid = submit_res["crossing_id"]
     assert submit_res["verdict"] == "allow"
 
-    res = services.record_external_outcome(
-        cid, status="success", claim_id=None, require_claim=True
-    )
+    res = services.record_external_outcome(cid, status="success", claim_id=None, require_claim=True)
     assert "error" in res
     assert res.get("code") == "claim_required"
 

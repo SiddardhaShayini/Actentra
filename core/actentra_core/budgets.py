@@ -316,9 +316,8 @@ class SessionBudgetTracker:
                     p_usage.write_bytes_count += bytes_written
                 delta_bytes = bytes_written
             elif isinstance(envelope.action.params, dict):
-                raw_data = (
-                    envelope.action.params.get("content")
-                    or envelope.action.params.get("data")
+                raw_data = envelope.action.params.get("content") or envelope.action.params.get(
+                    "data"
                 )
                 if isinstance(raw_data, (str, bytes)):
                     wb = len(raw_data)

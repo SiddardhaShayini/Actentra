@@ -73,9 +73,7 @@ rules:
     store = ReceiptStore(db_path)
 
     for i in range(1, (count // 2) + 1):
-        env = build_envelope(
-            tool="admin.exec", verb="exec", resource=f"service:restart:{i}"
-        )
+        env = build_envelope(tool="admin.exec", verb="exec", resource=f"service:restart:{i}")
         dec = engine.evaluate(env)
         store.record_decision(env, dec)
         store.record_outcome(
@@ -117,9 +115,7 @@ def test_reproduce_chain_rewrite_attack_and_external_checkpoint_detection(
     # 2. ATTACK: Attacker with SQLite editor access modifies seq=1 and recomputes the SHA-256 chain
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute(
-            "UPDATE receipts SET reason = 'Fake administrative override' WHERE seq = 1;"
-        )
+        conn.execute("UPDATE receipts SET reason = 'Fake administrative override' WHERE seq = 1;")
         # Recompute SHA-256 chain for all rows
         rows = conn.execute(
             "SELECT seq, record_type, crossing_id, session_id, canonical_hash, "
@@ -552,14 +548,10 @@ def test_concurrent_receipt_creation_and_checkpointing(tmp_path: Path) -> None:
         for _ in range(5):
             time.sleep(0.03)
             with contextlib.suppress(CheckpointError):
-                store.create_external_checkpoint(
-                    priv_pem, anchor=anchor, key_ring=ring
-                )
+                store.create_external_checkpoint(priv_pem, anchor=anchor, key_ring=ring)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers + 1) as executor:
-        futures = [
-            executor.submit(worker_record, wid) for wid in range(num_workers)
-        ]
+        futures = [executor.submit(worker_record, wid) for wid in range(num_workers)]
         cp_future = executor.submit(worker_checkpoint)
         for f in futures:
             f.result()

@@ -68,8 +68,7 @@ def validate_certificate(cert_path: Path) -> x509.Certificate:
         )
     if now > cert.not_valid_after_utc:
         raise ValueError(
-            f"TLS certificate in {cert_path} has expired on "
-            f"{cert.not_valid_after_utc.isoformat()}"
+            f"TLS certificate in {cert_path} has expired on {cert.not_valid_after_utc.isoformat()}"
         )
     return cert
 
@@ -199,7 +198,7 @@ ROUTE_SCOPE_MATRIX: dict[tuple[str, str], tuple[str, ...]] = {
     ("GET", "/v1/delegations/*"): ("delegations:read",),
     ("GET", "/v1/sessions"): ("sessions:read",),
     ("GET", "/v1/sessions/*"): ("sessions:read",),
-
+    ("GET", "/v1/metrics"): ("system:metrics", "metrics:read", "operator:access"),
     # POST routes (state-mutating action authorization)
     ("POST", "/v1/crossings"): ("crossings:submit", "crossings:propose", "crossings:evaluate"),
     ("POST", "/v1/crossings/*/approve"): ("crossings:approve", "approvals:write"),
@@ -219,7 +218,6 @@ ROUTE_SCOPE_MATRIX: dict[tuple[str, str], tuple[str, ...]] = {
     ("POST", "/v1/unfreeze"): ("system:unfreeze",),
     ("POST", "/v1/delegations"): ("delegations:create",),
     ("POST", "/v1/sessions"): ("sessions:create",),
-
     # DELETE routes
     ("DELETE", "/v1/trace/links/*"): ("trace:delete",),
     ("DELETE", "/v1/delegations/*"): ("delegations:revoke",),
@@ -340,9 +338,7 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         server_obj = getattr(self, "server", None)
         raw_proxies: Any = getattr(server_obj, "trusted_proxies", frozenset())
         trusted_proxies = (
-            raw_proxies
-            if isinstance(raw_proxies, (set, frozenset, tuple, list))
-            else frozenset()
+            raw_proxies if isinstance(raw_proxies, (set, frozenset, tuple, list)) else frozenset()
         )
         if remote_ip in trusted_proxies and hasattr(self, "headers") and self.headers:
             xff = self.headers.get("X-Forwarded-For")
@@ -396,8 +392,10 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
             raw_mode if isinstance(raw_mode, (DeploymentMode, str)) else DeploymentMode.LOCAL
         )
 
-        if protocol == "HTTP/1.1" and not host_hdr and (
-            deployment_mode != DeploymentMode.LOCAL or allowed
+        if (
+            protocol == "HTTP/1.1"
+            and not host_hdr
+            and (deployment_mode != DeploymentMode.LOCAL or allowed)
         ):
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
@@ -797,6 +795,10 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
 
         if path == "/health":
             self._send_json(HTTPStatus.OK, services.get_health())
+            return
+
+        if path == "/v1/metrics":
+            self._send_json(HTTPStatus.OK, services.get_metrics())
             return
 
         if path == "/v1/crossings/pending":
@@ -2011,9 +2013,7 @@ class ActentraHTTPServer(ThreadingHTTPServer):
     ) -> None:
         host = server_address[0]
         mode = (
-            DeploymentMode(deployment_mode)
-            if isinstance(deployment_mode, str)
-            else deployment_mode
+            DeploymentMode(deployment_mode) if isinstance(deployment_mode, str) else deployment_mode
         )
         effective_token = auth_token or os.environ.get("ACTENTRA_GATEWAY_TOKEN")
         is_remote_allowed = (
@@ -2266,7 +2266,9 @@ def serve_http(
         request_timeout=request_timeout,
     )
     scheme = "https" if server.is_tls else "http"
-    print(f"Actentra Gateway serving on {scheme}://{host}:{port} (Console: {scheme}://{host}:{port}/ui)")
+    print(
+        f"Actentra Gateway serving on {scheme}://{host}:{port} (Console: {scheme}://{host}:{port}/ui)"
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
