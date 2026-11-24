@@ -184,3 +184,64 @@ Actentra is designed for local-first, low-overhead operation on resource-constra
   - Read endpoints enforce object-level authorization: non-operator callers can only inspect pending approvals, receipts, and sessions belonging to their own identity.
   - Action parameters in pending approvals are automatically redacted (`{"_redacted": "UNAUTHORIZED_RESOURCE_ACCESS"}`) for non-owner viewers.
   - Internal `AppServices` methods replicate all route authorization checks, preventing internal direct-call bypasses.
+
+### 8. Remote Gateway & Transport Security Architecture (Phase 3 Hardening)
+- **Mandatory TLS 1.2+ Transport:**
+  - Remote and private-network bindings unconditionally refuse plaintext HTTP at startup, requiring valid X.509 server certificates and private keys.
+  - Forward-secret AEAD ciphers (`ECDHE+AESGCM`, `ECDHE+CHACHA20`) and TLS compression disabled (`OP_NO_COMPRESSION`).
+  - Mutual TLS (mTLS) with client certificate verification against configured trusted CA bundles.
+- **Anti-Replay & Nonce Tracking:**
+  - Enforces sliding-window single-use nonces (`X-Actentra-Nonce`) and timestamp skew validation (`X-Actentra-Timestamp` within +/-300s).
+- **Transport Hardening & Body Bounds:**
+  - 2 MiB bound on HTTP request bodies (`HTTP 413 Payload Too Large`).
+  - Rejection of conflicting `Transfer-Encoding` / `Content-Length` headers (HTTP request smuggling mitigation).
+  - Loopback host and allowed Host header enforcement preventing DNS rebinding.
+
+### 9. Executor Boundary Hardening (Phase 4 Hardening)
+- **Filesystem Executor Isolation:**
+  - Strict path canonicalization on Windows, eliminating Alternate Data Streams, 8.3 short names, and traversal tokens.
+  - Open file descriptor realpath verification against workspace boundaries before read/write operations to eliminate symlink and junction TOCTOU attacks.
+  - Atomic file writing via temporary file creation within workspace boundaries and atomic rename/replacement.
+- **SQLite Engine Authorization:**
+  - SQLite authorizer callbacks (`sqlite3.set_authorizer`) enforce table-level permissions across direct queries, JOINs, CTEs, subqueries, and triggers.
+  - Unconditional blocking of `ATTACH`, `DETACH`, `PRAGMA`, and schema DDL mutations.
+- **HTTP SSRF Defense:**
+  - Pre-connect DNS lookup and IP validation blocking private subnets (RFC1918), loopback, and cloud metadata (`169.254.169.254`).
+  - Strict redirect validation (`SSRFSafeRedirectHandler`) evaluating every redirect hop against SSRF rules.
+
+### 10. Execution Integrity & Outcome Verification (Phase 5 Hardening)
+- **Authorized Execution Context:**
+  - Binds action identity, target resource, authenticated principal, executor identity, approval identity, policy version, and required postconditions into a canonical execution context.
+- **Policy-Mandated Postconditions:**
+  - Rejection of postcondition weakening or substitution (e.g. replacing `digest_match` with generic `exists` under strict policies).
+  - Unconditional rejection of ambiguous string claims (`verified`, `ok`, `true`).
+- **External Outcome Verification:**
+  - Mandatory `ExecutionClaim` required for reporting external effects as completed, bound to action hash, executor principal, approval/warrant ID, and result digest.
+  - Single-use claim consumption rejecting cross-principal use and replay.
+  - Prevention of false success promotion; ambiguous outcomes preserved as `unknown`.
+
+### 11. Immutable Audit Architecture & Checkpointing (Phase 6 Hardening)
+- **Cryptographic Audit Log:**
+  - Append-only SQLite WAL receipts with SHA-256 hash chaining (`prev_hash` -> `entry_hash`).
+  - Dual-layer context verification checking both log hash integrity and execution context parameters.
+- **Externally Anchored Ed25519 Checkpoints:**
+  - Monotonic sequence numbers (`checkpoint_seq`), unique IDs, and previous-checkpoint hash chaining (`prev_checkpoint_hash`).
+  - Off-host key custody with `KeyRing` rotation and revocation tracking.
+  - Cross-verification tooling (`verify_audit_trail`, `verify_audit_bundle`) detecting `CHAIN_REWRITE`, `ROLLBACK`, `TAIL_TRUNCATION`, and `REVOKED_KEY`.
+
+### 12. Production Reliability, Lifecycle State Machine & Durable Idempotency (Phase 7 & 8)
+- **Action Execution Lifecycle State Machine:**
+  - Transactional state machine enforcing legal transitions (`created` -> `authorized` -> `approved` -> `claimed` -> `executing` -> `verification_pending` -> `succeeded`/`failed`/`unknown`/`reconciliation_required`).
+  - Immutable historical state transition audit log in `action_transitions`.
+- **Durable Idempotency Engine:**
+  - Primary key `(principal_id, idempotency_key)` bound to canonical action hash and tool invocation.
+  - Cached result return on completed replays without tool re-dispatch.
+  - `IdempotencyConflictError` on parameter tampering and `IdempotencyInFlightError` on concurrent execution.
+- **Unified Startup Crash Recovery:**
+  - `recover_system_state()` reconciles in-flight action lifecycles, expired leases, dangling claims, and unfinalized decisions to known safe states upon gateway or SDK initialization.
+- **Observability & Operational Telemetry:**
+  - `OperationalMetrics` collector tracking throughput counters, failure counts, and latency percentiles (p50, p95, p99, max).
+  - Data sanitization via `sanitize_operational_data()` scrubbing secrets and tokens.
+  - Exposed via `GET /v1/metrics` and `actentra metrics` CLI.
+- **Agent Integration Parity:**
+  - Full caller context and idempotency propagation through `MCPStdioProxy`, `FunctionCallAdapter`, and `LangChainToolWrapper`.

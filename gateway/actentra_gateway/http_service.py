@@ -179,6 +179,8 @@ ROUTE_SCOPE_MATRIX: dict[tuple[str, str], tuple[str, ...]] = {
     ("GET", "/ui"): ("console:access", "operator:access", "system:admin"),
     ("GET", "/"): ("console:access", "operator:access", "system:admin"),
     ("GET", "/v1/crossings/pending"): ("approvals:read", "crossings:read"),
+    ("GET", "/v1/crossings/*/lifecycle"): ("crossings:read", "approvals:read"),
+    ("GET", "/v1/crossings/*/transitions"): ("crossings:read", "approvals:read"),
     ("GET", "/v1/crossings/*"): ("approvals:read", "crossings:read"),
     ("GET", "/v1/receipts"): ("receipts:read",),
     ("GET", "/v1/verify"): ("audit:verify", "receipts:read"),
@@ -811,12 +813,41 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 self._send_forbidden(str(exc))
             return
 
+        if path.startswith("/v1/crossings/") and path.endswith("/lifecycle"):
+            cid = path[len("/v1/crossings/") : -len("/lifecycle")]
+            try:
+                detail = services.get_action_lifecycle(cid, caller_context=caller_ctx)
+                if detail is None:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"error": f"Lifecycle record for crossing '{cid}' not found"},
+                    )
+                    return
+                self._send_json(HTTPStatus.OK, detail)
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
+            return
+
+        if path.startswith("/v1/crossings/") and path.endswith("/transitions"):
+            cid = path[len("/v1/crossings/") : -len("/transitions")]
+            try:
+                transitions = services.list_action_transitions(cid, caller_context=caller_ctx)
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"crossing_id": cid, "transitions": transitions},
+                )
+            except IdentitySecurityError as exc:
+                self._send_forbidden(str(exc))
+            return
+
         if path.startswith("/v1/crossings/") and not path.endswith(
-            ("/approve", "/execute", "/outcome", "/claim")
+            ("/approve", "/execute", "/outcome", "/claim", "/lifecycle", "/transitions")
         ):
             cid = path[len("/v1/crossings/") :]
             try:
                 detail = services.get_pending_approval(cid, caller_context=caller_ctx)
+                if detail is None:
+                    detail = services.get_crossing(cid, caller_context=caller_ctx)
                 if detail is None:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Crossing '{cid}' not found"})
                     return

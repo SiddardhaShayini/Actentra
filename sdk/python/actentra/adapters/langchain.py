@@ -8,6 +8,7 @@ from typing import Any
 from actentra.adapters.function_calling import _default_resource_extractor, _infer_verb_from_name
 from actentra.boundary import Boundary
 from actentra_core.envelope import ProvenanceItem
+from actentra_core.identity import CallerContext
 
 ResourceFn = Callable[[dict[str, Any]], str]
 
@@ -25,6 +26,7 @@ class LangChainToolWrapper:
         resource_fn: ResourceFn | None = None,
         provenance: list[ProvenanceItem] | tuple[ProvenanceItem, ...] = (),
         user_goal: str | None = None,
+        caller_context: CallerContext | None = None,
     ) -> None:
         self._underlying = tool
         self._boundary = boundary
@@ -39,6 +41,7 @@ class LangChainToolWrapper:
         )
         self._provenance = tuple(provenance)
         self._user_goal = user_goal
+        self._caller_context = caller_context
 
     @property
     def underlying(self) -> Any:
@@ -84,7 +87,15 @@ class LangChainToolWrapper:
             return self._underlying(**kwargs)
         raise TypeError(f"Underlying tool {self._underlying!r} is not callable")
 
-    def invoke(self, input: Any = None, config: Any = None, **kwargs: Any) -> Any:
+    def invoke(
+        self,
+        input: Any = None,
+        config: Any = None,
+        *,
+        caller_context: CallerContext | None = None,
+        idempotency_key: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
         """Mediate LangChain tool invoke() call through Actentra boundary."""
         args_dict = self._normalize_args(input, kwargs)
         resource = self.resource_fn(args_dict)
@@ -93,6 +104,7 @@ class LangChainToolWrapper:
         if config is not None:
             extra_call_kwargs["config"] = config
 
+        effective_ctx = caller_context or self._caller_context
         return self._boundary.execute(
             tool=self.name,
             verb=self.verb,
@@ -101,6 +113,8 @@ class LangChainToolWrapper:
             fn=lambda _env, _dec: self._execute_underlying(input, extra_call_kwargs),
             provenance=self._provenance,
             user_goal=self._user_goal,
+            caller_context=effective_ctx,
+            idempotency_key=idempotency_key,
         )
 
     def run(self, *args: Any, **kwargs: Any) -> Any:
@@ -122,6 +136,7 @@ def wrap_langchain_tool(
     resource_fn: ResourceFn | None = None,
     provenance: list[ProvenanceItem] | tuple[ProvenanceItem, ...] = (),
     user_goal: str | None = None,
+    caller_context: CallerContext | None = None,
 ) -> LangChainToolWrapper:
     """Convenience helper to wrap a LangChain tool with an Actentra Boundary."""
     return LangChainToolWrapper(
@@ -132,4 +147,5 @@ def wrap_langchain_tool(
         resource_fn=resource_fn,
         provenance=provenance,
         user_goal=user_goal,
+        caller_context=caller_context,
     )

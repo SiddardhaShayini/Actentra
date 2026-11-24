@@ -11,6 +11,7 @@ from typing import Any
 from actentra.boundary import ActionBlockedError, Boundary
 from actentra_core.canonicalize import canonicalize_json
 from actentra_core.envelope import ProvenanceItem
+from actentra_core.identity import CallerContext
 
 ResourceFn = Callable[[dict[str, Any]], str]
 
@@ -59,9 +60,11 @@ class FunctionCallAdapter:
         boundary: Boundary,
         *,
         raise_on_blocked: bool = False,
+        caller_context: CallerContext | None = None,
     ) -> None:
         self._boundary = boundary
         self._raise_on_blocked = raise_on_blocked
+        self._caller_context = caller_context
         self._tools: dict[str, ProtectedTool] = {}
 
     @property
@@ -96,6 +99,8 @@ class FunctionCallAdapter:
         *,
         provenance: list[ProvenanceItem] | tuple[ProvenanceItem, ...] = (),
         user_goal: str | None = None,
+        caller_context: CallerContext | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Execute a tool call dict and return an OpenAI-compatible tool response message.
 
@@ -140,6 +145,7 @@ class FunctionCallAdapter:
                 raise
             return self._error_response(call_id, err_msg)
 
+        effective_ctx = caller_context or self._caller_context
         try:
             result = self._boundary.execute(
                 tool=tool_obj.name,
@@ -149,6 +155,8 @@ class FunctionCallAdapter:
                 fn=lambda _env, _dec: self._invoke_callable(tool_obj.fn, args),
                 provenance=provenance,
                 user_goal=user_goal,
+                caller_context=effective_ctx,
+                idempotency_key=idempotency_key,
             )
             content_str = (
                 canonicalize_json(result) if isinstance(result, (dict, list)) else str(result)

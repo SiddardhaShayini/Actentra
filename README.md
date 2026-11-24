@@ -13,7 +13,8 @@
 ## Key Highlights
 
 - **Persistent Pending Approvals:** Human approval requests (`ASK`) are durably stored in SQLite WAL, surviving process restarts and power cycles with strict single-use hash binding and TTL expiration.
-- **Unified Action Lifecycle & Dispatched Execution:** Single continuous contract for Propose -> Evaluate -> Pre-Execution Receipt -> (if ASK: Persist -> Approve) -> Scoped Execution -> Post-Execution Outcome Receipt.
+- **Transactional Action Lifecycle State Machine:** Strict formal state transitions (`created` -> `authorized` -> `approved` -> `claimed` -> `executing` -> `verification_pending` -> `succeeded`/`failed`/`unknown`/`reconciliation_required`) with historical state transition auditing.
+- **Durable Idempotency Engine:** Prevents replay side effects across process boundaries, returns cached results on exact replay without re-dispatching tools, and flags interrupted executions for reconciliation.
 - **Typed Application Services:** Modular `AppServices` and `ExecutorRegistry` unifying CLI, SDK, and Web UI.
 - **Unified Local Operator Console:** 7-tab embedded offline web application at `/ui` (Overview, Approvals Inbox, Policy Viewer & Linter, Dry-Run Simulator, Paginated Receipts Explorer, Integrations, Settings).
 - **Bounded Paged Receipts & Offline Audit Bundles:** Paged queries, keyword search, and one-click JSON/JSONL export bundles with integrity verification.
@@ -27,7 +28,8 @@
 - **Bounded Streaming Audit Log & Archival:** Memory-bounded streaming log iteration, chunked export, envelope-integrity verification, and standalone SQLite archive partitioning.
 - **Policy Canary Diff Engine:** Replays recorded agent traffic against proposed policies to detect regressions with context integrity, provenance, and temporal window modeling.
 - **Standalone HTML Audit Reports:** Generates zero-external-CDN audit reports with SVG security badges and chronological timelines.
-- **Agent Framework Adapters:** First-class adapters for LangChain and OpenAI function calling.
+- **Operational Metrics & Telemetry:** Built-in latency percentiles (p50, p95, p99, max), failure counters, and secret scrubbing exposed via `GET /v1/metrics` and `actentra metrics`.
+- **Agent Framework & MCP Adapters:** First-class adapters for LangChain, OpenAI function calling, and MCP stdio proxy with anti-rug-pull schema pinning (CVE-2025-54136) and caller context propagation.
 
 ---
 
@@ -55,7 +57,7 @@
   - `FunctionCallAdapter` (OpenAI / Anthropic function calling format)
   - `LangChainToolWrapper` (duck-typed wrapper for LangChain tools)
 - [`cli/actentra_cli/`](cli/actentra_cli/) — Typer CLI commands:
-  - `init`, `policy check`, `policy canary`, `dry-run`, `serve`, `report`, `run`, `replay`, `mcp-proxy`, `checkpoint`, `warrant`, `verify-log`, `export-log`, `demo`
+  - `init`, `policy check`, `policy canary`, `dry-run`, `serve`, `report`, `run`, `replay`, `mcp-proxy`, `checkpoint`, `warrant`, `verify-log`, `export-log`, `demo`, `lifecycle`, `metrics`
 - [`spec/`](spec/) — Draft 2020-12 JSON Schemas for Envelope, Policy, and Receipt v1
 - [`policies/examples/`](policies/examples/) — Starter policy packs
 - [`corpus/`](corpus/) — Documented real-world agent incident corpus (32 incidents), red-team attacks, and benign actions

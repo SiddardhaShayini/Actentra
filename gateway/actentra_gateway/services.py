@@ -856,6 +856,48 @@ class AppServices:
                 d["params"] = {"_redacted": "UNAUTHORIZED_RESOURCE_ACCESS"}
         return d
 
+    def get_action_lifecycle(
+        self,
+        crossing_id: str,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any] | None:
+        """Get lifecycle state and details for a crossing, enforcing authorization."""
+        self._require_scope_or_operator(caller_context, "crossings:read", "approvals:read")
+        rec = self.boundary.receipt_store.get_action_lifecycle(crossing_id)
+        if rec is None:
+            return None
+        return rec.to_dict()
+
+    def list_action_transitions(
+        self,
+        crossing_id: str,
+        caller_context: CallerContext | None = None,
+    ) -> list[dict[str, Any]]:
+        """List historical state transitions for a crossing, enforcing authorization."""
+        self._require_scope_or_operator(caller_context, "crossings:read", "approvals:read")
+        transitions = self.boundary.receipt_store.list_action_transitions(crossing_id)
+        return [t.to_dict() for t in transitions]
+
+    def get_crossing(
+        self,
+        crossing_id: str,
+        caller_context: CallerContext | None = None,
+    ) -> dict[str, Any] | None:
+        """Get unified crossing status including lifecycle, approval, and transitions."""
+        self._require_scope_or_operator(caller_context, "crossings:read", "approvals:read")
+        lf = self.boundary.receipt_store.get_action_lifecycle(crossing_id)
+        appr = self.get_pending_approval(crossing_id, caller_context=caller_context)
+        if lf is None and appr is None:
+            return None
+
+        transitions = self.boundary.receipt_store.list_action_transitions(crossing_id)
+        return {
+            "crossing_id": crossing_id,
+            "lifecycle": lf.to_dict() if lf is not None else None,
+            "approval": appr,
+            "transitions": [t.to_dict() for t in transitions],
+        }
+
     def resolve_approval(
         self,
         crossing_id: str,

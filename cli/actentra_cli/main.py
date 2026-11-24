@@ -91,6 +91,8 @@ evidence_app = typer.Typer(help="Inspect and verify execution evidence records."
 app.add_typer(evidence_app, name="evidence")
 lease_app = typer.Typer(help="Manage multi-agent resource coordination leases.")
 app.add_typer(lease_app, name="lease")
+lifecycle_app = typer.Typer(help="Inspect action execution lifecycles and state transitions.")
+app.add_typer(lifecycle_app, name="lifecycle")
 
 _DEFAULT_STARTER_POLICY = """\
 version: 1
@@ -1723,6 +1725,51 @@ def warrant_verify_cmd(
         f"OK valid warrant id={warrant.warrant_id} holder={warrant.holder} "
         f"expires={warrant.expires_at}"
     )
+
+
+@lifecycle_app.command("show")
+def lifecycle_show_cmd(
+    crossing_id: Annotated[str, typer.Argument(help="Crossing ID to inspect.")],
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
+) -> None:
+    """Show the current lifecycle state of an action crossing."""
+    store = ReceiptStore(db_path)
+    rec = store.get_action_lifecycle(crossing_id)
+    if rec is None:
+        typer.echo(f"No action lifecycle record found for crossing '{crossing_id}'", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(json.dumps(rec.to_dict(), indent=2))
+
+
+@lifecycle_app.command("transitions")
+def lifecycle_transitions_cmd(
+    crossing_id: Annotated[str, typer.Argument(help="Crossing ID to inspect.")],
+    db_path: Annotated[Path, typer.Option("--db", help="Path to SQLite receipt database.")] = Path(
+        ".actentra/gateway-receipts.db"
+    ),
+) -> None:
+    """List historical state transitions for an action crossing."""
+    store = ReceiptStore(db_path)
+    transitions = store.list_action_transitions(crossing_id)
+    if not transitions:
+        typer.echo(f"No state transitions found for crossing '{crossing_id}'")
+        return
+    for t in transitions:
+        typer.echo(
+            f"[{t.transitioned_at}] {t.from_state} -> {t.to_state} "
+            f"actor={t.actor_id} reason={t.reason or 'none'}"
+        )
+
+
+@app.command("metrics")
+def metrics_cmd() -> None:
+    """Display system-wide operational metrics and latency percentiles."""
+    from actentra_core.observability import get_global_metrics
+
+    metrics = get_global_metrics().snapshot()
+    typer.echo(json.dumps(metrics, indent=2))
 
 
 if __name__ == "__main__":

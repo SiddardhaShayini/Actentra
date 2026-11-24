@@ -13,6 +13,7 @@ from typing import IO, Any
 from actentra.boundary import ActionBlockedError, Boundary
 from actentra_core.canonicalize import hash_canonical
 from actentra_core.envelope import EnvelopeError, ProvenanceItem, build_envelope
+from actentra_core.identity import CallerContext
 from actentra_core.receipts import ReceiptError
 from actentra_core.verdict import Decision, Verdict
 
@@ -98,11 +99,15 @@ class MCPStdioProxy:
         forward: ForwardFn,
         tool_mapper: ToolMapper | None = None,
         taint_on_untrusted_tool: bool = True,
+        caller_context: CallerContext | None = None,
+        session_id: str | None = None,
     ) -> None:
         self._boundary = boundary
         self._forward = forward
         self._tool_mapper = tool_mapper or default_mcp_tool_mapper
         self._taint_on_untrusted_tool = taint_on_untrusted_tool
+        self._caller_context = caller_context
+        self._session_id = session_id
         self._pinned_tool_hashes: dict[str, str] = {}
         self._poisoned_tools: set[str] = set()
 
@@ -219,6 +224,16 @@ class MCPStdioProxy:
         if self._taint_on_untrusted_tool and raw_name not in self._pinned_tool_hashes:
             provenance.append(ProvenanceItem(source=f"mcp:{raw_name}", trust="unknown"))
 
+        # Extract metadata if provided (standard MCP _meta envelope)
+        meta_dict: dict[str, Any] = {}
+        if isinstance(params.get("_meta"), dict):
+            meta_dict = params["_meta"]
+        elif isinstance(raw_args.get("_meta"), dict):
+            meta_dict = raw_args["_meta"]
+
+        raw_idemp = meta_dict.get("idempotency_key") or meta_dict.get("idempotencyKey")
+        idemp_key = str(raw_idemp).strip() if raw_idemp is not None else None
+
         try:
             response = self._boundary.execute(
                 tool=mapped.tool,
@@ -226,6 +241,8 @@ class MCPStdioProxy:
                 resource=mapped.resource,
                 params=raw_args,
                 provenance=provenance,
+                idempotency_key=idemp_key,
+                caller_context=self._caller_context,
                 fn=lambda _env, _dec: self._forward(msg),
             )
             return dict(response) if isinstance(response, dict) else response
@@ -256,6 +273,8 @@ def serve_stdio(
     client_in: IO[str] | None = None,
     client_out: IO[str] | None = None,
     tool_mapper: ToolMapper | None = None,
+    caller_context: CallerContext | None = None,
+    session_id: str | None = None,
 ) -> int:
     """Spawn downstream MCP server (no shell=True) and proxy JSON-RPC lines."""
     if not server_cmd:
@@ -294,7 +313,13 @@ def serve_stdio(
             raise MCPProxyError("Downstream MCP response must be a JSON object")
         return loaded
 
-    proxy = MCPStdioProxy(boundary=boundary, forward=forward, tool_mapper=tool_mapper)
+    proxy = MCPStdioProxy(
+        boundary=boundary,
+        forward=forward,
+        tool_mapper=tool_mapper,
+        caller_context=caller_context,
+        session_id=session_id,
+    )
     try:
         for raw_line in in_stream:
             stripped = raw_line.strip()
