@@ -24,10 +24,16 @@ from actentra_core.causal import (
 )
 from actentra_core.checkpoints import CheckpointAnchor, KeyRing
 from actentra_core.claims import ExecutionClaimError
+from actentra_core.context import (
+    ContextError,
+    PostconditionSpec,
+    validate_postcondition_semantics,
+)
 from actentra_core.coordination import (
     LeaseMode,
     ResourceConflictError,
     build_lease,
+    utc_iso,
 )
 from actentra_core.envelope import (
     ActionEnvelope,
@@ -57,13 +63,6 @@ from actentra_core.lifecycle import (
     IdempotencyInFlightError,
     ReconciliationRequiredError,
 )
-from actentra_core.context import (
-    ContextError,
-    PostconditionSpec,
-    compute_content_digest,
-    validate_postcondition_semantics,
-)
-from actentra_core.coordination import utc_iso
 from actentra_core.observability import get_global_metrics
 from actentra_core.observations import build_observation
 from actentra_core.policy import lint_policy, load_policy_yaml
@@ -1037,8 +1036,6 @@ class AppServices:
                 crossing_id=envelope.crossing_id,
                 error=f"Verifier raised exception: {exc}",
             )
-
-        verifier_id = getattr(verifier, "verifier_id", "actentra.gateway.verifier")
 
         if obs.status == "verified":
             # SUCCESS: postcondition independently confirmed.

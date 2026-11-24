@@ -28,14 +28,12 @@ import pytest
 from actentra.boundary import ActionBlockedError, Boundary, PostconditionFailedError
 from actentra_core.context import compute_content_digest
 from actentra_core.envelope import ActionEnvelope
-from actentra_core.observations import build_observation
 from actentra_core.policy import load_policy_yaml
 from actentra_core.receipts import ReceiptStore
-from actentra_core.verdict import Decision, Verdict
+from actentra_core.verdict import Decision
 from actentra_executors.verifiers import WorkspaceFileVerifier
 from actentra_gateway.http_service import ActentraHTTPHandler
-from actentra_gateway.mcp_proxy import MCPStdioProxy
-from actentra_gateway.services import AppServices, ExecutorRegistry
+from actentra_gateway.services import AppServices
 
 # ---------------------------------------------------------------------------
 # Policies
@@ -138,7 +136,9 @@ def services_with_verifier(tmp_path: Path, workspace: Path) -> AppServices:
     store = ReceiptStore(tmp_path / "r.db")
     policy = load_policy_yaml(_POLICY_WITH_POSTCONDITION)
     verifier = WorkspaceFileVerifier(workspace)
-    boundary = Boundary(policy=policy, receipt_store=store, verifier=verifier, agent_id="agent-test")
+    boundary = Boundary(
+        policy=policy, receipt_store=store, verifier=verifier, agent_id="agent-test"
+    )
     return AppServices(boundary, file_verifier=verifier)
 
 
