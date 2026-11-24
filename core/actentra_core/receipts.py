@@ -14,6 +14,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from actentra_core.checkpoints import (
+        AuditTrailVerificationResult,
+        CheckpointAnchor,
+        KeyRing,
+        SignedCheckpoint,
+    )
     from actentra_core.warrants import Warrant
 
 from actentra_core.canonicalize import canonicalize_json, hash_canonical
@@ -202,8 +208,9 @@ def _compute_entry_hash(
     error: str | None,
     ts: str,
     prev_hash: str,
+    evidence_status: str | None = None,
 ) -> str:
-    payload = {
+    payload: dict[str, Any] = {
         "seq": seq,
         "record_type": record_type,
         "crossing_id": crossing_id,
@@ -221,6 +228,8 @@ def _compute_entry_hash(
         "ts": ts,
         "prev_hash": prev_hash,
     }
+    if evidence_status is not None:
+        payload["evidence_status"] = evidence_status
     return hash_canonical(payload)
 
 
@@ -740,6 +749,7 @@ class ReceiptStore:
                 error=error,
                 ts=stamp,
                 prev_hash=prev_hash,
+                evidence_status=evidence_status,
             )
 
             conn.execute(
@@ -1283,7 +1293,8 @@ class ReceiptStore:
                 """
                 SELECT seq, record_type, crossing_id, session_id, canonical_hash,
                        policy_version, verdict, rule_id, reason, risk_tags_json,
-                       shadow, status, result_hash, error, ts, prev_hash, entry_hash
+                       shadow, status, result_hash, error, ts, prev_hash, entry_hash,
+                       evidence_status
                 FROM receipts
                 WHERE seq < ?
                 ORDER BY seq ASC;
@@ -1320,8 +1331,9 @@ class ReceiptStore:
                     INSERT OR REPLACE INTO receipts
                         (seq, record_type, crossing_id, session_id, canonical_hash,
                          policy_version, verdict, rule_id, reason, risk_tags_json,
-                         shadow, status, result_hash, error, ts, prev_hash, entry_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                         shadow, status, result_hash, error, ts, prev_hash, entry_hash,
+                         evidence_status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
                     rows,
                 )
@@ -3648,6 +3660,47 @@ class ReceiptStore:
         finally:
             conn.close()
 
+    def create_external_checkpoint(
+        self,
+        private_key_pem: bytes,
+        *,
+        anchor: CheckpointAnchor,
+        key_id: str | None = None,
+        key_ring: KeyRing | None = None,
+        checkpoint_id: str | None = None,
+        version: int = 2,
+    ) -> SignedCheckpoint:
+        """Create a signed, hash-chained checkpoint and store it in the external anchor."""
+        from actentra_core.checkpoints import sign_checkpoint
+
+        return sign_checkpoint(
+            self.db_path,
+            private_key_pem,
+            anchor=anchor,
+            key_ring=key_ring,
+            checkpoint_id=checkpoint_id,
+            version=version,
+        )
+
+    def verify_audit_trail(
+        self,
+        anchor: CheckpointAnchor,
+        key_ring: KeyRing | bytes,
+        *,
+        verify_envelopes: bool = False,
+        require_checkpoints: bool = True,
+    ) -> AuditTrailVerificationResult:
+        """Verify receipt hash chain, external checkpoint continuity, and anchoring."""
+        from actentra_core.checkpoints import verify_audit_trail
+
+        return verify_audit_trail(
+            self.db_path,
+            anchor,
+            key_ring,
+            verify_envelopes=verify_envelopes,
+            require_checkpoints=require_checkpoints,
+        )
+
 
 def verify_log(
     db_path: str | Path,
@@ -3719,6 +3772,7 @@ def verify_log(
                 error=rec.error,
                 ts=rec.ts,
                 prev_hash=rec.prev_hash,
+                evidence_status=rec.evidence_status,
             )
             if computed != rec.entry_hash:
                 errors.append(

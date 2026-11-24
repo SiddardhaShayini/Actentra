@@ -20,9 +20,14 @@ from actentra_core.causal import (
 )
 from actentra_core.checkpoints import (
     CheckpointError,
+    FileCheckpointAnchor,
+    KeyRing,
+    create_key_record,
     generate_ed25519_keypair,
     load_checkpoint,
     sign_checkpoint,
+    verify_audit_bundle,
+    verify_audit_trail,
     verify_checkpoint,
     write_checkpoint,
 )
@@ -898,6 +903,14 @@ def bundle_export_cmd(
     policy_path: Annotated[
         Path | None, typer.Option("--policy", "-p", help="Path to active YAML policy file.")
     ] = None,
+    anchor_dir: Annotated[
+        Path | None,
+        typer.Option("--anchor", "-a", help="Path to external checkpoint anchor directory."),
+    ] = None,
+    keys_path: Annotated[
+        Path | None,
+        typer.Option("--keys", "-k", help="Path to public key PEM or key manifest JSON."),
+    ] = None,
     out_path: Annotated[Path, typer.Option("--out", "-o", help="Output JSON bundle file.")] = Path(
         "audit-bundle.json"
     ),
@@ -909,10 +922,48 @@ def bundle_export_cmd(
         pack = load_policy_yaml(_DEFAULT_STARTER_POLICY)
     store = ReceiptStore(db_path)
     boundary = Boundary(policy=pack, receipt_store=store)
-    services = AppServices(boundary)
-    bundle = services.export_audit_bundle(out_path=out_path)
+
+    anchor = FileCheckpointAnchor(anchor_dir) if anchor_dir else None
+    ring: KeyRing | None = None
+    if keys_path is not None:
+        if keys_path.suffix == ".json":
+            ring = KeyRing.load(keys_path)
+        else:
+            rec = create_key_record(keys_path.read_bytes())
+            ring = KeyRing([rec])
+
+    services = AppServices(boundary, checkpoint_anchor=anchor, key_ring=ring)
+    bundle = services.export_audit_bundle(
+        out_path=out_path, checkpoint_anchor=anchor, key_ring=ring
+    )
     rec_count = bundle["integrity"]["total_records"]
-    typer.echo(f"Exported audit bundle ({rec_count} receipts) -> {out_path}")
+    cp_count = len(bundle.get("external_checkpoints", []))
+    typer.echo(
+        f"Exported audit bundle ({rec_count} receipts, {cp_count} checkpoints) -> {out_path}"
+    )
+
+
+@bundle_app.command("verify")
+def bundle_verify_cmd(
+    bundle_path: Annotated[Path, typer.Argument(help="Path to exported audit bundle JSON file.")],
+) -> None:
+    """Independently verify an offline audit bundle."""
+    try:
+        vr = verify_audit_bundle(bundle_path)
+    except Exception as exc:
+        typer.echo(f"BUNDLE VERIFY ERROR: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if not vr.ok:
+        typer.echo(f"BUNDLE VERIFICATION FAILED: {vr.divergence_type or 'INVALID'}", err=True)
+        for err in vr.errors:
+            typer.echo(f"  - {err}", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo(
+        f"OK audit bundle verified: {vr.receipts_verified} receipts, "
+        f"{vr.checkpoints_verified} external checkpoints, head={vr.head_hash}"
+    )
 
 
 @observation_app.command("verify")
@@ -1497,32 +1548,47 @@ def checkpoint_keygen(
     out_dir.mkdir(parents=True, exist_ok=True)
     priv_path = out_dir / "checkpoint.key.pem"
     pub_path = out_dir / "checkpoint.pub.pem"
+    manifest_path = out_dir / "key_manifest.json"
     if (priv_path.exists() or pub_path.exists()) and not force:
         typer.echo(f"Key files already exist in {out_dir} (use --force to overwrite)", err=True)
         raise typer.Exit(code=1)
     priv_pem, pub_pem = generate_ed25519_keypair()
     priv_path.write_bytes(priv_pem)
     pub_path.write_bytes(pub_pem)
-    typer.echo(f"Generated Ed25519 keypair: private={priv_path} public={pub_path}")
+    key_rec = create_key_record(pub_pem)
+    ring = KeyRing([key_rec])
+    ring.save(manifest_path)
+    typer.echo(
+        f"Generated Ed25519 keypair: key_id={key_rec.key_id} private={priv_path} public={pub_path}"
+    )
 
 
 @checkpoint_app.command("sign")
 def checkpoint_sign_cmd(
     db_path: Annotated[Path, typer.Argument(help="Path to SQLite receipt database.")],
     key_path: Annotated[Path, typer.Option("--key", "-k", help="Ed25519 private key PEM.")],
+    anchor_dir: Annotated[
+        Path | None,
+        typer.Option("--anchor", "-a", help="Optional external checkpoint anchor directory."),
+    ] = None,
     out_path: Annotated[
-        Path, typer.Option("--out", "-o", help="Output checkpoint JSON file.")
+        Path, typer.Option("--out", "-o", help="Output checkpoint JSON file (if anchor not used).")
     ] = Path("checkpoint.json"),
 ) -> None:
     """Sign a tamper-evident checkpoint at the current head of a receipt log."""
     try:
         priv_pem = key_path.read_bytes()
-        cp = sign_checkpoint(db_path, priv_pem)
-        write_checkpoint(cp, out_path)
+        anchor = FileCheckpointAnchor(anchor_dir) if anchor_dir else None
+        cp = sign_checkpoint(db_path, priv_pem, anchor=anchor)
+        if anchor is None:
+            write_checkpoint(cp, out_path)
+            dest_msg = str(out_path)
+        else:
+            dest_msg = f"anchor {anchor_dir} (seq={cp.checkpoint_seq})"
     except (OSError, CheckpointError) as exc:
         typer.echo(f"CHECKPOINT SIGN FAILED: {exc}", err=True)
         raise typer.Exit(code=1) from exc
-    typer.echo(f"Signed checkpoint seq={cp.seq} head={cp.head_hash} -> {out_path}")
+    typer.echo(f"Signed checkpoint seq={cp.seq} head={cp.head_hash} -> {dest_msg}")
 
 
 @checkpoint_app.command("verify")
@@ -1546,6 +1612,43 @@ def checkpoint_verify_cmd(
         typer.echo(f"VERIFICATION FAILED: {msg}", err=True)
         raise typer.Exit(code=1)
     typer.echo(f"OK checkpoint seq={cp.seq} key_id={cp.key_id} head={cp.head_hash}")
+
+
+@checkpoint_app.command("verify-trail")
+def checkpoint_verify_trail_cmd(
+    db_path: Annotated[Path, typer.Argument(help="Path to SQLite receipt database.")],
+    anchor_dir: Annotated[
+        Path, typer.Option("--anchor", "-a", help="Path to checkpoint anchor directory.")
+    ],
+    keys_path: Annotated[
+        Path, typer.Option("--keys", "-k", help="Path to public key PEM or key manifest JSON.")
+    ],
+    verify_envelopes: Annotated[
+        bool, typer.Option("--verify-envelopes", "-e", help="Verify action envelope hashes.")
+    ] = False,
+) -> None:
+    """Verify SQLite receipt log against externally anchored checkpoints and key ring."""
+    anchor = FileCheckpointAnchor(anchor_dir)
+    ring: KeyRing
+    if keys_path.suffix == ".json":
+        ring = KeyRing.load(keys_path)
+    else:
+        rec = create_key_record(keys_path.read_bytes())
+        ring = KeyRing([rec])
+
+    vr = verify_audit_trail(
+        db_path, anchor, ring, verify_envelopes=verify_envelopes
+    )
+    if not vr.ok:
+        typer.echo(f"AUDIT TRAIL VERIFICATION FAILED: {vr.divergence_type or 'INVALID'}", err=True)
+        for err in vr.errors:
+            typer.echo(f"  - {err}", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo(
+        f"OK audit trail verified: {vr.receipts_verified} receipts, "
+        f"{vr.checkpoints_verified} external checkpoints, head={vr.head_hash}"
+    )
 
 
 @warrant_app.command("issue")

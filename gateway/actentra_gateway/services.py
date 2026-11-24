@@ -22,6 +22,7 @@ from actentra_core.causal import (
     build_causal_trace,
     generate_link_id,
 )
+from actentra_core.checkpoints import CheckpointAnchor, KeyRing
 from actentra_core.claims import ExecutionClaimError
 from actentra_core.coordination import (
     LeaseMode,
@@ -116,11 +117,15 @@ class AppServices:
         file_verifier: WorkspaceFileVerifier | None = None,
         approval_ttl_seconds: float = 300.0,
         delegation_registry: DelegationRegistry | None = None,
+        checkpoint_anchor: CheckpointAnchor | None = None,
+        key_ring: KeyRing | None = None,
     ) -> None:
         self.boundary = boundary
         self.registry = executor_registry or ExecutorRegistry()
         self.approval_ttl_seconds = approval_ttl_seconds
         self.delegation_registry = delegation_registry or get_default_delegation_registry()
+        self.checkpoint_anchor = checkpoint_anchor
+        self.key_ring = key_ring
         if file_verifier is not None:
             self.file_verifier: WorkspaceFileVerifier | None = file_verifier
         elif self.registry.workspace_root is not None:
@@ -1352,11 +1357,23 @@ class AppServices:
         self,
         out_path: str | Path | None = None,
         caller_context: CallerContext | None = None,
+        *,
+        checkpoint_anchor: CheckpointAnchor | None = None,
+        key_ring: KeyRing | None = None,
     ) -> dict[str, Any]:
         """Create an exportable offline audit bundle."""
         self._require_scope_or_operator(caller_context, "audit:export")
         vr = verify_log(self.boundary.receipt_store.db_path)
         records = [r.to_dict() for r in self.boundary.receipt_store.iter_records()]
+
+        # Collect external checkpoints if anchor is provided or configured
+        anchor = checkpoint_anchor or self.checkpoint_anchor
+        external_cps = [cp.to_dict() for cp in anchor.list_checkpoints()] if anchor else []
+
+        # Collect key rotation manifest if key ring is provided or configured
+        ring = key_ring or self.key_ring
+        key_manifest = ring.to_dict() if ring else {}
+
         bundle = {
             "actentra_version": "0.1.0a0",
             "export_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1372,6 +1389,8 @@ class AppServices:
                 "errors": list(vr.errors),
             },
             "receipts": records,
+            "external_checkpoints": external_cps,
+            "key_manifest": key_manifest,
             "observations": [
                 obs.to_dict() for obs in self.boundary.receipt_store.list_observations(limit=500)
             ],

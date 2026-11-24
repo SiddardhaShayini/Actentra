@@ -18,7 +18,7 @@ This document defines the threats Actentra is designed to mitigate, the correspo
 | T3 | **Confused deputy / ambient authority** | Least-privilege per-action mediation; DPAPI-backed `SecretsBroker` dynamically resolves `secret:<NAME>` references at executor dispatch time; secrets never exist in agent prompts, envelopes, or policies | Overly broad broker or policy scopes |
 | T4 | **Exfiltration via chains of benign calls** | Dynamic session taint tracking, per-minute rate limits, cumulative session budgets (`max_actions`, `max_external_calls`, `max_egress_bytes`), egress destination allowlists | Low-and-slow exfiltration below thresholds across multiple unlinked sessions |
 | T5 | **Runaway loops & cost blowups** | Per-session and global rate limits (`limits`), cumulative session action caps, kill switch (`freeze`) | Thresholds must be tuned per workload |
-| T6 | **Audit log tampering** | Append-only SQLite WAL receipts with SHA-256 hash chaining (`prev_hash` -> `entry_hash`), dual-layer context verification (`actentra verify-log -e`), bounded archival (`actentra archive-log`), signed Ed25519 checkpoints | An attacker with full host write access can delete/rewrite an unanchored local DB; off-host signed checkpoint anchoring mitigates this |
+| T6 | **Audit log tampering, local database rewrite & historical rollback (ACT-07)** | Append-only SQLite WAL receipts with SHA-256 hash chaining (`prev_hash` -> `entry_hash`), dual-layer context verification (`actentra verify-log -e`), inclusion of all columns (`evidence_status`) in entry hashes; chained, externally anchored Ed25519 checkpoints (`FileCheckpointAnchor`) with monotonic sequences (`checkpoint_seq`), unique IDs, and previous-checkpoint hash chaining (`prev_checkpoint_hash`); off-host key custody via `KeyRing` supporting cryptographic rotation and revocation; cross-verification tooling (`verify_audit_trail`, `verify_audit_bundle`) detecting divergence (`CHAIN_REWRITE`, `ROLLBACK`, `TAIL_TRUNCATION`, `CHECKPOINT_TAMPERING`, `SIGNATURE_FORGERY`, `UNTRUSTED_KEY`, `REVOKED_KEY`) | Compromise of all external anchor destinations AND root signing keys |
 | T7 | **Malicious plugin / connector** | Narrow connector scopes, strict filesystem sandboxing, and loopback-only executor dispatch | Supply-chain trust for locally installed Python dependencies in-process |
 | T8 | **Policy bypass via encoding, traversal, or TOCTOU** | Canonicalize-then-hash-then-execute-same-bytes (`I3`), strict Windows path checks (ADS, reserved names, `..`, trailing dots/spaces, device namespaces) | Target parser differentials (e.g., SQL dialect quirks) |
 | T9 | **Policy tampering on disk** | `policy check` validation, policy hash pinned in every receipt (`policy_version`), last-known-good reload (`I6`), OS permissions | Root/admin compromise on the host is out of scope |
@@ -31,3 +31,41 @@ This document defines the threats Actentra is designed to mitigate, the correspo
 | T16 | **Remote gateway eavesdropping, plaintext bearer token exposure, DNS rebinding & request smuggling (ACT-02)** | Mandatory authenticated TLS transport (TLS 1.2+ with forward-secret AEAD ciphers) on all non-loopback bindings; remote plaintext HTTP binding refused at startup; mutual TLS (mTLS) support with client certificate validation; constant-time Bearer token verification (`hmac.compare_digest`); dynamic token revocation (`revoke_token`) and rotation (`rotate_token`); sliding-window nonce replay protection (`X-Actentra-Nonce`) and timestamp skew validation (`X-Actentra-Timestamp`); Host header validation against allowed hosts / loopback; untrusted proxy header spoofing rejection (`X-Forwarded-For` ignored unless peer IP is in `trusted_proxies`); 2 MiB request body limit (HTTP 413); conflicting Content-Length/Transfer-Encoding smuggling checks | Zero-day vulnerability in underlying TLS stack or root CA private key compromise |
 | T17 | **Executor resource escape: SQL table unauthorized access & Filesystem symlink/TOCTOU bypass (ACT-05, ACT-08)** | SQLite engine authorizer callback (`set_authorizer`) enforces table-level boundaries on direct queries, JOINs, CTEs, subqueries, views, and triggers, unconditionally blocking ATTACH, DETACH, PRAGMA, and unauthorized DDL; Filesystem executor enforces atomic writes via temporary-file creation and atomic replacement, verifies opened file descriptor realpaths against workspace boundaries to prevent symlink/junction/TOCTOU substitution, and validates all ancestor path components | Underlying kernel/filesystem bugs or driver-level reparse point bypasses |
 | T18 | **Execution claim substitution, postcondition bypass & false success promotion (ACT-06)** | Cryptographic execution context binding (`AuthorizedExecutionContext`); rejection of postcondition weakening (e.g. `exists` on write rejected under strict verification, requiring `digest_match` with expected content digest); unconditional rejection of generic string claims (`verified`, `ok`, `true`); mandatory one-time `ExecutionClaim` for external outcome reporting bound to canonical hash, principal ID, approval/warrant ID, and result digest; atomic single-use claim consumption rejecting cross-principal use and replay; prevention of false success promotion when verification is unverified; preservation of uncertain outcomes as `unknown` with safe reconciliation (`Boundary.reconcile_outcome`) | Out-of-band external side effects altering state after verification window |
+
+---
+
+## Audit Architecture Threat Model & Protection Boundary (ACT-07)
+
+The audit architecture formally distinguishes between eight attacker profiles and failure modes:
+
+1. **Accidental Corruption:**
+   - *Threat:* Bit flips, hardware disk sector corruption, or incomplete OS writes.
+   - *Detection & Prevention:* Detected via SHA-256 hash chaining (`prev_hash` -> `entry_hash`), canonical JSON hashing, and SQLite WAL checksumming.
+
+2. **Unauthorized Application-Level Modifications:**
+   - *Threat:* Malicious or buggy application code attempting to modify, reorder, or delete committed receipts via standard APIs.
+   - *Detection & Prevention:* Blocked by `ReceiptStore` append-only database constraints (`UNIQUE` index on outcome records, monotonic autoincrement sequence, read-only transaction semantics for queries).
+
+3. **Database-Editor Access (Direct SQL Write Access):**
+   - *Threat:* An attacker with direct write access to `receipts.db` modifies historical receipt fields and recomputes the SHA-256 hash chain so that `verify_log(db_path)` alone passes.
+   - *Detection & Prevention:* Detected by `verify_audit_trail()`. External checkpoints signed with Ed25519 anchor past `head_seq` and `head_hash`. Because the attacker lacks the private signing key and cannot edit external append-only checkpoints, recomputed local chains trigger `CHAIN_REWRITE` divergence.
+
+4. **Host Administrator Access:**
+   - *Threat:* An OS administrator on the local host attempts to modify both SQLite databases and local filesystem files.
+   - *Detection & Prevention:* Prevented by externalizing the checkpoint destination (`FileCheckpointAnchor` on an independent, append-only, or remote witness mount) and maintaining signing key custody off-host (e.g., KMS, hardware token, or remote broker). The administrator cannot modify history without triggering `CHAIN_REWRITE` or `CHECKPOINT_TAMPERING`.
+
+5. **Full Host Compromise:**
+   - *Threat:* An attacker gains total control of the execution host, capable of deleting all local files and stopping receipt emission.
+   - *Protection Boundary:* Historical checkpoints already exported or transmitted to an external anchor remain cryptographically immutable and provable. The verifier detects that the host's log has ceased progressing or diverged from the external timeline. Protection is not claimed against an attacker who controls every trust anchor and remote sink simultaneously.
+
+6. **Signing-Key Compromise:**
+   - *Threat:* A private checkpoint signing key is compromised or exfiltrated.
+   - *Detection & Prevention:* Mitigated by the `KeyRing` rotation and revocation manifest. The compromised key is immediately marked `revoked` with an explicit ISO 8601 revocation timestamp and rationale. Verifiers reject any checkpoints signed by that key after the revocation timestamp (`REVOKED_KEY`).
+
+7. **Backup Rollback:**
+   - *Threat:* An attacker replaces the active SQLite database with an older valid database backup snapshot, attempting to silently revert state or hide recent actions.
+   - *Detection & Prevention:* Detected by `verify_audit_trail()`. External checkpoints record strictly monotonic sequence numbers (`checkpoint_seq`) and anchored receipt sequences (`head_seq`). When an older backup contains fewer records than the highest external checkpoint, the verifier flags `ROLLBACK`.
+
+8. **Receipt Deletion and Truncation:**
+   - *Threat:* An attacker deletes records from the tail or interior of the SQLite receipt table.
+   - *Detection & Prevention:* Interior deletion breaks receipt sequence continuity and hash-chain linkage. Tail truncation is detected because the external checkpoint demands a higher `head_seq` than the local database provides, triggering `TAIL_TRUNCATION` / `ROLLBACK`.
