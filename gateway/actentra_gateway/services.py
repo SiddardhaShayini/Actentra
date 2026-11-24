@@ -57,7 +57,15 @@ from actentra_core.lifecycle import (
     IdempotencyInFlightError,
     ReconciliationRequiredError,
 )
+from actentra_core.context import (
+    ContextError,
+    PostconditionSpec,
+    compute_content_digest,
+    validate_postcondition_semantics,
+)
+from actentra_core.coordination import utc_iso
 from actentra_core.observability import get_global_metrics
+from actentra_core.observations import build_observation
 from actentra_core.policy import lint_policy, load_policy_yaml
 from actentra_core.receipts import GENESIS_HASH, SessionRecord, verify_log
 from actentra_core.verdict import Decision, Verdict
@@ -612,6 +620,21 @@ class AppServices:
                     )
                     resp["executed"] = True
                     resp["outcome"] = {"status": "success", "result": exec_result}
+                except ActionBlockedError as exc:
+                    # _dispatch_and_record raises ActionBlockedError for postcondition
+                    # failures and unknown outcomes; these are NOT generic executor failures.
+                    resp["executed"] = True  # execution occurred; verification failed
+                    outcome_status = (
+                        "unknown"
+                        if exc.decision.rule_id.startswith("kernel:postcondition-")
+                        and "refuted" not in exc.decision.rule_id
+                        else "failure"
+                    )
+                    resp["outcome"] = {
+                        "status": outcome_status,
+                        "error": exc.decision.reason,
+                        "rule_id": exc.decision.rule_id,
+                    }
                 except Exception as exc:
                     resp["executed"] = False
                     resp["outcome"] = {"status": "failure", "error": type(exc).__name__}
@@ -631,7 +654,20 @@ class AppServices:
         executor: ToolExecutorCallable,
         caller_context: CallerContext | None = None,
     ) -> Any:
-        """Internal dispatch executing the action and recording the outcome receipt."""
+        """Internal dispatch executing the action and recording the outcome receipt.
+
+        Security invariant: this method enforces the same postcondition verification
+        lifecycle as Boundary.execute().  An executor returning success is NOT sufficient
+        to record verified-success status when the policy mandates postcondition
+        verification.  Success is only promoted after the independent verifier confirms
+        the required postcondition.
+
+        Lifecycle states: authorized → claimed → executing → verification_pending
+            → succeeded (verified) | failed (refuted/error) | unknown (unverifiable)
+
+        The gateway path, approval path, and all callers of this method share one
+        authoritative execution orchestrator.  There is no shorter path to "succeeded".
+        """
         # Invariant I3: TOCTOU check immediately before execution
         verify_hash = compute_action_hash(
             envelope_version=envelope.envelope_version,
@@ -664,6 +700,67 @@ class AppServices:
             caller_context.authenticated_identity if caller_context else envelope.agent.id
         )
 
+        # --- Determine postcondition requirements from policy constraints ---
+        # This is the security-critical extraction that was absent from the gateway path.
+        # The SDK Boundary.execute() path always inspects decision.constraints; we must too.
+        policy_require_post = bool(
+            decision.constraints.get("require_postcondition")
+            or "postcondition" in decision.constraints
+            or "required_postconditions" in decision.constraints
+            or decision.constraints.get("strict_postconditions")
+        )
+        policy_post_claim: str | None = decision.constraints.get("postcondition")
+        policy_expected_digest: str | None = decision.constraints.get("expected_digest")
+
+        # Resolve effective postcondition claim and expected digest
+        effective_claim: str = str(policy_post_claim) if policy_post_claim else "exists"
+        effective_expected_digest: str | None = policy_expected_digest
+
+        # Validate postcondition semantics when required
+        validated_postcondition: PostconditionSpec | None = None
+        if policy_require_post:
+            try:
+                validated_postcondition = validate_postcondition_semantics(
+                    tool=envelope.action.tool,
+                    verb=envelope.action.verb,
+                    resource=envelope.action.resource,
+                    claim=effective_claim,
+                    params=envelope.action.params,
+                    expected_digest=effective_expected_digest,
+                    strict=True,
+                )
+                effective_claim = validated_postcondition.claim
+                effective_expected_digest = validated_postcondition.expected_digest
+            except ContextError as exc:
+                err_msg = f"Invalid postcondition semantics: {exc}"
+                self.boundary.receipt_store.record_outcome(
+                    crossing_id=envelope.crossing_id,
+                    session_id=envelope.session_id,
+                    canonical_hash=envelope.canonical_hash,
+                    policy_version=decision.policy_version,
+                    status="failure",
+                    error=err_msg,
+                    reason="invalid_postcondition_semantics",
+                    evidence_status="locally_observed",
+                )
+                self.boundary.receipt_store.transition_action_state(
+                    envelope.crossing_id,
+                    "failed",
+                    actor_id="policy",
+                    reason="invalid_postcondition_semantics",
+                )
+                raise ActionBlockedError(
+                    Decision(
+                        verdict=Verdict.HOLD,
+                        rule_id="kernel:postcondition-invalid",
+                        reason=err_msg,
+                        policy_version=decision.policy_version,
+                        canonical_hash=envelope.canonical_hash,
+                    ),
+                    envelope.crossing_id,
+                ) from exc
+
+        # --- Lifecycle state machine: advance to claimed ---
         cur_lf = self.boundary.receipt_store.get_action_lifecycle(envelope.crossing_id)
         if cur_lf is None:
             self.boundary.receipt_store.create_action_lifecycle(
@@ -689,6 +786,25 @@ class AppServices:
                     reason="claim_issued",
                 )
 
+        # --- Issue durable execution claim (matches SDK Boundary.execute() invariant) ---
+        appr_or_war = (
+            f"approval:{envelope.crossing_id}"
+            if decision.rule_id.endswith(":approved")
+            else None
+        )
+        try:
+            claim = self.boundary.receipt_store.issue_execution_claim(
+                crossing_id=envelope.crossing_id,
+                executor_principal_id=effective_principal,
+                session_id=envelope.session_id,
+                canonical_hash=envelope.canonical_hash,
+                approval_or_warrant_id=appr_or_war,
+            )
+        except Exception:
+            # If claim issuance fails (e.g. duplicate), fall back to no-claim for
+            # backwards-compat with approved-crossing path that may already hold a claim.
+            claim = None
+
         # Phase 7: Transition to EXECUTING
         self.boundary.receipt_store.transition_action_state(
             envelope.crossing_id,
@@ -705,6 +821,16 @@ class AppServices:
             err_label = type(exc).__name__
             if self.boundary.secrets_broker is not None:
                 err_label = self.boundary.secrets_broker.redact(err_label)
+            if claim is not None:
+                with contextlib.suppress(Exception):
+                    self.boundary.receipt_store.consume_execution_claim(
+                        claim.claim_id,
+                        executor_principal_id=effective_principal,
+                        crossing_id=envelope.crossing_id,
+                        canonical_hash=envelope.canonical_hash,
+                        approval_or_warrant_id=claim.approval_or_warrant_id,
+                        verification_status="error",
+                    )
             self.boundary.receipt_store.record_outcome(
                 crossing_id=envelope.crossing_id,
                 session_id=envelope.session_id,
@@ -737,49 +863,380 @@ class AppServices:
         except Exception:
             res_hash = None
 
-        self.boundary.receipt_store.record_outcome(
-            crossing_id=envelope.crossing_id,
-            session_id=envelope.session_id,
-            canonical_hash=envelope.canonical_hash,
-            policy_version=decision.policy_version,
-            status="success",
-            result_hash=res_hash,
-            evidence_status="locally_observed",
-        )
+        # =====================================================================
+        # SECURITY CRITICAL: Postcondition verification gate
+        #
+        # When policy mandates postcondition verification (require_postcondition,
+        # postcondition constraint, etc.) success may ONLY be recorded AFTER the
+        # independent verifier confirms the required postcondition.
+        #
+        # An executor returning without raising is NOT proof of verified success.
+        # Skipping this gate is the exact bypass reported in the audit.
+        # =====================================================================
+
+        if not policy_require_post:
+            # No postcondition required: record locally-observed success (unchanged from before)
+            if claim is not None:
+                with contextlib.suppress(Exception):
+                    self.boundary.receipt_store.consume_execution_claim(
+                        claim.claim_id,
+                        executor_principal_id=effective_principal,
+                        crossing_id=envelope.crossing_id,
+                        canonical_hash=envelope.canonical_hash,
+                        approval_or_warrant_id=claim.approval_or_warrant_id,
+                        result_digest=res_hash,
+                        verification_status="unverified",
+                    )
+            self.boundary.receipt_store.record_outcome(
+                crossing_id=envelope.crossing_id,
+                session_id=envelope.session_id,
+                canonical_hash=envelope.canonical_hash,
+                policy_version=decision.policy_version,
+                status="success",
+                result_hash=res_hash,
+                evidence_status="locally_observed",
+            )
+            self.boundary.receipt_store.transition_action_state(
+                envelope.crossing_id,
+                "succeeded",
+                actor_id=effective_principal,
+                reason="gateway_execution_completed",
+            )
+            if envelope.action.idempotency_key:
+                self.boundary.receipt_store.finalize_idempotency_key(
+                    idempotency_key=envelope.action.idempotency_key,
+                    principal_id=effective_principal,
+                    crossing_id=envelope.crossing_id,
+                    status="completed",
+                    result_hash=res_hash,
+                    response={"result": result, "status": "success"},
+                )
+            get_global_metrics().increment("executions_succeeded")
+            get_global_metrics().record_latency(
+                f"gateway:{envelope.action.tool}", time.time() - t0
+            )
+            with contextlib.suppress(Exception):
+                ev = build_evidence_record(
+                    crossing_id=envelope.crossing_id,
+                    tier=EvidenceTier.LOCALLY_OBSERVED,
+                    trust_domain="local_boundary",
+                    collector=f"executor:{envelope.action.tool}",
+                    details={"result_hash": res_hash, "executed": True},
+                )
+                self.boundary.receipt_store.record_evidence(ev)
+            self.boundary.engine.budget_tracker.record_usage(
+                envelope,
+                principal_id=(
+                    caller_context.authenticated_identity if caller_context else envelope.agent.id
+                ),
+            )
+            return result
+
+        # --- Postcondition verification required ---
+        # Transition to verification_pending before invoking the verifier.
         self.boundary.receipt_store.transition_action_state(
             envelope.crossing_id,
-            "succeeded",
+            "verification_pending",
             actor_id=effective_principal,
-            reason="gateway_execution_completed",
+            reason="verifying_postcondition",
         )
-        if envelope.action.idempotency_key:
-            self.boundary.receipt_store.finalize_idempotency_key(
-                idempotency_key=envelope.action.idempotency_key,
-                principal_id=effective_principal,
+
+        verifier = self.file_verifier  # AppServices verifier (WorkspaceFileVerifier or None)
+
+        if verifier is None:
+            # Fail closed: postcondition required but no verifier configured.
+            # Record unknown (not success) and require reconciliation.
+            if claim is not None:
+                with contextlib.suppress(Exception):
+                    self.boundary.receipt_store.consume_execution_claim(
+                        claim.claim_id,
+                        executor_principal_id=effective_principal,
+                        crossing_id=envelope.crossing_id,
+                        canonical_hash=envelope.canonical_hash,
+                        approval_or_warrant_id=claim.approval_or_warrant_id,
+                        result_digest=res_hash,
+                        verification_status="unknown",
+                    )
+            self.boundary.receipt_store.record_outcome(
                 crossing_id=envelope.crossing_id,
-                status="completed",
+                session_id=envelope.session_id,
+                canonical_hash=envelope.canonical_hash,
+                policy_version=decision.policy_version,
+                status="unknown",
                 result_hash=res_hash,
-                response={"result": result, "status": "success"},
+                error=(
+                    "Postcondition verification required by policy but no verifier is "
+                    "configured on AppServices; failing closed"
+                ),
+                reason="postcondition_unverified_no_verifier",
+                evidence_status="unknown",
             )
-        get_global_metrics().increment("executions_succeeded")
-        get_global_metrics().record_latency(f"gateway:{envelope.action.tool}", time.time() - t0)
-        with contextlib.suppress(Exception):
-            ev = build_evidence_record(
-                crossing_id=envelope.crossing_id,
-                tier=EvidenceTier.LOCALLY_OBSERVED,
-                trust_domain="local_boundary",
-                collector=f"executor:{envelope.action.tool}",
-                details={"result_hash": res_hash, "executed": True},
+            self.boundary.receipt_store.transition_action_state(
+                envelope.crossing_id,
+                "unknown",
+                actor_id=effective_principal,
+                reason="postcondition_unverified_no_verifier",
             )
-            self.boundary.receipt_store.record_evidence(ev)
-        # Update session and principal cumulative budgets for gateway execution
-        self.boundary.engine.budget_tracker.record_usage(
-            envelope,
-            principal_id=(
-                caller_context.authenticated_identity if caller_context else envelope.agent.id
-            ),
+            if envelope.action.idempotency_key:
+                self.boundary.receipt_store.finalize_idempotency_key(
+                    idempotency_key=envelope.action.idempotency_key,
+                    principal_id=effective_principal,
+                    crossing_id=envelope.crossing_id,
+                    status="reconciliation_required",
+                    result_hash=res_hash,
+                    response={"status": "unknown"},
+                )
+            get_global_metrics().increment("executions_unknown")
+            # Raise: gateway callers must handle this as a non-success outcome.
+            raise ActionBlockedError(
+                Decision(
+                    verdict=Verdict.HOLD,
+                    rule_id="kernel:postcondition-verifier-missing",
+                    reason=(
+                        "Postcondition verification required by policy but no verifier "
+                        "is configured; execution outcome recorded as unknown"
+                    ),
+                    policy_version=decision.policy_version,
+                    canonical_hash=envelope.canonical_hash,
+                ),
+                envelope.crossing_id,
+            )
+
+        # --- Run independent verifier ---
+        target_res = (
+            validated_postcondition.resource
+            if validated_postcondition
+            else envelope.action.resource
         )
-        return result
+        target_claim = (
+            validated_postcondition.claim if validated_postcondition else effective_claim
+        )
+        target_digest = (
+            validated_postcondition.expected_digest
+            if validated_postcondition
+            else effective_expected_digest
+        )
+
+        obs = None
+        try:
+            kwargs: dict[str, Any] = {"crossing_id": envelope.crossing_id}
+            if target_digest is not None:
+                kwargs["expected_digest"] = target_digest
+            try:
+                obs = verifier.verify(resource=target_res, claim=target_claim, **kwargs)
+            except TypeError:
+                obs = verifier.verify(resource=target_res, claim=target_claim)
+        except Exception as exc:
+            obs = build_observation(
+                subject_resource=target_res,
+                claim=target_claim,
+                status="error",
+                verifier_id=getattr(verifier, "verifier_id", "actentra.gateway.verifier.unknown"),
+                verifier_version=getattr(verifier, "verifier_version", "1.0.0"),
+                trust_domain="local_host",
+                crossing_id=envelope.crossing_id,
+                error=f"Verifier raised exception: {exc}",
+            )
+
+        verifier_id = getattr(verifier, "verifier_id", "actentra.gateway.verifier")
+
+        if obs.status == "verified":
+            # SUCCESS: postcondition independently confirmed.
+            if claim is not None:
+                with contextlib.suppress(Exception):
+                    self.boundary.receipt_store.consume_execution_claim(
+                        claim.claim_id,
+                        executor_principal_id=effective_principal,
+                        crossing_id=envelope.crossing_id,
+                        canonical_hash=envelope.canonical_hash,
+                        approval_or_warrant_id=claim.approval_or_warrant_id,
+                        result_digest=res_hash,
+                        evidence_id=obs.observation_id,
+                        verification_status="verified",
+                    )
+            self.boundary.receipt_store.record_outcome(
+                crossing_id=envelope.crossing_id,
+                session_id=envelope.session_id,
+                canonical_hash=envelope.canonical_hash,
+                policy_version=decision.policy_version,
+                status="success",
+                result_hash=res_hash,
+                evidence_status="externally_verified",
+                observation=obs,
+            )
+            self.boundary.receipt_store.transition_action_state(
+                envelope.crossing_id,
+                "succeeded",
+                actor_id=obs.verifier_id,
+                reason="postcondition_verified",
+            )
+            if envelope.action.idempotency_key:
+                self.boundary.receipt_store.finalize_idempotency_key(
+                    idempotency_key=envelope.action.idempotency_key,
+                    principal_id=effective_principal,
+                    crossing_id=envelope.crossing_id,
+                    status="completed",
+                    result_hash=res_hash,
+                    response={"result": result, "status": "success"},
+                )
+            get_global_metrics().increment("executions_succeeded")
+            get_global_metrics().record_latency(
+                f"gateway:{envelope.action.tool}", time.time() - t0
+            )
+            # Record externally-verified evidence and causal link
+            with contextlib.suppress(Exception):
+                ev = build_evidence_record(
+                    crossing_id=envelope.crossing_id,
+                    tier=EvidenceTier.EXTERNALLY_VERIFIED,
+                    trust_domain="verifier:workspace",
+                    collector=obs.verifier_id,
+                    details={
+                        "observation_id": obs.observation_id,
+                        "resource": obs.subject_resource,
+                        "claim": obs.claim,
+                        "status": obs.status,
+                        "observed_digest": obs.observed_digest,
+                    },
+                    expires_at=obs.expires_at,
+                )
+                self.boundary.receipt_store.record_evidence(ev)
+            with contextlib.suppress(Exception):
+                link = CausalLink(
+                    link_id=generate_link_id(),
+                    link_version="1",
+                    source_id=envelope.crossing_id,
+                    source_type="crossing",
+                    relation="verifies",
+                    target_id=obs.observation_id,
+                    target_type="observation",
+                    created_at=utc_iso(),
+                )
+                self.boundary.receipt_store.record_causal_link(link)
+            self.boundary.engine.budget_tracker.record_usage(
+                envelope,
+                principal_id=(
+                    caller_context.authenticated_identity if caller_context else envelope.agent.id
+                ),
+            )
+            return result
+
+        elif obs.status == "refuted":
+            # FAILURE: postcondition independently refuted.
+            if claim is not None:
+                with contextlib.suppress(Exception):
+                    self.boundary.receipt_store.consume_execution_claim(
+                        claim.claim_id,
+                        executor_principal_id=effective_principal,
+                        crossing_id=envelope.crossing_id,
+                        canonical_hash=envelope.canonical_hash,
+                        approval_or_warrant_id=claim.approval_or_warrant_id,
+                        result_digest=res_hash,
+                        evidence_id=obs.observation_id,
+                        verification_status="refuted",
+                    )
+            err_msg = (
+                f"Postcondition refuted: claim '{target_claim}' on resource '{target_res}'"
+            )
+            if obs.error:
+                err_msg += f" ({obs.error})"
+            self.boundary.receipt_store.record_outcome(
+                crossing_id=envelope.crossing_id,
+                session_id=envelope.session_id,
+                canonical_hash=envelope.canonical_hash,
+                policy_version=decision.policy_version,
+                status="failure",
+                result_hash=res_hash,
+                error=err_msg,
+                reason="postcondition_refuted",
+                evidence_status="locally_observed",
+                observation=obs,
+            )
+            self.boundary.receipt_store.transition_action_state(
+                envelope.crossing_id,
+                "failed",
+                actor_id=obs.verifier_id,
+                reason="postcondition_refuted",
+            )
+            if envelope.action.idempotency_key:
+                self.boundary.receipt_store.finalize_idempotency_key(
+                    idempotency_key=envelope.action.idempotency_key,
+                    principal_id=effective_principal,
+                    crossing_id=envelope.crossing_id,
+                    status="failed",
+                    response={"error": "postcondition_refuted"},
+                )
+            get_global_metrics().increment("executions_failed")
+            raise ActionBlockedError(
+                Decision(
+                    verdict=Verdict.DENY,
+                    rule_id="kernel:postcondition-refuted",
+                    reason=err_msg,
+                    policy_version=decision.policy_version,
+                    canonical_hash=envelope.canonical_hash,
+                ),
+                envelope.crossing_id,
+            )
+
+        else:
+            # UNKNOWN: verifier returned an indeterminate status (error, stale, etc.)
+            status_label = obs.status
+            if claim is not None:
+                with contextlib.suppress(Exception):
+                    self.boundary.receipt_store.consume_execution_claim(
+                        claim.claim_id,
+                        executor_principal_id=effective_principal,
+                        crossing_id=envelope.crossing_id,
+                        canonical_hash=envelope.canonical_hash,
+                        approval_or_warrant_id=claim.approval_or_warrant_id,
+                        result_digest=res_hash,
+                        evidence_id=obs.observation_id,
+                        verification_status=status_label,
+                    )
+            err_msg = (
+                f"Postcondition verification status is '{status_label}' "
+                f"for claim '{target_claim}'"
+            )
+            if obs.error:
+                err_msg += f": {obs.error}"
+            ev_status = "stale" if status_label == "stale" else "unknown"
+            self.boundary.receipt_store.record_outcome(
+                crossing_id=envelope.crossing_id,
+                session_id=envelope.session_id,
+                canonical_hash=envelope.canonical_hash,
+                policy_version=decision.policy_version,
+                status="unknown",
+                result_hash=res_hash,
+                error=err_msg,
+                reason=f"postcondition_{status_label}",
+                evidence_status=ev_status,
+                observation=obs,
+            )
+            self.boundary.receipt_store.transition_action_state(
+                envelope.crossing_id,
+                "unknown",
+                actor_id=obs.verifier_id,
+                reason=f"postcondition_{status_label}",
+            )
+            if envelope.action.idempotency_key:
+                self.boundary.receipt_store.finalize_idempotency_key(
+                    idempotency_key=envelope.action.idempotency_key,
+                    principal_id=effective_principal,
+                    crossing_id=envelope.crossing_id,
+                    status="reconciliation_required",
+                    result_hash=res_hash,
+                    response={"status": "unknown", "error": obs.error},
+                )
+            get_global_metrics().increment("executions_unknown")
+            raise ActionBlockedError(
+                Decision(
+                    verdict=Verdict.HOLD,
+                    rule_id=f"kernel:postcondition-{status_label}",
+                    reason=err_msg,
+                    policy_version=decision.policy_version,
+                    canonical_hash=envelope.canonical_hash,
+                ),
+                envelope.crossing_id,
+            )
 
     # --- 3. Approvals Management ---
 
@@ -1094,6 +1551,21 @@ class AppServices:
                 envelope, decision, executor, caller_context=caller_context
             )
             return {"status": "success", "result": result, "crossing_id": crossing_id}
+        except ActionBlockedError as exc:
+            # ActionBlockedError from _dispatch_and_record means postcondition verification
+            # failed or produced an unknown outcome. This is NOT a simple executor failure.
+            outcome_status = (
+                "unknown"
+                if exc.decision.rule_id.startswith("kernel:postcondition-")
+                and "refuted" not in exc.decision.rule_id
+                else "failure"
+            )
+            return {
+                "status": outcome_status,
+                "error": exc.decision.reason,
+                "rule_id": exc.decision.rule_id,
+                "crossing_id": crossing_id,
+            }
         except Exception as exc:
             return {"status": "failure", "error": type(exc).__name__, "crossing_id": crossing_id}
 

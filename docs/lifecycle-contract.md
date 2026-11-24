@@ -173,8 +173,14 @@ Actentra classifies evidence into 5 formal tiers (`spec/evidence.v1.schema.json`
 ### 4.3 Local HTTP Gateway Service (`/v1/crossings`)
 - **Propose & Evaluate:** `POST /v1/crossings` canonicalizes envelope, evaluates policy, and records decision receipt.
 - **Execution Continuation:**
-  - If `execute: true` is passed and the action is allowed (or once approved), gateway dispatches directly to registered executors (`LocalFSExecutor`, `ScopedSQLiteExecutor`, `ScopedHTTPExecutor`), commits outcome receipt, and returns the result.
-  - If execution is managed externally, the client uses `POST /v1/crossings/{id}/outcome` to record the post-execution outcome receipt (`success`, `failure`, `unknown`), completing the audit chain.
+  - If `execute: true` is passed and the action is allowed (or once approved), gateway dispatches through the authoritative execution lifecycle (`_dispatch_and_record`), enforcing:
+    - TOCTOU hash verification immediately prior to dispatch.
+    - Policy constraint and postcondition inspection (`require_postcondition`, `postcondition`, `expected_digest`).
+    - Execution claim binding and registration.
+    - Full lifecycle state machine advancement (`authorized` -> `claimed` -> `executing` -> `verification_pending` -> `succeeded`/`failed`/`unknown`).
+    - Mandatory postcondition verification via configured verifier before success promotion; an executor returning success is NOT sufficient without verification.
+    - Atomic outcome recording (`externally_verified` evidence upon verification, or `failure`/`unknown` if refuted or unverified).
+  - If execution is managed externally, the client uses `POST /v1/crossings/{id}/claim` and `POST /v1/crossings/{id}/outcome` to record the post-execution outcome receipt (`success`, `failure`, `unknown`), completing the audit chain.
 - **Approval Persistence:** `ASK` crossings are persisted in SQLite WAL `pending_approvals`. Survives gateway restarts.
 - **Operator Console:** Web UI at `/ui` exposes real-time approvals, simulator, policy linter, and paged receipts.
 
