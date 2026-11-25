@@ -1351,6 +1351,7 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 crossing_id,
                 status=status_val,
                 claim_id=claim_id,
+                observation_id=data.get("observation_id"),
                 result_hash=data.get("result_hash"),
                 error=data.get("error"),
                 caller_context=caller_ctx,
@@ -1433,13 +1434,45 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            try:
+                caller_ctx = self._get_caller_context()
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "unauthorized_principal"},
+                )
+                return
+
+            try:
+                ttl_val = float(data.get("ttl_seconds", 60.0))
+            except (TypeError, ValueError):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "Field 'ttl_seconds' must be a number", "code": "invalid_ttl"},
+                )
+                return
+
             res = services.verify_state(
                 resource=str(resource),
                 claim=str(claim),
                 crossing_id=data.get("crossing_id"),
+                claim_id=data.get("claim_id"),
                 expected_digest=data.get("expected_digest"),
-                ttl_seconds=float(data.get("ttl_seconds", 60.0)),
+                ttl_seconds=ttl_val,
+                caller_context=caller_ctx,
             )
+            if "error" in res and res.get("status") == "error" and "code" in res:
+                code = res.get("code")
+                if code == "forbidden":
+                    status_code = HTTPStatus.FORBIDDEN
+                elif code in ("not_found", "claim_not_found"):
+                    status_code = HTTPStatus.NOT_FOUND
+                elif code == "conflict":
+                    status_code = HTTPStatus.CONFLICT
+                else:
+                    status_code = HTTPStatus.BAD_REQUEST
+                self._send_json(status_code, res)
+                return
             self._send_json(HTTPStatus.OK, res)
             return
 

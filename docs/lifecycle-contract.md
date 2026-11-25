@@ -180,7 +180,7 @@ Actentra classifies evidence into 5 formal tiers (`spec/evidence.v1.schema.json`
     - Full lifecycle state machine advancement (`authorized` -> `claimed` -> `executing` -> `verification_pending` -> `succeeded`/`failed`/`unknown`).
     - Mandatory postcondition verification via configured verifier before success promotion; an executor returning success is NOT sufficient without verification.
     - Atomic outcome recording (`externally_verified` evidence upon verification, or `failure`/`unknown` if refuted or unverified).
-  - If execution is managed externally, the client uses `POST /v1/crossings/{id}/claim` and `POST /v1/crossings/{id}/outcome` to record the post-execution outcome receipt (`success`, `failure`, `unknown`), completing the audit chain.
+  - If execution is managed externally, the client uses `POST /v1/crossings/{id}/claim` to obtain a one-time `ExecutionClaim`. When postcondition verification is required, `POST /v1/observations/verify` must generate a bound `ObservationRecord` anchored to a canonical `VerificationContext` (exact crossing, action hash, canonical resource, expected postcondition/digest, active claim, executor, and authenticated verifier). `POST /v1/crossings/{id}/outcome` atomically validates and consumes both the bound observation and execution claim before recording `success`, completing the audit chain.
 - **Approval Persistence:** `ASK` crossings are persisted in SQLite WAL `pending_approvals`. Survives gateway restarts.
 - **Operator Console:** Web UI at `/ui` exposes real-time approvals, simulator, policy linter, and paged receipts.
 

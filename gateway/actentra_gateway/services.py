@@ -7,7 +7,9 @@ canary simulations, and audit reporting for both the CLI and Local Web UI.
 from __future__ import annotations
 
 import contextlib
+import hmac
 import json
+import math
 import threading
 import time
 import uuid
@@ -16,7 +18,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 from actentra.boundary import ActionBlockedError, Boundary
-from actentra_core.canonicalize import hash_canonical
+from actentra_core.canonicalize import (
+    CanonicalizationError,
+    canonicalize_resource,
+    canonicalize_unicode,
+    canonicalize_windows_path,
+    hash_canonical,
+)
 from actentra_core.causal import (
     CausalLink,
     build_causal_trace,
@@ -64,7 +72,13 @@ from actentra_core.lifecycle import (
     ReconciliationRequiredError,
 )
 from actentra_core.observability import get_global_metrics
-from actentra_core.observations import build_observation
+from actentra_core.observations import (
+    ObservationError,
+    ObservationRecord,
+    build_observation,
+    build_verification_context,
+    compute_verification_context_hash,
+)
 from actentra_core.policy import lint_policy, load_policy_yaml
 from actentra_core.receipts import GENESIS_HASH, SessionRecord, verify_log
 from actentra_core.verdict import Decision, Verdict
@@ -1651,12 +1665,197 @@ class AppServices:
         except Exception as exc:
             return {"error": str(exc), "code": "claim_failed"}
 
+    def _normalize_bound_resource(self, resource: str) -> str:
+        """Canonicalize a resource identifier using the same representation as policy/verifiers."""
+        clean = canonicalize_unicode(resource).strip()
+        if clean.lower().startswith("path:"):
+            raw_path = clean[5:]
+            base = self.file_verifier.workspace_root if self.file_verifier is not None else None
+            try:
+                canon = canonicalize_windows_path(raw_path, base_dir=base, resolve_fs=True)
+                return f"path:{canon}"
+            except CanonicalizationError:
+                return canonicalize_resource(clean)
+        return canonicalize_resource(clean)
+
+    def _resolve_crossing_postcondition(
+        self,
+        raw_env: dict[str, Any],
+        dec_constraints: dict[str, Any],
+    ) -> tuple[str, str, str | None]:
+        """Resolve canonical authorized resource, expected claim, and expected digest."""
+        action_data = raw_env.get("action") or {}
+        tool = str(action_data.get("tool", ""))
+        verb = str(action_data.get("verb", "other"))
+        raw_res = str(action_data.get("resource", ""))
+        params = action_data.get("params") or {}
+        authorized_resource = self._normalize_bound_resource(raw_res)
+
+        policy_post_claim: str | None = dec_constraints.get("postcondition")
+        policy_expected_digest: str | None = dec_constraints.get("expected_digest")
+
+        req_posts = dec_constraints.get("required_postconditions")
+        if isinstance(req_posts, (list, tuple)) and req_posts:
+            first_post = req_posts[0]
+            if isinstance(first_post, dict):
+                if policy_post_claim is None and first_post.get("claim"):
+                    policy_post_claim = str(first_post["claim"])
+                if policy_expected_digest is None and first_post.get("expected_digest"):
+                    policy_expected_digest = str(first_post["expected_digest"])
+                if first_post.get("resource"):
+                    spec_res = self._normalize_bound_resource(str(first_post["resource"]))
+                    if spec_res != authorized_resource:
+                        raise ContextError(
+                            f"Postcondition resource '{spec_res}' does not match "
+                            f"authorized action resource '{authorized_resource}'"
+                        )
+
+        effective_claim = str(policy_post_claim) if policy_post_claim else "exists"
+        validated = validate_postcondition_semantics(
+            tool=tool,
+            verb=verb,
+            resource=authorized_resource,
+            claim=effective_claim,
+            params=params,
+            expected_digest=policy_expected_digest,
+            strict=True,
+        )
+        return (
+            authorized_resource,
+            validated.claim,
+            validated.expected_digest.lower() if validated.expected_digest else None,
+        )
+
+    def _validate_bound_observation_for_outcome(
+        self,
+        obs: ObservationRecord,
+        *,
+        crossing_id: str,
+        claim_id: str,
+        executor_principal_id: str,
+        canonical_action_hash: str,
+        authorized_resource: str,
+        expected_claim: str,
+        expected_digest: str | None,
+        policy_version: str,
+    ) -> str | None:
+        """Validate all cryptographic, resource, claim, postcondition, and identity bindings."""
+        if not obs.verify_integrity():
+            return f"Observation '{obs.observation_id}' failed cryptographic integrity verification"
+        if obs.consumed_at is not None:
+            return f"Observation '{obs.observation_id}' has already been consumed"
+        if obs.crossing_id != crossing_id:
+            return (
+                f"Observation '{obs.observation_id}' is bound to crossing '{obs.crossing_id}', "
+                f"not '{crossing_id}'"
+            )
+        if obs.claim_id != claim_id:
+            return (
+                f"Observation '{obs.observation_id}' is bound to claim '{obs.claim_id}', "
+                f"not '{claim_id}'"
+            )
+        if obs.canonical_action_hash != canonical_action_hash:
+            return (
+                f"Observation '{obs.observation_id}' action hash '{obs.canonical_action_hash}' "
+                f"does not match crossing action hash '{canonical_action_hash}'"
+            )
+        if obs.executor_principal_id != executor_principal_id:
+            return (
+                f"Observation '{obs.observation_id}' executor '{obs.executor_principal_id}' "
+                f"does not match claim executor '{executor_principal_id}'"
+            )
+        if obs.policy_version != policy_version:
+            return (
+                f"Observation '{obs.observation_id}' policy version '{obs.policy_version}' "
+                f"does not match decision policy version '{policy_version}'"
+            )
+        if (
+            not obs.verification_id
+            or not obs.verifier_principal_id
+            or not obs.verification_context_hash
+        ):
+            return (
+                f"Observation '{obs.observation_id}' is missing canonical verification context "
+                "binding"
+            )
+
+        try:
+            obs_res = self._normalize_bound_resource(obs.subject_resource)
+        except Exception as exc:
+            return f"Observation resource '{obs.subject_resource}' failed normalization: {exc}"
+
+        if obs_res != authorized_resource:
+            return (
+                f"Observation resource '{obs_res}' does not match authorized crossing resource "
+                f"'{authorized_resource}'"
+            )
+
+        expected_ctx_hash = compute_verification_context_hash(
+            verification_id=obs.verification_id,
+            crossing_id=crossing_id,
+            canonical_action_hash=canonical_action_hash,
+            authorized_resource=authorized_resource,
+            expected_postcondition=expected_claim,
+            expected_digest=expected_digest,
+            claim_id=claim_id,
+            executor_principal_id=executor_principal_id,
+            verifier_principal_id=obs.verifier_principal_id,
+            policy_version=policy_version,
+            observed_at=obs.observed_at,
+            expires_at=obs.expires_at or "",
+        )
+        if not hmac.compare_digest(obs.verification_context_hash, expected_ctx_hash):
+            return (
+                f"Observation '{obs.observation_id}' verification context hash mismatch "
+                "(context tampering or binding mismatch)"
+            )
+
+        if obs.status != "verified":
+            return f"Observation '{obs.observation_id}' has status '{obs.status}', not 'verified'"
+
+        clean_obs_claim = canonicalize_unicode(obs.claim).strip().lower()
+        if clean_obs_claim != expected_claim:
+            return (
+                f"Observation postcondition claim '{clean_obs_claim}' does not satisfy "
+                f"required postcondition '{expected_claim}'"
+            )
+
+        if expected_claim == "digest_match":
+            if not expected_digest:
+                return "Missing expected_digest for 'digest_match' postcondition"
+            if not obs.observed_digest:
+                return f"Observation '{obs.observation_id}' is missing observed_digest"
+            if obs.observed_digest.strip().lower() != expected_digest.strip().lower():
+                return (
+                    f"Observed digest '{obs.observed_digest}' does not match expected digest "
+                    f"'{expected_digest}'"
+                )
+        elif expected_claim == "exists":
+            if obs.metadata.get("exists") is not True:
+                return f"Observation '{obs.observation_id}' did not confirm resource existence"
+            if authorized_resource.startswith("path:") and not obs.observed_digest:
+                return f"Observation '{obs.observation_id}' is missing file digest for 'exists'"
+        elif expected_claim == "absent" and obs.metadata.get("exists") is not False:
+            return f"Observation '{obs.observation_id}' did not confirm resource absence"
+
+        if obs.expires_at is None or not obs.is_fresh():
+            return f"Observation '{obs.observation_id}' is expired or missing expiry"
+
+        verifier_id_low = obs.verifier_id.strip().lower()
+        if not verifier_id_low or verifier_id_low.startswith(
+            ("caller", "llm", "agent", "anonymous")
+        ):
+            return f"Untrusted observation producer '{obs.verifier_id}'"
+
+        return None
+
     def record_external_outcome(
         self,
         crossing_id: str,
         *,
         status: Literal["success", "failure", "unknown"],
         claim_id: str | None = None,
+        observation_id: str | None = None,
         result_hash: str | None = None,
         error: str | None = None,
         caller_context: CallerContext | None = None,
@@ -1717,30 +1916,9 @@ class AppServices:
         except Exception:
             dec_constraints = {}
 
-        # Phase 5: Prevent false success promotion if postcondition verification was mandated
-        if status == "success" and (
-            dec_constraints.get("require_postcondition")
-            or "postcondition" in dec_constraints
-            or "required_postconditions" in dec_constraints
-        ):
-            ev_records = self.boundary.receipt_store.list_evidence(crossing_id=crossing_id)
-            has_verified = any(ev.tier == EvidenceTier.EXTERNALLY_VERIFIED for ev in ev_records)
-            if not has_verified:
-                obs_records = self.boundary.receipt_store.list_observations(crossing_id=crossing_id)
-                has_verified = any(obs.status == "verified" for obs in obs_records)
-
-            if not has_verified:
-                return {
-                    "error": (
-                        f"False success promotion rejected: crossing '{crossing_id}' requires "
-                        "independent postcondition verification, but no verified state observation "
-                        "was found"
-                    ),
-                    "code": "unverified_postcondition",
-                }
-
         executor_principal = "anonymous_executor"
         if caller_context is not None:
+            self._validate_caller_context(caller_context)
             if not caller_context.has_scope("crossings:outcome") and not caller_context.has_scope(
                 "crossings:execute"
             ):
@@ -1753,8 +1931,147 @@ class AppServices:
                 }
             executor_principal = caller_context.principal_id
 
-        # Validate and consume execution claim (Finding 5 & Phase 5)
+        require_post = bool(
+            dec_constraints.get("require_postcondition")
+            or "postcondition" in dec_constraints
+            or "required_postconditions" in dec_constraints
+            or dec_constraints.get("strict_postconditions")
+        )
+
         clean_claim_id = str(claim_id).strip() if claim_id is not None else None
+        if not clean_claim_id and (
+            caller_context is not None
+            or require_claim
+            or require_post
+            or dec_constraints.get("require_claim")
+        ):
+            return {
+                "error": (
+                    "Missing required 'claim_id': external outcome reporting requires a valid "
+                    "one-time execution claim issued via POST /v1/crossings/{id}/claim"
+                ),
+                "code": "claim_required",
+            }
+
+        # Phase 2: Strict bound observation verification before consuming claim
+        consumed_obs: ObservationRecord | None = None
+        if status == "success" and require_post:
+            assert clean_claim_id is not None
+            claim_rec = self.boundary.receipt_store.get_execution_claim(clean_claim_id)
+            if claim_rec is None:
+                return {
+                    "error": f"Execution claim '{clean_claim_id}' not found",
+                    "code": "not_found",
+                }
+            if claim_rec.crossing_id != crossing_id:
+                return {
+                    "error": (
+                        f"Execution claim '{clean_claim_id}' was issued for crossing "
+                        f"'{claim_rec.crossing_id}', not '{crossing_id}'"
+                    ),
+                    "code": "claim_invalid",
+                }
+            if claim_rec.canonical_hash != raw_env["canonical_hash"]:
+                return {
+                    "error": (
+                        f"Execution claim '{clean_claim_id}' action hash mismatch "
+                        f"for crossing '{crossing_id}'"
+                    ),
+                    "code": "claim_invalid",
+                }
+            if (
+                executor_principal != "anonymous_executor"
+                and claim_rec.executor_principal_id != executor_principal
+            ):
+                return {
+                    "error": (
+                        f"Execution claim '{clean_claim_id}' was issued to executor "
+                        f"'{claim_rec.executor_principal_id}', not caller '{executor_principal}'"
+                    ),
+                    "code": "forbidden",
+                }
+            if claim_rec.status == "consumed":
+                return {
+                    "error": f"Execution claim '{clean_claim_id}' has already been consumed",
+                    "code": "conflict",
+                }
+            if claim_rec.is_expired():
+                return {
+                    "error": f"Execution claim '{clean_claim_id}' has expired",
+                    "code": "expired",
+                }
+
+            try:
+                auth_resource, exp_claim, exp_digest = self._resolve_crossing_postcondition(
+                    raw_env, dec_constraints
+                )
+            except Exception as exc:
+                return {
+                    "error": f"Invalid crossing postcondition specification: {exc}",
+                    "code": "unverified_postcondition",
+                }
+
+            candidates: list[ObservationRecord] = []
+            if observation_id:
+                obs_id_clean = str(observation_id).strip()
+                single_obs = self.boundary.receipt_store.get_observation(obs_id_clean)
+                if single_obs is not None:
+                    candidates = [single_obs]
+            else:
+                candidates = self.boundary.receipt_store.list_observations(crossing_id=crossing_id)
+
+            matched_obs: ObservationRecord | None = None
+            rejection_reasons: list[str] = []
+            for cand in candidates:
+                reason = self._validate_bound_observation_for_outcome(
+                    cand,
+                    crossing_id=crossing_id,
+                    claim_id=clean_claim_id,
+                    executor_principal_id=claim_rec.executor_principal_id,
+                    canonical_action_hash=raw_env["canonical_hash"],
+                    authorized_resource=auth_resource,
+                    expected_claim=exp_claim,
+                    expected_digest=exp_digest,
+                    policy_version=dec_rec.policy_version,
+                )
+                if reason is None:
+                    matched_obs = cand
+                    break
+                rejection_reasons.append(reason)
+
+            if matched_obs is None:
+                detail = (
+                    rejection_reasons[0]
+                    if rejection_reasons
+                    else "no bound verified state observation was found"
+                )
+                return {
+                    "error": (
+                        f"False success promotion rejected: crossing '{crossing_id}' requires "
+                        f"independent postcondition verification ({detail})"
+                    ),
+                    "code": "unverified_postcondition",
+                }
+
+            try:
+                consumed_obs = self.boundary.receipt_store.consume_observation_for_outcome(
+                    matched_obs.observation_id,
+                    crossing_id=crossing_id,
+                    claim_id=clean_claim_id,
+                )
+            except ObservationError as exc:
+                err_low = str(exc).lower()
+                code = (
+                    "conflict"
+                    if "consumed" in err_low or "replayed" in err_low
+                    else "unverified_postcondition"
+                )
+                return {
+                    "error": f"False success promotion rejected: {exc}",
+                    "code": code,
+                }
+
+        # Validate and consume execution claim (Finding 5 & Phase 5)
         if clean_claim_id:
             try:
                 self.boundary.receipt_store.consume_execution_claim(
@@ -1763,6 +2080,8 @@ class AppServices:
                     crossing_id=crossing_id,
                     canonical_hash=raw_env["canonical_hash"],
                     result_digest=result_hash,
+                    evidence_id=consumed_obs.observation_id if consumed_obs else None,
+                    verification_status="verified" if consumed_obs else "unverified",
                 )
             except ExecutionClaimError as exc:
                 err_msg = str(exc)
@@ -1776,19 +2095,6 @@ class AppServices:
                 elif "expired" in err_msg.lower():
                     code = "expired"
                 return {"error": err_msg, "code": code}
-        elif (
-            caller_context is not None
-            or require_claim
-            or dec_constraints.get("require_postcondition")
-            or dec_constraints.get("require_claim")
-        ):
-            return {
-                "error": (
-                    "Missing required 'claim_id': external outcome reporting requires a valid "
-                    "one-time execution claim issued via POST /v1/crossings/{id}/claim"
-                ),
-                "code": "claim_required",
-            }
         else:
             # Direct in-process call without caller_context and claim: auto-issue internal claim
             try:
@@ -1815,6 +2121,8 @@ class AppServices:
                     "code": "conflict",
                 }
 
+        ev_status = "externally_verified" if consumed_obs is not None else "caller_reported"
+        outcome_reason = "postcondition_verified" if consumed_obs is not None else "caller-reported"
         try:
             rec = self.boundary.receipt_store.record_outcome(
                 crossing_id=crossing_id,
@@ -1824,8 +2132,9 @@ class AppServices:
                 status=status,
                 result_hash=result_hash,
                 error=error,
-                reason="caller-reported",
-                evidence_status="caller_reported",
+                reason=outcome_reason,
+                evidence_status=ev_status,
+                observation=consumed_obs,
             )
         except Exception as exc:
             code = "conflict" if "already recorded" in str(exc).lower() else "record_failed"
@@ -1834,15 +2143,30 @@ class AppServices:
         with contextlib.suppress(Exception):
             ev = build_evidence_record(
                 crossing_id=crossing_id,
-                tier=EvidenceTier.CALLER_REPORTED,
-                trust_domain="external_caller",
-                collector=f"executor:{executor_principal}",
+                tier=(
+                    EvidenceTier.EXTERNALLY_VERIFIED
+                    if consumed_obs is not None
+                    else EvidenceTier.CALLER_REPORTED
+                ),
+                trust_domain=(
+                    "verifier:workspace" if consumed_obs is not None else "external_caller"
+                ),
+                collector=(
+                    consumed_obs.verifier_id
+                    if consumed_obs is not None
+                    else f"executor:{executor_principal}"
+                ),
                 details={
                     "claim_id": clean_claim_id,
                     "reported_status": status,
                     "result_hash": result_hash,
                     "error": error,
                     "executor_principal_id": executor_principal,
+                    "observation_id": consumed_obs.observation_id if consumed_obs else None,
+                    "verification_id": consumed_obs.verification_id if consumed_obs else None,
+                    "verification_context_hash": (
+                        consumed_obs.verification_context_hash if consumed_obs else None
+                    ),
                 },
             )
             self.boundary.receipt_store.record_evidence(ev)
@@ -1872,16 +2196,21 @@ class AppServices:
                     principal_id=executor_principal,
                 )
 
-        return {
+        resp: dict[str, Any] = {
             "status": "recorded",
             "crossing_id": crossing_id,
             "claim_id": clean_claim_id,
             "outcome_seq": rec.seq,
             "entry_hash": rec.entry_hash,
             "reported_by": "caller",
-            "evidence_tier": "caller_reported",
-            "externally_verified": False,
+            "evidence_tier": ev_status,
+            "externally_verified": consumed_obs is not None,
         }
+        if consumed_obs is not None:
+            resp["observation_id"] = consumed_obs.observation_id
+            resp["verification_id"] = consumed_obs.verification_id
+            resp["verification_context_hash"] = consumed_obs.verification_context_hash
+        return resp
 
     # --- 4. Policy, Linting, & Canary ---
 
@@ -2151,24 +2480,265 @@ class AppServices:
         claim: str,
         *,
         crossing_id: str | None = None,
+        claim_id: str | None = None,
         expected_digest: str | None = None,
         ttl_seconds: float = 60.0,
+        caller_context: CallerContext | None = None,
+        now: float | None = None,
     ) -> dict[str, Any]:
-        """Perform a read-only state verification and persist an observation record."""
+        """Perform a read-only state verification and persist a bound observation record."""
+        try:
+            self._require_scope_or_operator(caller_context, "observations:verify")
+        except IdentitySecurityError as exc:
+            return {"error": str(exc), "status": "error", "code": "forbidden"}
+
+        if not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+            return {
+                "error": f"ttl_seconds must be positive and finite, got {ttl_seconds!r}",
+                "status": "error",
+                "code": "invalid_ttl",
+            }
+
         if self.file_verifier is None:
             return {
                 "error": "No file verifier configured (register filesystem executor or verifier)",
                 "status": "error",
             }
-        obs = self.file_verifier.verify(
-            resource=resource,
-            claim=claim,
+
+        if crossing_id is None:
+            obs = self.file_verifier.verify(
+                resource=resource,
+                claim=claim,
+                crossing_id=None,
+                expected_digest=expected_digest,
+                ttl_seconds=ttl_seconds,
+                now=now,
+            )
+            self.boundary.receipt_store.record_observation(obs)
+            return obs.to_dict()
+
+        # --- Crossing-bound verification: establish canonical VerificationContext ---
+        dec_rec = self.boundary.receipt_store.get_decision_receipt(crossing_id)
+        if dec_rec is None:
+            return {
+                "error": f"Decision receipt not found for crossing '{crossing_id}'",
+                "status": "error",
+                "code": "not_found",
+            }
+        if dec_rec.verdict not in ("allow", "allow_with_constraints"):
+            p = self.boundary.receipt_store.get_pending_approval(crossing_id)
+            if p is None or p.status != "approved":
+                return {
+                    "error": (
+                        f"Cannot verify crossing '{crossing_id}' with non-allowed decision "
+                        f"(verdict={dec_rec.verdict})"
+                    ),
+                    "status": "error",
+                    "code": "not_permitted",
+                }
+        if self.boundary.receipt_store.get_outcome_receipt(crossing_id) is not None:
+            return {
+                "error": f"Outcome already recorded for crossing '{crossing_id}'",
+                "status": "error",
+                "code": "conflict",
+            }
+
+        raw_env = self.boundary.receipt_store.get_envelope(crossing_id)
+        if raw_env is None:
+            return {
+                "error": f"Crossing '{crossing_id}' envelope not found in store",
+                "status": "error",
+                "code": "not_found",
+            }
+
+        dec_constraints: dict[str, Any] = {}
+        try:
+            action_data = raw_env.get("action") or {}
+            agent_data = raw_env.get("agent") or {}
+            prov_items = [
+                ProvenanceItem(source=item["source"], trust=item["trust"])
+                for item in raw_env.get("provenance", [])
+                if isinstance(item, dict) and "source" in item and "trust" in item
+            ]
+            env = build_envelope(
+                tool=str(action_data.get("tool", "")),
+                verb=str(action_data.get("verb", "other")),
+                resource=str(action_data.get("resource", "")),
+                params=action_data.get("params") or {},
+                session_id=str(raw_env.get("session_id", "default")),
+                agent_id=str(agent_data.get("id", "http-client")),
+                provenance=prov_items,
+                crossing_id=crossing_id,
+            )
+            dec_constraints = dict(self.boundary.engine.evaluate(env).constraints)
+        except Exception:
+            dec_constraints = {}
+
+        try:
+            auth_resource, exp_claim, exp_digest = self._resolve_crossing_postcondition(
+                raw_env, dec_constraints
+            )
+        except Exception as exc:
+            return {
+                "error": f"Invalid crossing postcondition specification: {exc}",
+                "status": "error",
+                "code": "postcondition_mismatch",
+            }
+
+        try:
+            req_resource = self._normalize_bound_resource(resource)
+        except Exception as exc:
+            return {
+                "error": f"Invalid resource '{resource}': {exc}",
+                "status": "error",
+                "code": "resource_mismatch",
+            }
+
+        if req_resource != auth_resource:
+            return {
+                "error": (
+                    f"Resource mismatch: requested '{req_resource}', but crossing "
+                    f"'{crossing_id}' is authorized for '{auth_resource}'"
+                ),
+                "status": "error",
+                "code": "resource_mismatch",
+            }
+
+        req_claim = canonicalize_unicode(claim).strip().lower()
+        if req_claim != exp_claim:
+            return {
+                "error": (
+                    f"Postcondition mismatch: requested '{req_claim}', but crossing "
+                    f"'{crossing_id}' requires '{exp_claim}'"
+                ),
+                "status": "error",
+                "code": "postcondition_mismatch",
+            }
+
+        req_digest = expected_digest.strip().lower() if expected_digest else None
+        if exp_digest is not None and req_digest is not None and req_digest != exp_digest:
+            return {
+                "error": (
+                    f"Expected digest mismatch: requested '{req_digest}', but crossing "
+                    f"'{crossing_id}' requires '{exp_digest}'"
+                ),
+                "status": "error",
+                "code": "digest_mismatch",
+            }
+        effective_digest = exp_digest if exp_digest is not None else req_digest
+        if exp_claim == "digest_match" and not effective_digest:
+            return {
+                "error": f"Missing expected_digest for 'digest_match' on crossing '{crossing_id}'",
+                "status": "error",
+                "code": "missing_expected_digest",
+            }
+
+        # --- Execution claim binding ---
+        if claim_id is not None and str(claim_id).strip():
+            claim_rec = self.boundary.receipt_store.get_execution_claim(str(claim_id).strip())
+            if claim_rec is None:
+                return {
+                    "error": f"Execution claim '{claim_id}' not found",
+                    "status": "error",
+                    "code": "claim_not_found",
+                }
+        else:
+            claim_rec = self.boundary.receipt_store.get_execution_claim_for_crossing(crossing_id)
+            if claim_rec is None:
+                return {
+                    "error": (
+                        f"Crossing '{crossing_id}' must be claimed before bound state verification"
+                    ),
+                    "status": "error",
+                    "code": "claim_required",
+                }
+
+        if claim_rec.crossing_id != crossing_id:
+            return {
+                "error": (
+                    f"Execution claim '{claim_rec.claim_id}' belongs to crossing "
+                    f"'{claim_rec.crossing_id}', not '{crossing_id}'"
+                ),
+                "status": "error",
+                "code": "claim_crossing_mismatch",
+            }
+        if claim_rec.canonical_hash != raw_env["canonical_hash"]:
+            return {
+                "error": f"Execution claim '{claim_rec.claim_id}' canonical action hash mismatch",
+                "status": "error",
+                "code": "claim_action_mismatch",
+            }
+        if claim_rec.status != "issued":
+            return {
+                "error": (
+                    f"Execution claim '{claim_rec.claim_id}' is not active "
+                    f"(status={claim_rec.status})"
+                ),
+                "status": "error",
+                "code": "claim_not_active",
+            }
+        if claim_rec.is_expired(now=now):
+            return {
+                "error": f"Execution claim '{claim_rec.claim_id}' has expired",
+                "status": "error",
+                "code": "claim_expired",
+            }
+
+        verifier_principal = (
+            caller_context.principal_id if caller_context is not None else "local_verifier"
+        )
+        allowed_verifiers = dec_constraints.get("allowed_verifiers")
+        if (
+            isinstance(allowed_verifiers, (list, tuple, set))
+            and allowed_verifiers
+            and verifier_principal not in allowed_verifiers
+        ):
+            return {
+                "error": (
+                    f"Principal '{verifier_principal}' is not an authorized verifier "
+                    f"for crossing '{crossing_id}'"
+                ),
+                "status": "error",
+                "code": "forbidden",
+            }
+
+        ver_ctx = build_verification_context(
             crossing_id=crossing_id,
-            expected_digest=expected_digest,
+            canonical_action_hash=raw_env["canonical_hash"],
+            authorized_resource=auth_resource,
+            expected_postcondition=exp_claim,
+            expected_digest=effective_digest,
+            claim_id=claim_rec.claim_id,
+            executor_principal_id=claim_rec.executor_principal_id,
+            verifier_principal_id=verifier_principal,
+            policy_version=dec_rec.policy_version,
             ttl_seconds=ttl_seconds,
+            now=now,
+        )
+
+        raw_obs = self.file_verifier.verify(
+            resource=auth_resource,
+            claim=exp_claim,
+            crossing_id=crossing_id,
+            expected_digest=effective_digest,
+            ttl_seconds=ttl_seconds,
+            now=now,
+        )
+        obs = build_observation(
+            observation_id=raw_obs.observation_id,
+            subject_resource=raw_obs.subject_resource,
+            claim=raw_obs.claim,
+            status=raw_obs.status,
+            verifier_id=raw_obs.verifier_id,
+            verifier_version=raw_obs.verifier_version,
+            trust_domain=raw_obs.trust_domain,
+            observed_digest=raw_obs.observed_digest,
+            metadata=raw_obs.metadata,
+            error=raw_obs.error,
+            verification_context=ver_ctx,
         )
         self.boundary.receipt_store.record_observation(obs)
-        if obs.status == "verified" and crossing_id:
+        if obs.status == "verified":
             with contextlib.suppress(Exception):
                 ev = build_evidence_record(
                     crossing_id=crossing_id,
@@ -2177,10 +2747,18 @@ class AppServices:
                     collector=obs.verifier_id,
                     details={
                         "observation_id": obs.observation_id,
+                        "verification_id": obs.verification_id,
+                        "claim_id": obs.claim_id,
+                        "canonical_action_hash": obs.canonical_action_hash,
                         "resource": obs.subject_resource,
                         "claim": obs.claim,
-                        "status": obs.status,
+                        "expected_digest": obs.expected_digest,
                         "observed_digest": obs.observed_digest,
+                        "status": obs.status,
+                        "executor_principal_id": obs.executor_principal_id,
+                        "verifier_principal_id": obs.verifier_principal_id,
+                        "policy_version": obs.policy_version,
+                        "verification_context_hash": obs.verification_context_hash,
                     },
                     expires_at=obs.expires_at,
                 )

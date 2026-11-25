@@ -64,7 +64,7 @@ from actentra_core.lifecycle import (
     validate_lifecycle_transition,
 )
 from actentra_core.observability import get_global_metrics
-from actentra_core.observations import ObservationRecord
+from actentra_core.observations import ObservationError, ObservationRecord
 from actentra_core.verdict import Decision
 
 GENESIS_HASH = "sha256:" + ("0" * 64)
@@ -405,12 +405,43 @@ class ReceiptStore:
                     trust_domain TEXT NOT NULL,
                     metadata_json TEXT NOT NULL,
                     error TEXT,
-                    observation_hash TEXT NOT NULL
+                    observation_hash TEXT NOT NULL,
+                    verification_id TEXT,
+                    claim_id TEXT,
+                    canonical_action_hash TEXT,
+                    expected_postcondition TEXT,
+                    expected_digest TEXT,
+                    executor_principal_id TEXT,
+                    verifier_principal_id TEXT,
+                    policy_version TEXT,
+                    verification_context_hash TEXT,
+                    consumed_at TEXT,
+                    consumed_by_crossing_id TEXT,
+                    consumed_by_claim_id TEXT
                 );
                 """
             )
+            for col, col_type in (
+                ("verification_id", "TEXT"),
+                ("claim_id", "TEXT"),
+                ("canonical_action_hash", "TEXT"),
+                ("expected_postcondition", "TEXT"),
+                ("expected_digest", "TEXT"),
+                ("executor_principal_id", "TEXT"),
+                ("verifier_principal_id", "TEXT"),
+                ("policy_version", "TEXT"),
+                ("verification_context_hash", "TEXT"),
+                ("consumed_at", "TEXT"),
+                ("consumed_by_crossing_id", "TEXT"),
+                ("consumed_by_claim_id", "TEXT"),
+            ):
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute(f"ALTER TABLE observations ADD COLUMN {col} {col_type};")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_obs_crossing ON observations(crossing_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_obs_claim ON observations(claim_id);"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_obs_resource ON observations(subject_resource);"
@@ -913,28 +944,20 @@ class ReceiptStore:
             if observation is not None:
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO observations (
+                    INSERT OR IGNORE INTO observations (
                         observation_id, crossing_id, subject_resource, claim, status,
                         observed_digest, observed_at, expires_at, verifier_id,
-                        verifier_version, trust_domain, metadata_json, error, observation_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        verifier_version, trust_domain, metadata_json, error, observation_hash,
+                        verification_id, claim_id, canonical_action_hash,
+                        expected_postcondition, expected_digest, executor_principal_id,
+                        verifier_principal_id, policy_version, verification_context_hash,
+                        consumed_at, consumed_by_crossing_id, consumed_by_claim_id
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    );
                     """,
-                    (
-                        observation.observation_id,
-                        observation.crossing_id,
-                        observation.subject_resource,
-                        observation.claim,
-                        observation.status,
-                        observation.observed_digest,
-                        observation.observed_at,
-                        observation.expires_at,
-                        observation.verifier_id,
-                        observation.verifier_version,
-                        observation.trust_domain,
-                        json.dumps(observation.metadata, ensure_ascii=False),
-                        observation.error,
-                        observation.observation_hash,
-                    ),
+                    self._obs_insert_params(observation),
                 )
             conn.execute("COMMIT;")
         except sqlite3.Error as exc:
@@ -1193,28 +1216,20 @@ class ReceiptStore:
             if observation is not None:
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO observations (
+                    INSERT OR IGNORE INTO observations (
                         observation_id, crossing_id, subject_resource, claim, status,
                         observed_digest, observed_at, expires_at, verifier_id,
-                        verifier_version, trust_domain, metadata_json, error, observation_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        verifier_version, trust_domain, metadata_json, error, observation_hash,
+                        verification_id, claim_id, canonical_action_hash,
+                        expected_postcondition, expected_digest, executor_principal_id,
+                        verifier_principal_id, policy_version, verification_context_hash,
+                        consumed_at, consumed_by_crossing_id, consumed_by_claim_id
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    );
                     """,
-                    (
-                        observation.observation_id,
-                        observation.crossing_id,
-                        observation.subject_resource,
-                        observation.claim,
-                        observation.status,
-                        observation.observed_digest,
-                        observation.observed_at,
-                        observation.expires_at,
-                        observation.verifier_id,
-                        observation.verifier_version,
-                        observation.trust_domain,
-                        json.dumps(observation.metadata, ensure_ascii=False),
-                        observation.error,
-                        observation.observation_hash,
-                    ),
+                    self._obs_insert_params(observation),
                 )
             conn.execute(
                 """
@@ -1877,35 +1892,72 @@ class ReceiptStore:
 
     # --- 8. State Observations (Phase 2) ---
 
+    _OBS_SELECT_COLS = (
+        "observation_id, crossing_id, subject_resource, claim, status, "
+        "observed_digest, observed_at, expires_at, verifier_id, "
+        "verifier_version, trust_domain, metadata_json, error, observation_hash, "
+        "verification_id, claim_id, canonical_action_hash, "
+        "expected_postcondition, expected_digest, executor_principal_id, "
+        "verifier_principal_id, policy_version, verification_context_hash, "
+        "consumed_at, consumed_by_crossing_id, consumed_by_claim_id"
+    )
+
+    @staticmethod
+    def _obs_insert_params(obs: ObservationRecord) -> tuple[Any, ...]:
+        return (
+            obs.observation_id,
+            obs.crossing_id,
+            obs.subject_resource,
+            obs.claim,
+            obs.status,
+            obs.observed_digest,
+            obs.observed_at,
+            obs.expires_at,
+            obs.verifier_id,
+            obs.verifier_version,
+            obs.trust_domain,
+            json.dumps(obs.metadata, ensure_ascii=False),
+            obs.error,
+            obs.observation_hash,
+            obs.verification_id,
+            obs.claim_id,
+            obs.canonical_action_hash,
+            obs.expected_postcondition,
+            obs.expected_digest,
+            obs.executor_principal_id,
+            obs.verifier_principal_id,
+            obs.policy_version,
+            obs.verification_context_hash,
+            obs.consumed_at,
+            obs.consumed_by_crossing_id,
+            obs.consumed_by_claim_id,
+        )
+
     def record_observation(self, obs: ObservationRecord) -> ObservationRecord:
         """Persist a verifiable state observation record."""
+        if not obs.verify_integrity():
+            raise ObservationError(
+                f"Observation '{obs.observation_id}' failed cryptographic integrity check"
+            )
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
             conn.execute(
                 """
-                INSERT OR REPLACE INTO observations (
+                INSERT INTO observations (
                     observation_id, crossing_id, subject_resource, claim, status,
                     observed_digest, observed_at, expires_at, verifier_id,
-                    verifier_version, trust_domain, metadata_json, error, observation_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    verifier_version, trust_domain, metadata_json, error, observation_hash,
+                    verification_id, claim_id, canonical_action_hash,
+                    expected_postcondition, expected_digest, executor_principal_id,
+                    verifier_principal_id, policy_version, verification_context_hash,
+                    consumed_at, consumed_by_crossing_id, consumed_by_claim_id
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                );
                 """,
-                (
-                    obs.observation_id,
-                    obs.crossing_id,
-                    obs.subject_resource,
-                    obs.claim,
-                    obs.status,
-                    obs.observed_digest,
-                    obs.observed_at,
-                    obs.expires_at,
-                    obs.verifier_id,
-                    obs.verifier_version,
-                    obs.trust_domain,
-                    json.dumps(obs.metadata, ensure_ascii=False),
-                    obs.error,
-                    obs.observation_hash,
-                ),
+                self._obs_insert_params(obs),
             )
             conn.execute("COMMIT;")
             return obs
@@ -1916,17 +1968,81 @@ class ReceiptStore:
         finally:
             conn.close()
 
+    def consume_observation_for_outcome(
+        self,
+        observation_id: str,
+        *,
+        crossing_id: str,
+        claim_id: str,
+        now: float | None = None,
+    ) -> ObservationRecord:
+        """Atomically validate and mark an observation as consumed for a single outcome."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            row = conn.execute(
+                f"SELECT {self._OBS_SELECT_COLS} FROM observations WHERE observation_id = ?;",  # noqa: S608
+                (observation_id,),
+            ).fetchone()
+            if row is None:
+                raise ObservationError(f"Observation '{observation_id}' not found")
+            obs = self._row_to_observation(row)
+            if not obs.verify_integrity():
+                raise ObservationError(
+                    f"Observation '{observation_id}' failed integrity verification"
+                )
+            if obs.consumed_at is not None:
+                raise ObservationError(
+                    f"Observation '{observation_id}' has already been consumed (replayed)"
+                )
+            if obs.crossing_id != crossing_id:
+                raise ObservationError(
+                    f"Observation '{observation_id}' belongs to crossing '{obs.crossing_id}', "
+                    f"not '{crossing_id}'"
+                )
+            if obs.claim_id != claim_id:
+                raise ObservationError(
+                    f"Observation '{observation_id}' belongs to claim '{obs.claim_id}', "
+                    f"not '{claim_id}'"
+                )
+            if not obs.is_fresh(now=now):
+                raise ObservationError(
+                    f"Observation '{observation_id}' has expired (expires_at={obs.expires_at})"
+                )
+
+            consumed_ts = utc_now_iso()
+            cur = conn.execute(
+                """
+                UPDATE observations
+                SET consumed_at = ?, consumed_by_crossing_id = ?, consumed_by_claim_id = ?
+                WHERE observation_id = ? AND consumed_at IS NULL;
+                """,
+                (consumed_ts, crossing_id, claim_id, observation_id),
+            )
+            if cur.rowcount != 1:
+                raise ObservationError(
+                    f"Observation '{observation_id}' was concurrently consumed"
+                )
+            conn.execute("COMMIT;")
+            return dataclasses.replace(
+                obs,
+                consumed_at=consumed_ts,
+                consumed_by_crossing_id=crossing_id,
+                consumed_by_claim_id=claim_id,
+            )
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise
+        finally:
+            conn.close()
+
     def get_observation(self, observation_id: str) -> ObservationRecord | None:
         """Fetch a specific observation by ID."""
         conn = self._connect()
         try:
             cur = conn.execute(
-                """
-                SELECT observation_id, crossing_id, subject_resource, claim, status,
-                       observed_digest, observed_at, expires_at, verifier_id,
-                       verifier_version, trust_domain, metadata_json, error, observation_hash
-                FROM observations WHERE observation_id = ?;
-                """,
+                f"SELECT {self._OBS_SELECT_COLS} FROM observations WHERE observation_id = ?;",  # noqa: S608
                 (observation_id,),
             )
             row = cur.fetchone()
@@ -1948,26 +2064,22 @@ class ReceiptStore:
         try:
             if claim is not None:
                 cur = conn.execute(
-                    """
-                    SELECT observation_id, crossing_id, subject_resource, claim, status,
-                           observed_digest, observed_at, expires_at, verifier_id,
-                           verifier_version, trust_domain, metadata_json, error, observation_hash
+                    f"""
+                    SELECT {self._OBS_SELECT_COLS}
                     FROM observations
                     WHERE subject_resource = ? AND claim = ?
                     ORDER BY observed_at DESC, rowid DESC LIMIT 1;
-                    """,
+                    """,  # noqa: S608
                     (subject_resource, claim),
                 )
             else:
                 cur = conn.execute(
-                    """
-                    SELECT observation_id, crossing_id, subject_resource, claim, status,
-                           observed_digest, observed_at, expires_at, verifier_id,
-                           verifier_version, trust_domain, metadata_json, error, observation_hash
+                    f"""
+                    SELECT {self._OBS_SELECT_COLS}
                     FROM observations
                     WHERE subject_resource = ?
                     ORDER BY observed_at DESC, rowid DESC LIMIT 1;
-                    """,
+                    """,  # noqa: S608
                     (subject_resource,),
                 )
             row = cur.fetchone()
@@ -1992,12 +2104,7 @@ class ReceiptStore:
         clamped_offset = max(0, offset)
         conn = self._connect()
         try:
-            query = (
-                "SELECT observation_id, crossing_id, subject_resource, claim, status, "
-                "observed_digest, observed_at, expires_at, verifier_id, "
-                "verifier_version, trust_domain, metadata_json, error, observation_hash "
-                "FROM observations "
-            )
+            query = f"SELECT {self._OBS_SELECT_COLS} FROM observations "  # noqa: S608
             params: list[Any] = []
             clauses: list[str] = []
             if crossing_id is not None:
@@ -2044,9 +2151,10 @@ class ReceiptStore:
             meta = json.loads(meta_raw) if isinstance(meta_raw, str) else dict(meta_raw)
         except Exception:
             meta = {}
+        ver_ctx_hash = str(row[22]) if len(row) > 22 and row[22] is not None else None
         return ObservationRecord(
             observation_id=str(row[0]),
-            observation_version="1",
+            observation_version="2" if ver_ctx_hash is not None else "1",
             crossing_id=str(row[1]) if row[1] is not None else None,
             subject_resource=str(row[2]),
             claim=str(row[3]),
@@ -2060,6 +2168,30 @@ class ReceiptStore:
             metadata=meta,
             error=str(row[12]) if row[12] is not None else None,
             observation_hash=str(row[13]),
+            verification_id=str(row[14]) if len(row) > 14 and row[14] is not None else None,
+            claim_id=str(row[15]) if len(row) > 15 and row[15] is not None else None,
+            canonical_action_hash=(
+                str(row[16]) if len(row) > 16 and row[16] is not None else None
+            ),
+            expected_postcondition=(
+                str(row[17]) if len(row) > 17 and row[17] is not None else None
+            ),
+            expected_digest=str(row[18]) if len(row) > 18 and row[18] is not None else None,
+            executor_principal_id=(
+                str(row[19]) if len(row) > 19 and row[19] is not None else None
+            ),
+            verifier_principal_id=(
+                str(row[20]) if len(row) > 20 and row[20] is not None else None
+            ),
+            policy_version=str(row[21]) if len(row) > 21 and row[21] is not None else None,
+            verification_context_hash=ver_ctx_hash,
+            consumed_at=str(row[23]) if len(row) > 23 and row[23] is not None else None,
+            consumed_by_crossing_id=(
+                str(row[24]) if len(row) > 24 and row[24] is not None else None
+            ),
+            consumed_by_claim_id=(
+                str(row[25]) if len(row) > 25 and row[25] is not None else None
+            ),
         )
 
     # --- 9. Causal Links and Trace (Phase 3) ---

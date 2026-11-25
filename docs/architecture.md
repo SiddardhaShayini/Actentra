@@ -219,9 +219,10 @@ Actentra is designed for local-first, low-overhead operation on resource-constra
 - **Policy-Mandated Postconditions:**
   - Rejection of postcondition weakening or substitution (e.g. replacing `digest_match` with generic `exists` under strict policies).
   - Unconditional rejection of ambiguous string claims (`verified`, `ok`, `true`).
-- **External Outcome Verification:**
-  - Mandatory `ExecutionClaim` required for reporting external effects as completed, bound to action hash, executor principal, approval/warrant ID, and result digest.
-  - Single-use claim consumption rejecting cross-principal use and replay.
+- **External Outcome & Observation Binding (Phase 2 Hardening):**
+  - Every crossing-bound verification (`POST /v1/observations/verify` or `AppServices.verify_state(..., crossing_id=...)`) establishes an immutable, cryptographically hashed `VerificationContext` binding `verification_id`, `crossing_id`, `canonical_action_hash`, canonical `authorized_resource`, `expected_postcondition`, `expected_digest`, `claim_id`, `executor_principal_id`, `verifier_principal_id`, `policy_version`, `observed_at`, and `expires_at`.
+  - Unrelated resources, mismatched claims, mismatched digests, forged/generic claims, expired observations, and unauthorized verifiers are rejected before verification or outcome promotion.
+  - External success promotion (`POST /v1/crossings/{id}/outcome` / `AppServices.record_external_outcome`) when postconditions are required atomically validates and consumes both the bound `ObservationRecord` and the one-time `ExecutionClaim` inside SQLite transactions, preventing replay and concurrent reuse.
   - Prevention of false success promotion; ambiguous outcomes preserved as `unknown`.
 
 ### 11. Immutable Audit Architecture & Checkpointing (Phase 6 Hardening)
