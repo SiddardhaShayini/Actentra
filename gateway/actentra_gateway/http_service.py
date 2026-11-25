@@ -26,6 +26,7 @@ from cryptography.hazmat.backends import default_backend
 
 from actentra.boundary import Boundary
 from actentra_core.causal import CycleDetectedError
+from actentra_core.checkpoints import CheckpointAnchor, KeyRing, SecurityProfile
 from actentra_core.handoffs import (
     ExpiredHandoffError,
     HandoffError,
@@ -2149,6 +2150,9 @@ class ActentraHTTPServer(ThreadingHTTPServer):
         cert_principals: dict[str, Any] | MTLSPrincipalRegistry | None = None,
         unsafe_allow_remote: bool = False,
         deployment_mode: DeploymentMode | str = DeploymentMode.LOCAL,
+        security_profile: SecurityProfile | str = SecurityProfile.LOCAL_DEV,
+        checkpoint_anchor: CheckpointAnchor | None = None,
+        key_ring: KeyRing | None = None,
         ssl_context: ssl.SSLContext | None = None,
         certfile: str | Path | None = None,
         keyfile: str | Path | None = None,
@@ -2163,6 +2167,11 @@ class ActentraHTTPServer(ThreadingHTTPServer):
         mode = (
             DeploymentMode(deployment_mode) if isinstance(deployment_mode, str) else deployment_mode
         )
+        profile = (
+            SecurityProfile(security_profile)
+            if isinstance(security_profile, str)
+            else security_profile
+        )
         effective_token = auth_token or os.environ.get("ACTENTRA_GATEWAY_TOKEN")
         is_remote_allowed = (
             unsafe_allow_remote
@@ -2170,6 +2179,19 @@ class ActentraHTTPServer(ThreadingHTTPServer):
             or mode != DeploymentMode.LOCAL
         )
         is_remote_mode = mode in (DeploymentMode.REMOTE, DeploymentMode.PRIVATE_NETWORK)
+
+        if profile == SecurityProfile.EXTERNAL_PRODUCTION:
+            if not token_principals and not cert_principals:
+                raise ValueError(
+                    "Security profile 'external_production' requires individual principal "
+                    "credentials (token_principals or cert_principals); legacy shared auth_token "
+                    "alone is prohibited"
+                )
+            if not require_client_cert or cert_principals is None:
+                raise ValueError(
+                    "Security profile 'external_production' requires mutual TLS with "
+                    "explicit principal binding (require_client_cert=True and cert_principals)"
+                )
 
         if host not in _LOOPBACK_HOSTS or is_remote_mode:
             if not is_remote_allowed and not is_remote_mode:
@@ -2245,7 +2267,11 @@ class ActentraHTTPServer(ThreadingHTTPServer):
             boundary,
             executor_registry=executor_registry,
             approval_ttl_seconds=approval_ttl_seconds,
+            checkpoint_anchor=checkpoint_anchor,
+            key_ring=key_ring,
+            security_profile=profile,
         )
+        self.security_profile = self.services.security_profile
         self.delegation_registry = self.services.delegation_registry
 
     def revoke_token(self, token: str) -> None:
@@ -2379,6 +2405,9 @@ def create_gateway_server(
     cert_principals: dict[str, Any] | MTLSPrincipalRegistry | None = None,
     unsafe_allow_remote: bool = False,
     deployment_mode: DeploymentMode | str = DeploymentMode.LOCAL,
+    security_profile: SecurityProfile | str = SecurityProfile.LOCAL_DEV,
+    checkpoint_anchor: CheckpointAnchor | None = None,
+    key_ring: KeyRing | None = None,
     ssl_context: ssl.SSLContext | None = None,
     certfile: str | Path | None = None,
     keyfile: str | Path | None = None,
@@ -2400,6 +2429,9 @@ def create_gateway_server(
         cert_principals=cert_principals,
         unsafe_allow_remote=unsafe_allow_remote,
         deployment_mode=deployment_mode,
+        security_profile=security_profile,
+        checkpoint_anchor=checkpoint_anchor,
+        key_ring=key_ring,
         ssl_context=ssl_context,
         certfile=certfile,
         keyfile=keyfile,
@@ -2424,6 +2456,9 @@ def serve_http(
     cert_principals: dict[str, Any] | MTLSPrincipalRegistry | None = None,
     unsafe_allow_remote: bool = False,
     deployment_mode: DeploymentMode | str = DeploymentMode.LOCAL,
+    security_profile: SecurityProfile | str = SecurityProfile.LOCAL_DEV,
+    checkpoint_anchor: CheckpointAnchor | None = None,
+    key_ring: KeyRing | None = None,
     ssl_context: ssl.SSLContext | None = None,
     certfile: str | Path | None = None,
     keyfile: str | Path | None = None,
@@ -2446,6 +2481,9 @@ def serve_http(
         cert_principals=cert_principals,
         unsafe_allow_remote=unsafe_allow_remote,
         deployment_mode=deployment_mode,
+        security_profile=security_profile,
+        checkpoint_anchor=checkpoint_anchor,
+        key_ring=key_ring,
         ssl_context=ssl_context,
         certfile=certfile,
         keyfile=keyfile,

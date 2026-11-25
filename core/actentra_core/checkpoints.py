@@ -19,6 +19,7 @@ import os
 import threading
 import uuid
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
@@ -1029,3 +1030,233 @@ def verify_audit_bundle(
         divergence_type=divergence if errors else None,
         errors=tuple(errors),
     )
+
+
+# -----------------------------------------------------------------------------
+# 8. Deployment Security Profiles & Audit Guarantee Assessment (Phase 5)
+# -----------------------------------------------------------------------------
+
+
+class SecurityProfile(StrEnum):
+    """Explicit deployment security profiles governing audit and trust guarantees."""
+
+    LOCAL_DEV = "local_dev"
+    LOCAL_TRUSTED = "local_trusted"
+    CONTROLLED_PILOT = "controlled_pilot"
+    EXTERNAL_PRODUCTION = "external_production"
+
+
+_ANCHORED_PROFILES: frozenset[SecurityProfile] = frozenset(
+    {SecurityProfile.CONTROLLED_PILOT, SecurityProfile.EXTERNAL_PRODUCTION}
+)
+
+
+def is_custody_separated(
+    db_path: str | Path,
+    anchor: CheckpointAnchor | None,
+) -> bool:
+    """Return True if anchor is durable and does not share the SQLite DB directory."""
+    if anchor is None or isinstance(anchor, MemoryCheckpointAnchor):
+        return False
+    if isinstance(anchor, FileCheckpointAnchor):
+        try:
+            db_dir = Path(db_path).resolve().parent
+            anchor_dir = anchor.anchor_dir.resolve()
+            if anchor_dir == db_dir:
+                return False
+            # Also reject if anchor is stored directly inside the DB's immediate directory
+            if db_dir in anchor_dir.parents and len(anchor_dir.parts) - len(db_dir.parts) <= 1:
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def validate_production_trust_configuration(
+    db_path: str | Path,
+    *,
+    security_profile: SecurityProfile | str,
+    checkpoint_anchor: CheckpointAnchor | None,
+    key_ring: KeyRing | None,
+) -> SecurityProfile:
+    """Validate that required checkpoint anchoring and key custody guarantees are satisfied.
+
+    Raises CheckpointError (fail-closed) when CONTROLLED_PILOT or EXTERNAL_PRODUCTION
+    lacks an independent CheckpointAnchor, valid KeyRing, custody separation, or
+    valid existing checkpoint trail.
+    """
+    profile = (
+        SecurityProfile(security_profile)
+        if isinstance(security_profile, str)
+        else security_profile
+    )
+
+    if profile not in _ANCHORED_PROFILES:
+        return profile
+
+    if checkpoint_anchor is None:
+        raise CheckpointError(
+            f"Security profile '{profile.value}' requires an external CheckpointAnchor; "
+            "cannot claim externally anchored auditing without one"
+        )
+    if profile == SecurityProfile.EXTERNAL_PRODUCTION and isinstance(
+        checkpoint_anchor, MemoryCheckpointAnchor
+    ):
+        raise CheckpointError(
+            "Security profile 'external_production' prohibits ephemeral MemoryCheckpointAnchor"
+        )
+    if key_ring is None:
+        raise CheckpointError(
+            f"Security profile '{profile.value}' requires a trusted public KeyRing"
+        )
+    if key_ring.get_active_key() is None:
+        raise CheckpointError(
+            f"Security profile '{profile.value}' requires at least one active signing key "
+            "in KeyRing (all keys are missing, retired, or revoked)"
+        )
+    if profile == SecurityProfile.EXTERNAL_PRODUCTION and not is_custody_separated(
+        db_path, checkpoint_anchor
+    ):
+        raise CheckpointError(
+            "Security profile 'external_production' requires checkpoint anchor custody "
+            "separation from the SQLite receipt database directory"
+        )
+
+    # Probe anchor reachability and verify any existing anchored trail
+    try:
+        existing_cps = checkpoint_anchor.list_checkpoints()
+    except Exception as exc:
+        raise CheckpointError(
+            f"External checkpoint anchor unavailable for profile '{profile.value}': {exc}"
+        ) from exc
+
+    if existing_cps:
+        vr = verify_audit_trail(
+            db_path,
+            checkpoint_anchor,
+            key_ring,
+            require_checkpoints=True,
+        )
+        if not vr.ok:
+            raise CheckpointError(
+                f"Audit trail verification failed for profile '{profile.value}' "
+                f"({vr.divergence_type}): {'; '.join(vr.errors)}"
+            )
+
+    return profile
+
+
+def assess_audit_guarantees(
+    db_path: str | Path,
+    *,
+    security_profile: SecurityProfile | str = SecurityProfile.LOCAL_DEV,
+    checkpoint_anchor: CheckpointAnchor | None = None,
+    key_ring: KeyRing | None = None,
+    full_verify: bool = False,
+) -> dict[str, Any]:
+    """Deterministically assess and report active audit integrity guarantees.
+
+    Never claims 'externally_anchored' unless an independent CheckpointAnchor and
+    KeyRing are configured and verify_audit_trail() succeeds with >= 1 checkpoint.
+    """
+    profile = (
+        SecurityProfile(security_profile)
+        if isinstance(security_profile, str)
+        else security_profile
+    )
+    warnings: list[str] = []
+
+    log_vr = verify_log(db_path) if full_verify else None
+    hash_chain_intact = log_vr.ok if log_vr is not None else True
+    if log_vr is not None and not log_vr.ok:
+        warnings.append(f"Local SQLite hash-chain verification failed: {'; '.join(log_vr.errors)}")
+
+    custody_sep = is_custody_separated(db_path, checkpoint_anchor)
+    has_anchor = checkpoint_anchor is not None
+    has_ring = key_ring is not None and key_ring.get_active_key() is not None
+    is_durable_anchor = has_anchor and not isinstance(checkpoint_anchor, MemoryCheckpointAnchor)
+
+    checkpoints_verified = 0
+    latest_cp_seq = 0
+    anchored_head_seq = 0
+    externally_anchored = False
+    signed_checkpoints_present = False
+    trail_errors: list[str] = []
+    divergence_type: DivergenceType | None = None
+
+    if checkpoint_anchor is not None:
+        try:
+            cps = checkpoint_anchor.list_checkpoints()
+            signed_checkpoints_present = len(cps) > 0
+        except Exception as exc:
+            cps = []
+            trail_errors.append(f"External anchor unavailable: {exc}")
+            warnings.append(f"External checkpoint anchor unavailable: {exc}")
+
+        if key_ring is not None and cps:
+            trail_vr = verify_audit_trail(
+                db_path,
+                checkpoint_anchor,
+                key_ring,
+                require_checkpoints=True,
+            )
+            checkpoints_verified = trail_vr.checkpoints_verified
+            latest_cp_seq = trail_vr.latest_checkpoint_seq
+            anchored_head_seq = int(trail_vr.details.get("anchored_head_seq", 0))
+            hash_chain_intact = hash_chain_intact and (
+                trail_vr.divergence_type != "RECEIPT_TAMPERING"
+            )
+            if trail_vr.ok and is_durable_anchor and checkpoints_verified > 0:
+                externally_anchored = True
+            elif not trail_vr.ok:
+                trail_errors.extend(trail_vr.errors)
+                divergence_type = trail_vr.divergence_type
+                warnings.append(
+                    f"Checkpoint trail verification failed ({trail_vr.divergence_type})"
+                )
+        elif not cps:
+            warnings.append("No external checkpoints have been published to anchor yet")
+        elif key_ring is None:
+            warnings.append("KeyRing not configured; cannot verify checkpoint signatures")
+    else:
+        warnings.append("No external CheckpointAnchor configured; audit is local hash-chain only")
+
+    if has_anchor and not is_durable_anchor:
+        warnings.append("Ephemeral MemoryCheckpointAnchor does not provide durable anchoring")
+    if has_anchor and is_durable_anchor and not custody_sep:
+        warnings.append(
+            "Checkpoint anchor shares storage directory with SQLite DB (no custody separation)"
+        )
+
+    if not hash_chain_intact or trail_errors:
+        audit_tier = "unverified"
+    elif externally_anchored and custody_sep:
+        audit_tier = "externally_anchored"
+    elif signed_checkpoints_present and key_ring is not None and not trail_errors:
+        audit_tier = "signed_checkpoints_local"
+    else:
+        audit_tier = "hash_chain_only"
+
+    protects_local_rewrite = externally_anchored and custody_sep
+    # Local FileCheckpointAnchor on the same host does NOT protect against host root compromise
+    protects_compromised_host = externally_anchored and not isinstance(
+        checkpoint_anchor, (FileCheckpointAnchor, MemoryCheckpointAnchor)
+    )
+
+    return {
+        "security_profile": profile.value,
+        "audit_tier": audit_tier,
+        "hash_chain_intact": hash_chain_intact,
+        "signed_checkpoints_present": signed_checkpoints_present,
+        "externally_anchored": externally_anchored,
+        "custody_separated": custody_sep,
+        "protects_against_local_db_rewrite": protects_local_rewrite,
+        "protects_against_compromised_host": protects_compromised_host,
+        "checkpoints_verified": checkpoints_verified,
+        "latest_checkpoint_seq": latest_cp_seq,
+        "anchored_head_seq": anchored_head_seq,
+        "has_active_signing_key": has_ring,
+        "divergence_type": divergence_type,
+        "errors": trail_errors,
+        "warnings": warnings,
+    }

@@ -30,7 +30,17 @@ from actentra_core.causal import (
     build_causal_trace,
     generate_link_id,
 )
-from actentra_core.checkpoints import CheckpointAnchor, KeyRing
+from actentra_core.checkpoints import (
+    CheckpointAnchor,
+    CheckpointError,
+    KeyRing,
+    SecurityProfile,
+    SignedCheckpoint,
+    assess_audit_guarantees,
+    sign_checkpoint,
+    validate_production_trust_configuration,
+    verify_audit_trail,
+)
 from actentra_core.claims import ExecutionClaimError
 from actentra_core.context import (
     ContextError,
@@ -146,6 +156,7 @@ class AppServices:
         delegation_registry: DelegationRegistry | None = None,
         checkpoint_anchor: CheckpointAnchor | None = None,
         key_ring: KeyRing | None = None,
+        security_profile: SecurityProfile | str = SecurityProfile.LOCAL_DEV,
     ) -> None:
         self.boundary = boundary
         self.registry = executor_registry or ExecutorRegistry()
@@ -153,6 +164,12 @@ class AppServices:
         self.delegation_registry = delegation_registry or get_default_delegation_registry()
         self.checkpoint_anchor = checkpoint_anchor
         self.key_ring = key_ring
+        self.security_profile = validate_production_trust_configuration(
+            self.boundary.receipt_store.db_path,
+            security_profile=security_profile,
+            checkpoint_anchor=checkpoint_anchor,
+            key_ring=key_ring,
+        )
         if file_verifier is not None:
             self.file_verifier: WorkspaceFileVerifier | None = file_verifier
         elif self.registry.workspace_root is not None:
@@ -255,19 +272,29 @@ class AppServices:
             integrity_ok = db_integrity_ok
             last_hash = latest.entry_hash if latest else GENESIS_HASH
 
+        guarantees = assess_audit_guarantees(
+            db_path,
+            security_profile=self.security_profile,
+            checkpoint_anchor=self.checkpoint_anchor,
+            key_ring=self.key_ring,
+            full_verify=full_verify,
+        )
+        anchored_ok = not bool(guarantees["errors"])
         return {
-            "status": "ok" if db_integrity_ok else "degraded",
+            "status": "ok" if (db_integrity_ok and anchored_ok) else "degraded",
             "db_status": "healthy" if db_integrity_ok else f"corrupt: {db_msg}",
             "db_integrity_ok": db_integrity_ok,
             "policy_id": self.boundary.engine.policy.policy_id,
             "policy_version": self.boundary.engine.policy.policy_version,
             "mode": self.boundary.engine.policy.mode,
+            "security_profile": self.security_profile.value,
             "frozen": self.boundary.engine.frozen,
             "total_receipts": total_records,
-            "integrity_ok": integrity_ok,
+            "integrity_ok": integrity_ok and anchored_ok,
             "last_hash": last_hash,
             "pending_approvals_count": len(pending_list),
             "registered_executors": self.registry.list_registered_tools(),
+            "audit_guarantees": guarantees,
         }
 
     def get_metrics(self) -> dict[str, Any]:
@@ -2394,20 +2421,75 @@ class AppServices:
             "offset": offset,
         }
 
+    def create_checkpoint(
+        self,
+        private_key_pem: bytes,
+        *,
+        caller_context: CallerContext | None = None,
+    ) -> SignedCheckpoint:
+        """Sign and publish a receipt checkpoint to the configured external anchor."""
+        self._require_scope_or_operator(caller_context, "audit:export", "system:admin")
+        if self.checkpoint_anchor is None:
+            raise CheckpointError(
+                "Cannot publish external checkpoint: no CheckpointAnchor configured"
+            )
+        return sign_checkpoint(
+            self.boundary.receipt_store.db_path,
+            private_key_pem,
+            anchor=self.checkpoint_anchor,
+            key_ring=self.key_ring,
+        )
+
     def verify_audit_log(
         self,
         *,
         verify_envelopes: bool = True,
         caller_context: CallerContext | None = None,
     ) -> dict[str, Any]:
-        """Verify receipt log hash-chain and envelope integrity."""
+        """Verify receipt log hash-chain, envelope integrity, and external anchor if configured."""
         self._require_scope_or_operator(caller_context, "audit:verify", "receipts:read")
-        vr = verify_log(self.boundary.receipt_store.db_path, verify_envelopes=verify_envelopes)
+        db_path = self.boundary.receipt_store.db_path
+        vr = verify_log(db_path, verify_envelopes=verify_envelopes)
+        guarantees = assess_audit_guarantees(
+            db_path,
+            security_profile=self.security_profile,
+            checkpoint_anchor=self.checkpoint_anchor,
+            key_ring=self.key_ring,
+            full_verify=True,
+        )
+        ok = vr.ok
+        errors = list(vr.errors)
+        divergence_type: str | None = None
+        checkpoints_verified = 0
+        if self.checkpoint_anchor is not None and self.key_ring is not None:
+            require_cps = self.security_profile in (
+                SecurityProfile.CONTROLLED_PILOT,
+                SecurityProfile.EXTERNAL_PRODUCTION,
+            )
+            trail_vr = verify_audit_trail(
+                db_path,
+                self.checkpoint_anchor,
+                self.key_ring,
+                verify_envelopes=verify_envelopes,
+                require_checkpoints=require_cps,
+            )
+            ok = ok and trail_vr.ok
+            checkpoints_verified = trail_vr.checkpoints_verified
+            divergence_type = trail_vr.divergence_type
+            for err in trail_vr.errors:
+                if err not in errors:
+                    errors.append(err)
+
         return {
-            "ok": vr.ok,
+            "ok": ok,
             "total_records": vr.total_records,
             "last_hash": vr.last_hash,
-            "errors": list(vr.errors),
+            "errors": errors,
+            "security_profile": self.security_profile.value,
+            "externally_anchored": guarantees["externally_anchored"],
+            "checkpoints_verified": checkpoints_verified,
+            "divergence_type": divergence_type,
+            "audit_guarantees": guarantees,
         }
 
     def export_audit_bundle(
@@ -2430,10 +2512,19 @@ class AppServices:
         # Collect key rotation manifest if key ring is provided or configured
         ring = key_ring or self.key_ring
         key_manifest = ring.to_dict() if ring else {}
+        guarantees = assess_audit_guarantees(
+            self.boundary.receipt_store.db_path,
+            security_profile=self.security_profile,
+            checkpoint_anchor=anchor,
+            key_ring=ring,
+            full_verify=True,
+        )
 
         bundle = {
             "actentra_version": "0.1.0a0",
             "export_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "security_profile": self.security_profile.value,
+            "audit_guarantees": guarantees,
             "policy": {
                 "id": self.boundary.engine.policy.policy_id,
                 "version": self.boundary.engine.policy.policy_version,

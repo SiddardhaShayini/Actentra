@@ -104,5 +104,28 @@ In accordance with Phase 8 architecture review, potential capabilities are class
 
 1. **Make a model correct:** Actentra enforces boundaries on tool calls; it does not prevent an LLM from reasoning poorly within allowed bounds.
 2. **Protect unmediated paths:** If an agent holds direct filesystem permissions, raw API keys, or unguarded subprocess access outside Actentra, Actentra cannot mediate those calls.
-3. **Defend against a fully compromised host:** If an attacker has Administrator/root control over the OS running Actentra, they can bypass in-process boundaries and alter local files. However, externally anchored checkpoints (`verify_audit_trail`) will prove that local history was tampered with or truncated.
+3. **Defend against a fully compromised host:** If an attacker has Administrator/root control over the OS running Actentra, they can bypass in-process boundaries and alter local files. However, externally anchored checkpoints (`verify_audit_trail`) will prove that local history was tampered with or truncated **when the checkpoint anchor and signing key reside outside the compromised host's trust boundary**.
 4. **Replace OS/Cloud IAM:** Actentra complements IAM by adding deterministic per-call intent, risk, taint, and approval checks.
+
+---
+
+## 6. Deployment Security Profiles & Audit Guarantee Hierarchy (Phase 5)
+
+Actentra distinguishes five distinct audit integrity properties and never claims `externally_anchored: True` unless an independent `CheckpointAnchor` and `KeyRing` are configured and verified:
+
+| Guarantee | Meaning |
+| :--- | :--- |
+| **Hash-chain integrity** (`hash_chain_intact`) | Local SQLite WAL `prev_hash -> entry_hash` chain is internally consistent (`verify_log`). Does **not** prevent an attacker with DB write access from rewriting the entire chain. |
+| **Signed checkpoint integrity** (`signed_checkpoints_present`) | Ed25519 `SignedCheckpoint` records exist and verify against `KeyRing`. |
+| **Independently anchored history** (`externally_anchored`) | Durable `CheckpointAnchor` + `KeyRing` are configured and `verify_audit_trail()` succeeds with >= 1 checkpoint. |
+| **Protection against local DB modification** (`protects_against_local_db_rewrite`) | `externally_anchored` AND `custody_separated` (anchor storage is separate from the SQLite DB directory). |
+| **Protection against compromised host** (`protects_against_compromised_host`) | `externally_anchored` via a remote/off-host `CheckpointAnchor` (local `FileCheckpointAnchor` reports `False`). |
+
+### Deployment Profiles (`SecurityProfile`)
+- **`local_dev` / `local_trusted`:** Local hash-chain auditing (`externally_anchored: False`).
+- **`controlled_pilot`:** Requires a configured `CheckpointAnchor` and `KeyRing` with an active key; fails closed if missing or trail verification fails.
+- **`external_production`:** Fails closed at startup unless:
+  1. A durable, custody-separated `CheckpointAnchor` is configured (`MemoryCheckpointAnchor` and same-directory `FileCheckpointAnchor` are rejected).
+  2. A `KeyRing` with at least one active Ed25519 key is configured, and any existing anchored trail passes `verify_audit_trail()`.
+  3. On the HTTP Gateway, individual principal credentials (`token_principals` / `cert_principals`) and mTLS (`require_client_cert=True`) are enforced (shared `auth_token` alone is prohibited).
+  4. Signing private keys must be provisioned separately from the SQLite DB directory and never included in health, verify, or audit bundle outputs.
