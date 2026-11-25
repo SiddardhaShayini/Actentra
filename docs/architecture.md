@@ -190,6 +190,12 @@ Actentra is designed for local-first, low-overhead operation on resource-constra
   - Remote and private-network bindings unconditionally refuse plaintext HTTP at startup, requiring valid X.509 server certificates and private keys.
   - Forward-secret AEAD ciphers (`ECDHE+AESGCM`, `ECDHE+CHACHA20`) and TLS compression disabled (`OP_NO_COMPRESSION`).
   - Mutual TLS (mTLS) with client certificate verification against configured trusted CA bundles.
+- **mTLS & Application Principal Binding (Phase 4 Hardening):**
+  - `MTLSPrincipalRegistry` explicitly maps validated X.509 client certificates (SHA-256 DER fingerprint, SAN URI, and allowed issuers) to application principals (`CertificatePrincipalBinding`), rejecting unknown, expired, revoked, issuer-mismatched, or ambiguous certificates.
+  - `resolve_http_caller_context()` and `ActentraHTTPHandler` strictly bind the authenticated TLS socket peer certificate (`conn.getpeercert(binary_form=True)`) to the Bearer-token principal, rejecting mismatches (`HTTP 403 mtls_identity_mismatch`) and attenuating scopes/allowed agents to their intersection.
+  - Caller-supplied forwarded certificate headers (`X-SSL-Client-Cert`, `X-Forwarded-Client-Cert`, `X-Client-Cert`, `X-Actentra-Client-Cert`) are unconditionally rejected when not backed by an authenticated TLS socket.
+  - Remote and private-network deployments (`DeploymentMode.REMOTE`, `DeploymentMode.PRIVATE_NETWORK`) prohibit shared-token principal impersonation via `X-Actentra-Identity`.
+  - Supports dynamic certificate revocation/rotation (`revoke_certificate`, `rotate_certificate`) and principal token rotation (`rotate_principal_token`) with audit event logging.
 - **Anti-Replay & Nonce Tracking:**
   - Enforces sliding-window single-use nonces (`X-Actentra-Nonce`) and timestamp skew validation (`X-Actentra-Timestamp` within +/-300s).
 - **Transport Hardening & Body Bounds:**

@@ -33,8 +33,11 @@ from actentra_core.handoffs import (
 )
 from actentra_core.identity import (
     CallerContext,
+    CertificateIdentity,
     DelegationRegistry,
     IdentitySecurityError,
+    MTLSPrincipalRegistry,
+    extract_certificate_identity,
     get_default_delegation_registry,
     resolve_http_caller_context,
 )
@@ -350,6 +353,16 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                     return hops[-1]
         return remote_ip
 
+    def _extract_tls_client_cert(self) -> CertificateIdentity | None:
+        """Extract CertificateIdentity strictly from the authenticated TLS socket."""
+        conn = getattr(self, "connection", None)
+        if not isinstance(conn, ssl.SSLSocket):
+            return None
+        der_bytes = conn.getpeercert(binary_form=True)
+        if not der_bytes:
+            return None
+        return extract_certificate_identity(der_bytes)
+
     def _get_caller_context(self) -> CallerContext:
         headers_dict = (
             {k.lower(): v for k, v in self.headers.items()}
@@ -362,6 +375,13 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         expected_token = raw_token if isinstance(raw_token, str) else None
         raw_principals = getattr(server_obj, "token_principals", None)
         token_principals = raw_principals if isinstance(raw_principals, dict) else None
+        raw_cert_reg = getattr(server_obj, "cert_registry", None)
+        cert_registry = raw_cert_reg if isinstance(raw_cert_reg, MTLSPrincipalRegistry) else None
+        raw_req = getattr(server_obj, "require_client_cert", False)
+        require_client_cert = bool(raw_req) if isinstance(raw_req, bool) else False
+        raw_mode = getattr(server_obj, "deployment_mode", DeploymentMode.LOCAL)
+        enforce_strict = raw_mode in (DeploymentMode.REMOTE, DeploymentMode.PRIVATE_NETWORK)
+
         delegation_reg = None
         server_services = getattr(server_obj, "services", None)
         if server_services is not None:
@@ -374,12 +394,18 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                 delegation_reg = cand
         if delegation_reg is None:
             delegation_reg = get_default_delegation_registry()
+
+        client_cert = self._extract_tls_client_cert()
         return resolve_http_caller_context(
             headers=headers_dict,
             expected_token=expected_token,
             remote_addr=remote_ip,
             token_principals=token_principals,
             delegation_registry=delegation_reg,
+            client_cert=client_cert,
+            cert_registry=cert_registry,
+            require_client_cert=require_client_cert,
+            enforce_strict_shared_token=enforce_strict,
         )
 
     def _validate_host_header(self) -> bool:
@@ -480,10 +506,36 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
         return True
 
     def _validate_client_cert(self) -> bool:
-        """Verify peer certificate when mutual TLS (mTLS) is enforced."""
+        """Verify peer certificate and principal binding when mTLS is active."""
         server_obj = getattr(self, "server", None)
         raw_req = getattr(server_obj, "require_client_cert", False)
         require_client_cert = bool(raw_req) if isinstance(raw_req, bool) else False
+        raw_cert_reg = getattr(server_obj, "cert_registry", None)
+        cert_registry = raw_cert_reg if isinstance(raw_cert_reg, MTLSPrincipalRegistry) else None
+
+        # Reject caller-supplied forwarded certificate headers when not backed by TLS
+        if hasattr(self, "headers") and self.headers:
+            spoof_hdrs = (
+                "X-SSL-Client-Cert",
+                "X-Forwarded-Client-Cert",
+                "X-Client-Cert",
+                "X-Actentra-Client-Cert",
+            )
+            if any(self.headers.get(h) for h in spoof_hdrs):
+                conn = getattr(self, "connection", None)
+                if not isinstance(conn, ssl.SSLSocket) or not conn.getpeercert(binary_form=True):
+                    self._send_json(
+                        HTTPStatus.FORBIDDEN,
+                        {
+                            "error": (
+                                "Caller-supplied client certificate headers are not trusted "
+                                "without an authenticated mTLS socket"
+                            ),
+                            "code": "mtls_spoofed_cert_header",
+                        },
+                    )
+                    return False
+
         if require_client_cert:
             conn = getattr(self, "connection", None)
             if not isinstance(conn, ssl.SSLSocket):
@@ -495,14 +547,29 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return False
-            peer_cert = conn.getpeercert()
-            if not peer_cert:
+            der_bytes = conn.getpeercert(binary_form=True)
+            if not der_bytes:
                 self._send_json(
                     HTTPStatus.FORBIDDEN,
                     {
                         "error": "Mutual TLS client certificate required and none was provided",
                         "code": "mtls_certificate_required",
                     },
+                )
+                return False
+            try:
+                cert_id = extract_certificate_identity(der_bytes)
+                if not cert_id.is_currently_valid():
+                    raise IdentitySecurityError(
+                        f"Client certificate '{cert_id.sha256_fingerprint}' is expired "
+                        "or not yet valid"
+                    )
+                if cert_registry is not None:
+                    cert_registry.resolve_certificate(cert_id)
+            except IdentitySecurityError as exc:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": str(exc), "code": "mtls_principal_rejected"},
                 )
                 return False
         return True
@@ -635,10 +702,10 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                     )
                     return False
 
+        token_valid = False
         if server_token and hmac.compare_digest(token, server_token):
-            return True
-
-        if token_principals:
+            token_valid = True
+        elif token_principals:
             for cand_token, pdata in token_principals.items():
                 if hmac.compare_digest(token, str(cand_token)):
                     if isinstance(pdata, dict):
@@ -666,7 +733,23 @@ class ActentraHTTPHandler(BaseHTTPRequestHandler):
                                     return False
                             except (ValueError, TypeError):
                                 pass
-                    return True
+                    token_valid = True
+                    break
+
+        if token_valid:
+            # Enforce transport-to-application binding when mTLS cert or registry is active
+            if self._extract_tls_client_cert() is not None or isinstance(
+                getattr(server_obj, "cert_registry", None), MTLSPrincipalRegistry
+            ):
+                try:
+                    self._get_caller_context()
+                except IdentitySecurityError as exc:
+                    self._send_json(
+                        HTTPStatus.FORBIDDEN,
+                        {"error": str(exc), "code": "mtls_identity_mismatch"},
+                    )
+                    return False
+            return True
 
         self._send_json(
             HTTPStatus.UNAUTHORIZED,
@@ -2063,6 +2146,7 @@ class ActentraHTTPServer(ThreadingHTTPServer):
         approval_ttl_seconds: float = 300.0,
         auth_token: str | None = None,
         token_principals: dict[str, Any] | None = None,
+        cert_principals: dict[str, Any] | MTLSPrincipalRegistry | None = None,
         unsafe_allow_remote: bool = False,
         deployment_mode: DeploymentMode | str = DeploymentMode.LOCAL,
         ssl_context: ssl.SSLContext | None = None,
@@ -2136,6 +2220,12 @@ class ActentraHTTPServer(ThreadingHTTPServer):
         self.approval_ttl_seconds = approval_ttl_seconds
         self.auth_token = effective_token
         self.token_principals = token_principals
+        if isinstance(cert_principals, MTLSPrincipalRegistry):
+            self.cert_registry: MTLSPrincipalRegistry | None = cert_principals
+        elif isinstance(cert_principals, dict):
+            self.cert_registry = MTLSPrincipalRegistry.from_dict(cert_principals)
+        else:
+            self.cert_registry = None
         self.require_client_cert = require_client_cert
         self.allowed_hosts = tuple(allowed_hosts) if allowed_hosts else ()
         self.trusted_proxies = frozenset(trusted_proxies) if trusted_proxies else frozenset()
@@ -2168,6 +2258,39 @@ class ActentraHTTPServer(ThreadingHTTPServer):
         with self._token_lock:
             self._revoked_tokens.add(old_token)
             self.auth_token = new_token
+
+    def rotate_principal_token(self, old_token: str, new_token: str) -> None:
+        """Rotate a principal-specific token in token_principals, revoking old_token."""
+        with self._token_lock:
+            self._revoked_tokens.add(old_token)
+            if self.token_principals is not None and old_token in self.token_principals:
+                entry = self.token_principals.pop(old_token)
+                self.token_principals[new_token] = entry
+
+    def revoke_certificate(self, fingerprint: str, *, reason: str = "manual_revocation") -> None:
+        """Revoke an mTLS client certificate fingerprint immediately."""
+        if self.cert_registry is not None:
+            self.cert_registry.revoke_certificate(fingerprint, reason=reason)
+
+    def rotate_certificate(
+        self,
+        principal_id: str,
+        *,
+        new_fingerprint: str | None = None,
+        new_san_uri: str | None = None,
+        old_fingerprint: str | None = None,
+        revoke_old: bool = True,
+    ) -> Any:
+        """Rotate an mTLS client certificate for a registered principal."""
+        if self.cert_registry is None:
+            raise IdentitySecurityError("No cert_registry configured on server")
+        return self.cert_registry.rotate_certificate(
+            principal_id,
+            new_fingerprint=new_fingerprint,
+            new_san_uri=new_san_uri,
+            old_fingerprint=old_fingerprint,
+            revoke_old=revoke_old,
+        )
 
     def is_token_revoked(self, token: str) -> bool:
         """Check whether a token has been revoked."""
@@ -2253,6 +2376,7 @@ def create_gateway_server(
     approval_ttl_seconds: float = 300.0,
     auth_token: str | None = None,
     token_principals: dict[str, Any] | None = None,
+    cert_principals: dict[str, Any] | MTLSPrincipalRegistry | None = None,
     unsafe_allow_remote: bool = False,
     deployment_mode: DeploymentMode | str = DeploymentMode.LOCAL,
     ssl_context: ssl.SSLContext | None = None,
@@ -2273,6 +2397,7 @@ def create_gateway_server(
         approval_ttl_seconds=approval_ttl_seconds,
         auth_token=auth_token,
         token_principals=token_principals,
+        cert_principals=cert_principals,
         unsafe_allow_remote=unsafe_allow_remote,
         deployment_mode=deployment_mode,
         ssl_context=ssl_context,
@@ -2296,6 +2421,7 @@ def serve_http(
     approval_ttl_seconds: float = 300.0,
     auth_token: str | None = None,
     token_principals: dict[str, Any] | None = None,
+    cert_principals: dict[str, Any] | MTLSPrincipalRegistry | None = None,
     unsafe_allow_remote: bool = False,
     deployment_mode: DeploymentMode | str = DeploymentMode.LOCAL,
     ssl_context: ssl.SSLContext | None = None,
@@ -2317,6 +2443,7 @@ def serve_http(
         approval_ttl_seconds=approval_ttl_seconds,
         auth_token=auth_token,
         token_principals=token_principals,
+        cert_principals=cert_principals,
         unsafe_allow_remote=unsafe_allow_remote,
         deployment_mode=deployment_mode,
         ssl_context=ssl_context,

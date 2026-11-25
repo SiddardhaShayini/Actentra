@@ -13,15 +13,18 @@ Provides a strict separation between:
 from __future__ import annotations
 
 import base64
+import hashlib
 import hmac
 import threading
 import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
+from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -31,6 +34,7 @@ from cryptography.hazmat.primitives.serialization import (
     load_pem_private_key,
     load_pem_public_key,
 )
+from cryptography.x509.oid import NameOID
 
 from actentra_core.canonicalize import canonicalize_json, canonicalize_unicode
 
@@ -1047,6 +1051,372 @@ def _find_parent_in_principals(
     return None
 
 
+def _normalize_fingerprint(fp: str) -> str:
+    clean = canonicalize_unicode(fp).strip().lower()
+    if clean.startswith("sha256:"):
+        clean = clean[7:]
+    clean = clean.replace(":", "")
+    return f"sha256:{clean}"
+
+
+@dataclass(frozen=True, slots=True)
+class CertificateIdentity:
+    """Validated X.509 transport identity extracted from an authenticated TLS socket."""
+
+    sha256_fingerprint: str
+    subject_cn: str | None
+    san_uris: tuple[str, ...]
+    san_dns: tuple[str, ...]
+    issuer_cn: str | None
+    issuer_dn: str
+    serial_number: str
+    not_valid_before: datetime
+    not_valid_after: datetime
+
+    def is_currently_valid(self, at_time: float | None = None) -> bool:
+        """Return True if certificate validity window covers at_time."""
+        now_dt = (
+            datetime.fromtimestamp(at_time, UTC) if at_time is not None else datetime.now(UTC)
+        )
+        return self.not_valid_before <= now_dt <= self.not_valid_after
+
+
+def extract_certificate_identity(der_bytes: bytes) -> CertificateIdentity:
+    """Extract canonical CertificateIdentity from DER-encoded X.509 peer certificate."""
+    if not der_bytes:
+        raise IdentitySecurityError("Empty TLS peer certificate")
+    try:
+        cert = x509.load_der_x509_certificate(der_bytes)
+    except Exception as exc:
+        raise IdentitySecurityError(f"Malformed TLS peer certificate: {exc}") from exc
+
+    fp = f"sha256:{hashlib.sha256(der_bytes).hexdigest().lower()}"
+
+    subject_cn: str | None = None
+    cn_attrs = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    if cn_attrs:
+        subject_cn = str(cn_attrs[0].value)
+
+    issuer_cn: str | None = None
+    issuer_cn_attrs = cert.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)
+    if issuer_cn_attrs:
+        issuer_cn = str(issuer_cn_attrs[0].value)
+
+    san_uris: list[str] = []
+    san_dns: list[str] = []
+    try:
+        san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        san_uris = [
+            str(u).strip() for u in san_ext.get_values_for_type(x509.UniformResourceIdentifier)
+        ]
+        san_dns = [str(d).strip().lower() for d in san_ext.get_values_for_type(x509.DNSName)]
+    except x509.ExtensionNotFound:
+        pass
+
+    return CertificateIdentity(
+        sha256_fingerprint=fp,
+        subject_cn=subject_cn,
+        san_uris=tuple(san_uris),
+        san_dns=tuple(san_dns),
+        issuer_cn=issuer_cn,
+        issuer_dn=cert.issuer.rfc4514_string(),
+        serial_number=format(cert.serial_number, "x"),
+        not_valid_before=cert.not_valid_before_utc,
+        not_valid_after=cert.not_valid_after_utc,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CertificatePrincipalBinding:
+    """Explicit trusted mapping between an X.509 client certificate and an app principal."""
+
+    principal_id: str
+    principal_type: PrincipalType = PrincipalType.AUTHENTICATED_AGENT
+    fingerprints: tuple[str, ...] = ()
+    san_uris: tuple[str, ...] = ()
+    allowed_issuers: tuple[str, ...] = ()
+    scopes: tuple[str, ...] = DEFAULT_AGENT_SCOPES
+    allowed_agents: tuple[str, ...] = ()
+    trust_domain: str = "mtls"
+    revoked: bool = False
+    expires_at: float | None = None
+
+
+class MTLSPrincipalRegistry:
+    """Thread-safe registry binding mTLS client certificates to application principals."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._bindings: dict[str, CertificatePrincipalBinding] = {}
+        self._revoked_fingerprints: set[str] = set()
+        self._audit_events: list[dict[str, Any]] = []
+
+    def _record_event(self, event_type: str, **details: Any) -> None:
+        self._audit_events.append(
+            {"ts": time.time(), "event": event_type, **details}
+        )
+        if len(self._audit_events) > 2000:
+            self._audit_events = self._audit_events[-2000:]
+
+    def audit_events(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(ev) for ev in self._audit_events]
+
+    def register_binding(self, binding: CertificatePrincipalBinding) -> None:
+        """Register or update a principal's certificate binding, rejecting ambiguous claims."""
+        clean_pid = canonicalize_unicode(binding.principal_id).strip()
+        if not clean_pid:
+            raise IdentitySecurityError("Certificate binding requires non-empty principal_id")
+        norm_fps = tuple(_normalize_fingerprint(fp) for fp in binding.fingerprints if fp)
+        norm_uris = tuple(canonicalize_unicode(u).strip() for u in binding.san_uris if u)
+        if not norm_fps and not norm_uris:
+            raise IdentitySecurityError(
+                f"Certificate binding for '{clean_pid}' must specify fingerprints or san_uris"
+            )
+        allowed_agents = binding.allowed_agents or (clean_pid,)
+        normalized = CertificatePrincipalBinding(
+            principal_id=clean_pid,
+            principal_type=binding.principal_type,
+            fingerprints=norm_fps,
+            san_uris=norm_uris,
+            allowed_issuers=tuple(binding.allowed_issuers),
+            scopes=tuple(binding.scopes),
+            allowed_agents=tuple(allowed_agents),
+            trust_domain=binding.trust_domain,
+            revoked=binding.revoked,
+            expires_at=binding.expires_at,
+        )
+        with self._lock:
+            for existing_pid, existing in self._bindings.items():
+                if existing_pid.lower() == clean_pid.lower() or existing.revoked:
+                    continue
+                if set(norm_fps) & set(existing.fingerprints):
+                    raise IdentitySecurityError(
+                        f"Ambiguous certificate fingerprint mapping: already bound to "
+                        f"'{existing.principal_id}'"
+                    )
+                if set(norm_uris) & set(existing.san_uris):
+                    raise IdentitySecurityError(
+                        f"Ambiguous SAN URI mapping: already bound to '{existing.principal_id}'"
+                    )
+            self._bindings[clean_pid.lower()] = normalized
+            self._record_event(
+                "cert_binding_registered",
+                principal_id=clean_pid,
+                fingerprints=list(norm_fps),
+                san_uris=list(norm_uris),
+            )
+
+    @classmethod
+    def from_dict(cls, mapping: Mapping[str, Any]) -> MTLSPrincipalRegistry:
+        """Build MTLSPrincipalRegistry from configuration dictionary keyed by principal_id."""
+        reg = cls()
+        for key, raw in mapping.items():
+            if isinstance(raw, CertificatePrincipalBinding):
+                reg.register_binding(raw)
+                continue
+            if not isinstance(raw, Mapping):
+                raise IdentitySecurityError(
+                    f"Invalid cert_principals entry for '{key}'"
+                )
+            pid = str(raw.get("principal_id", key))
+            fps_raw = raw.get("fingerprints") or (
+                [raw["fingerprint"]] if raw.get("fingerprint") else []
+            )
+            uris_raw = raw.get("san_uris") or (
+                [raw["san_uri"]] if raw.get("san_uri") else []
+            )
+            issuers_raw = raw.get("allowed_issuers") or ()
+            scopes_raw = raw.get("scopes", DEFAULT_AGENT_SCOPES)
+            agents_raw = raw.get("allowed_agents") or (pid,)
+            p_type = PrincipalType(raw.get("principal_type", PrincipalType.AUTHENTICATED_AGENT))
+            reg.register_binding(
+                CertificatePrincipalBinding(
+                    principal_id=pid,
+                    principal_type=p_type,
+                    fingerprints=tuple(str(f) for f in fps_raw),
+                    san_uris=tuple(str(u) for u in uris_raw),
+                    allowed_issuers=tuple(str(i) for i in issuers_raw),
+                    scopes=tuple(str(s) for s in scopes_raw),
+                    allowed_agents=tuple(str(a) for a in agents_raw),
+                    trust_domain=str(raw.get("trust_domain", "mtls")),
+                    revoked=bool(raw.get("revoked", False)),
+                    expires_at=(
+                        float(raw["expires_at"]) if raw.get("expires_at") is not None else None
+                    ),
+                )
+            )
+        return reg
+
+    def revoke_certificate(self, fingerprint: str, *, reason: str = "manual_revocation") -> None:
+        """Revoke a specific certificate fingerprint immediately."""
+        norm = _normalize_fingerprint(fingerprint)
+        with self._lock:
+            self._revoked_fingerprints.add(norm)
+            self._record_event("cert_revoked", fingerprint=norm, reason=reason)
+
+    def revoke_principal(self, principal_id: str, *, reason: str = "manual_revocation") -> bool:
+        """Revoke all certificate bindings for a principal."""
+        clean = canonicalize_unicode(principal_id).strip().lower()
+        with self._lock:
+            existing = self._bindings.get(clean)
+            if existing is None:
+                return False
+            for fp in existing.fingerprints:
+                self._revoked_fingerprints.add(fp)
+            self._bindings[clean] = CertificatePrincipalBinding(
+                principal_id=existing.principal_id,
+                principal_type=existing.principal_type,
+                fingerprints=existing.fingerprints,
+                san_uris=existing.san_uris,
+                allowed_issuers=existing.allowed_issuers,
+                scopes=existing.scopes,
+                allowed_agents=existing.allowed_agents,
+                trust_domain=existing.trust_domain,
+                revoked=True,
+                expires_at=existing.expires_at,
+            )
+            self._record_event(
+                "principal_cert_revoked", principal_id=existing.principal_id, reason=reason
+            )
+            return True
+
+    def rotate_certificate(
+        self,
+        principal_id: str,
+        *,
+        new_fingerprint: str | None = None,
+        new_san_uri: str | None = None,
+        old_fingerprint: str | None = None,
+        revoke_old: bool = True,
+    ) -> CertificatePrincipalBinding:
+        """Rotate a principal's certificate, optionally revoking the old fingerprint."""
+        clean = canonicalize_unicode(principal_id).strip().lower()
+        with self._lock:
+            existing = self._bindings.get(clean)
+            if existing is None:
+                raise IdentitySecurityError(
+                    f"Cannot rotate certificate: principal '{principal_id}' not registered"
+                )
+            if existing.revoked:
+                raise IdentitySecurityError(
+                    f"Cannot rotate certificate for revoked principal '{principal_id}'"
+                )
+            fps = list(existing.fingerprints)
+            if revoke_old:
+                if old_fingerprint:
+                    norm_old = _normalize_fingerprint(old_fingerprint)
+                    self._revoked_fingerprints.add(norm_old)
+                    fps = [f for f in fps if f != norm_old]
+                else:
+                    for fp in fps:
+                        self._revoked_fingerprints.add(fp)
+                    fps = []
+            if new_fingerprint:
+                norm_new = _normalize_fingerprint(new_fingerprint)
+                if norm_new in self._revoked_fingerprints:
+                    raise IdentitySecurityError("Cannot rotate to an already-revoked certificate")
+                if norm_new not in fps:
+                    fps.append(norm_new)
+
+            uris = list(existing.san_uris)
+            if new_san_uri and new_san_uri not in uris:
+                uris.append(canonicalize_unicode(new_san_uri).strip())
+
+            updated = CertificatePrincipalBinding(
+                principal_id=existing.principal_id,
+                principal_type=existing.principal_type,
+                fingerprints=tuple(fps),
+                san_uris=tuple(uris),
+                allowed_issuers=existing.allowed_issuers,
+                scopes=existing.scopes,
+                allowed_agents=existing.allowed_agents,
+                trust_domain=existing.trust_domain,
+                revoked=False,
+                expires_at=existing.expires_at,
+            )
+            self._bindings[clean] = updated
+            self._record_event(
+                "cert_rotated",
+                principal_id=existing.principal_id,
+                new_fingerprint=new_fingerprint,
+                revoke_old=revoke_old,
+            )
+            return updated
+
+    def resolve_certificate(
+        self,
+        cert_id: CertificateIdentity,
+        *,
+        at_time: float | None = None,
+    ) -> CertificatePrincipalBinding:
+        """Resolve an authenticated TLS peer certificate to its unique principal binding."""
+        now = at_time if at_time is not None else time.time()
+        if not cert_id.is_currently_valid(at_time=now):
+            raise IdentitySecurityError(
+                f"Client certificate '{cert_id.sha256_fingerprint}' is expired or not yet valid"
+            )
+
+        with self._lock:
+            if cert_id.sha256_fingerprint in self._revoked_fingerprints:
+                self._record_event(
+                    "cert_rejected_revoked", fingerprint=cert_id.sha256_fingerprint
+                )
+                raise IdentitySecurityError(
+                    f"Client certificate '{cert_id.sha256_fingerprint}' has been revoked"
+                )
+
+            matches: list[CertificatePrincipalBinding] = []
+            for binding in self._bindings.values():
+                fp_match = cert_id.sha256_fingerprint in binding.fingerprints
+                uri_match = bool(set(cert_id.san_uris) & set(binding.san_uris))
+                if fp_match or uri_match:
+                    matches.append(binding)
+
+            if len(matches) > 1:
+                self._record_event(
+                    "cert_rejected_ambiguous", fingerprint=cert_id.sha256_fingerprint
+                )
+                raise IdentitySecurityError(
+                    f"Ambiguous certificate mapping for '{cert_id.sha256_fingerprint}'"
+                )
+            if not matches:
+                self._record_event(
+                    "cert_rejected_unknown",
+                    fingerprint=cert_id.sha256_fingerprint,
+                    san_uris=list(cert_id.san_uris),
+                )
+                raise IdentitySecurityError(
+                    f"Client certificate '{cert_id.sha256_fingerprint}' is not registered "
+                    "to any application principal"
+                )
+
+            binding = matches[0]
+            if binding.revoked:
+                raise IdentitySecurityError(
+                    f"Certificate binding for principal '{binding.principal_id}' is revoked"
+                )
+            if binding.expires_at is not None and now > binding.expires_at:
+                raise IdentitySecurityError(
+                    f"Certificate binding for principal '{binding.principal_id}' has expired"
+                )
+            if binding.allowed_issuers:
+                issuer_match = cert_id.issuer_dn in binding.allowed_issuers or (
+                    cert_id.issuer_cn is not None and cert_id.issuer_cn in binding.allowed_issuers
+                )
+                if not issuer_match:
+                    self._record_event(
+                        "cert_rejected_issuer",
+                        fingerprint=cert_id.sha256_fingerprint,
+                        issuer=cert_id.issuer_dn,
+                    )
+                    raise IdentitySecurityError(
+                        f"Client certificate issuer '{cert_id.issuer_dn}' is not authorized "
+                        f"for principal '{binding.principal_id}'"
+                    )
+            return binding
+
+
 def resolve_http_caller_context(
     *,
     headers: dict[str, str],
@@ -1054,6 +1424,10 @@ def resolve_http_caller_context(
     remote_addr: str = "127.0.0.1",
     token_principals: Mapping[str, Any] | None = None,
     delegation_registry: DelegationRegistry | None = None,
+    client_cert: CertificateIdentity | None = None,
+    cert_registry: MTLSPrincipalRegistry | None = None,
+    require_client_cert: bool = False,
+    enforce_strict_shared_token: bool = False,
 ) -> CallerContext:
     """Resolve caller context from HTTP headers, strictly verifying credentials and delegation."""
     auth_header = headers.get("authorization", "").strip()
@@ -1069,6 +1443,61 @@ def resolve_http_caller_context(
         (expected_token and expected_token.strip())
         or (token_principals is not None and len(token_principals) > 0)
     )
+
+    # 0. Validate transport-layer mTLS identity if required or present
+    cert_binding: CertificatePrincipalBinding | None = None
+    if require_client_cert and client_cert is None:
+        raise IdentitySecurityError("Mutual TLS client certificate required and none was provided")
+    if client_cert is not None:
+        if not client_cert.is_currently_valid():
+            raise IdentitySecurityError(
+                f"Client certificate '{client_cert.sha256_fingerprint}' is expired or not yet valid"
+            )
+        if cert_registry is not None:
+            cert_binding = cert_registry.resolve_certificate(client_cert)
+
+    def _bind_transport_identity(ctx: CallerContext) -> CallerContext:
+        """Bind application CallerContext strictly to validated mTLS CertificatePrincipalBinding."""
+        if client_cert is None:
+            return ctx
+        if cert_binding is not None:
+            auth_pid = ctx.authenticated_principal_id or ctx.principal_id
+            if auth_pid.lower() != cert_binding.principal_id.lower():
+                raise IdentitySecurityError(
+                    f"mTLS identity binding mismatch: client certificate belongs to "
+                    f"'{cert_binding.principal_id}', but Bearer token belongs to '{auth_pid}'"
+                )
+            # Attenuate scopes & allowed_agents to intersection of token and cert binding
+            if "*" in cert_binding.scopes:
+                bound_scopes = ctx.scopes
+            elif "*" in ctx.scopes:
+                bound_scopes = cert_binding.scopes
+            else:
+                bound_scopes = tuple(s for s in ctx.scopes if s in cert_binding.scopes)
+
+            if "*" in cert_binding.allowed_agents:
+                bound_agents = ctx.allowed_agents
+            elif "*" in ctx.allowed_agents:
+                bound_agents = cert_binding.allowed_agents
+            else:
+                cert_ag_low = {a.lower() for a in cert_binding.allowed_agents}
+                bound_agents = tuple(a for a in ctx.allowed_agents if a.lower() in cert_ag_low)
+
+            return CallerContext(
+                principal_type=ctx.principal_type,
+                principal_id=cert_binding.principal_id,
+                authenticated=ctx.authenticated,
+                trust_domain=cert_binding.trust_domain,
+                scopes=bound_scopes,
+                allowed_agents=bound_agents,
+                delegated_by=ctx.delegated_by,
+                delegation_grant_id=ctx.delegation_grant_id,
+                claimed_identity=ctx.claimed_identity,
+                authenticated_principal_id=cert_binding.principal_id,
+                delegation_grant=ctx.delegation_grant,
+                audience=ctx.audience,
+            )
+        return ctx
 
     # 1. Process Bearer token if presented
     if auth_header.startswith("Bearer "):
@@ -1094,6 +1523,25 @@ def resolve_http_caller_context(
                     exp = mapped.get("expires_at")
                     if exp is not None and time.time() > float(exp):
                         raise IdentitySecurityError("Bearer token has expired")
+                    req_fp = mapped.get("cert_fingerprint")
+                    if req_fp is not None:
+                        if client_cert is None:
+                            raise IdentitySecurityError(
+                                "Token requires mTLS client certificate"
+                            )
+                        if _normalize_fingerprint(str(req_fp)) != client_cert.sha256_fingerprint:
+                            raise IdentitySecurityError(
+                                "mTLS identity binding mismatch: certificate fingerprint does "
+                                "not match token principal binding"
+                            )
+                    req_uri = mapped.get("san_uri")
+                    if req_uri is not None and (
+                        client_cert is None or str(req_uri) not in client_cert.san_uris
+                    ):
+                        raise IdentitySecurityError(
+                            "mTLS identity binding mismatch: certificate SAN URI does not "
+                            "match token principal binding"
+                        )
 
                 if isinstance(mapped, CallerContext):
                     ctx = mapped
@@ -1248,10 +1696,48 @@ def resolve_http_caller_context(
                         f"Conflicting identity claim: authenticated principal '{ctx.principal_id}' "
                         f"cannot assert identity '{client_identity}'"
                     )
-                return ctx
+                return _bind_transport_identity(ctx)
 
             # Check configured shared expected_token using constant-time comparison
             if expected_token and hmac.compare_digest(token, expected_token):
+                if cert_binding is not None:
+                    # Bind shared token strictly to the authenticated mTLS cert principal
+                    if client_identity and not (
+                        "*" in cert_binding.allowed_agents
+                        or client_identity.lower()
+                        in {a.lower() for a in cert_binding.allowed_agents}
+                    ):
+                        raise IdentitySecurityError(
+                            f"Conflicting identity claim: cert principal "
+                            f"'{cert_binding.principal_id}' cannot assert '{client_identity}'"
+                        )
+                    return CallerContext(
+                        principal_type=cert_binding.principal_type,
+                        principal_id=cert_binding.principal_id,
+                        authenticated=True,
+                        trust_domain=cert_binding.trust_domain,
+                        scopes=cert_binding.scopes,
+                        allowed_agents=cert_binding.allowed_agents,
+                        claimed_identity=client_identity or None,
+                        authenticated_principal_id=cert_binding.principal_id,
+                    )
+                if enforce_strict_shared_token:
+                    fixed_pid = "shared-gateway-operator"
+                    if client_identity and client_identity.lower() != fixed_pid:
+                        raise IdentitySecurityError(
+                            "Shared bearer token cannot impersonate distinct principal "
+                            f"'{client_identity}' in remote/strict mode"
+                        )
+                    return CallerContext(
+                        principal_type=PrincipalType.AUTHENTICATED_OPERATOR,
+                        principal_id=fixed_pid,
+                        authenticated=True,
+                        trust_domain="gateway_operator",
+                        scopes=DEFAULT_OPERATOR_SCOPES,
+                        allowed_agents=("*",),
+                        claimed_identity=client_identity or None,
+                        authenticated_principal_id=fixed_pid,
+                    )
                 return CallerContext(
                     principal_type=PrincipalType.AUTHENTICATED_OPERATOR,
                     principal_id=client_identity or f"token-operator@{remote_addr}",
@@ -1369,6 +1855,27 @@ def resolve_http_caller_context(
     # 2. No Bearer token provided
     if claimed_delegation or header_grant_id:
         raise IdentitySecurityError("Unauthenticated caller cannot assert delegated authority")
+
+    # Pure mTLS certificate authentication (when no server Bearer token is configured)
+    if cert_binding is not None and not has_server_auth:
+        if client_identity and not (
+            "*" in cert_binding.allowed_agents
+            or client_identity.lower() in {a.lower() for a in cert_binding.allowed_agents}
+        ):
+            raise IdentitySecurityError(
+                f"Conflicting identity claim: cert principal '{cert_binding.principal_id}' "
+                f"cannot assert identity '{client_identity}'"
+            )
+        return CallerContext(
+            principal_type=cert_binding.principal_type,
+            principal_id=cert_binding.principal_id,
+            authenticated=True,
+            trust_domain=cert_binding.trust_domain,
+            scopes=cert_binding.scopes,
+            allowed_agents=cert_binding.allowed_agents,
+            claimed_identity=client_identity or None,
+            authenticated_principal_id=cert_binding.principal_id,
+        )
 
     # In loopback mode without expected_token, classify as loopback caller
     if remote_addr in ("127.0.0.1", "::1", "localhost"):
