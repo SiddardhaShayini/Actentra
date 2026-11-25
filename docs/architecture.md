@@ -198,10 +198,11 @@ Actentra is designed for local-first, low-overhead operation on resource-constra
   - Loopback host and allowed Host header enforcement preventing DNS rebinding.
 
 ### 9. Executor Boundary Hardening (Phase 4 Hardening)
-- **Filesystem Executor Isolation:**
+- **Filesystem Executor Isolation (Phase 3 Race-Resistant Confinement):**
   - Strict path canonicalization on Windows, eliminating Alternate Data Streams, 8.3 short names, and traversal tokens.
-  - Open file descriptor realpath verification against workspace boundaries before read/write operations to eliminate symlink and junction TOCTOU attacks.
-  - Atomic file writing via temporary file creation within workspace boundaries and atomic rename/replacement.
+  - **Windows:** Segment-by-segment ancestor directory handle traversal (`CreateFileW` with `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT` and without `FILE_SHARE_DELETE`), locking every ancestor from `workspace_root` to the parent directory against concurrent rename/junction replacement, verifying `FILE_ATTRIBUTE_REPARSE_POINT` is absent via `GetFileInformationByHandle`, verifying `GetFinalPathNameByHandleW`, and deleting via `SetFileInformationByHandle(FileDispositionInfo)`.
+  - **POSIX:** Segment-by-segment `openat`-style traversal (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`), descriptor-relative `os.open(..., dir_fd=...)`, `os.mkdir(..., dir_fd=...)`, `os.replace(..., src_dir_fd=..., dst_dir_fd=...)`, and `os.unlink(..., dir_fd=...)`.
+  - Atomic file writing via exclusive temporary file creation (`O_CREAT | O_EXCL`) within the verified parent directory and safe cleanup inside `finally`.
 - **SQLite Engine Authorization:**
   - SQLite authorizer callbacks (`sqlite3.set_authorizer`) enforce table-level permissions across direct queries, JOINs, CTEs, subqueries, and triggers.
   - Unconditional blocking of `ATTACH`, `DETACH`, `PRAGMA`, and schema DDL mutations.
