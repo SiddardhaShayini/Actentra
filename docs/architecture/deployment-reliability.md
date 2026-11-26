@@ -182,9 +182,10 @@ Returns operational counters and latency histograms without leaking secrets:
 
 ### Handling Uncertain Outcomes (`status = "unknown"`)
 
-1. Query pending unknown outcomes:
-   ```bash
-   python -m actentra.cli receipts list --status unknown
+1. Export receipts or inspect a crossing lifecycle state:
+   ```powershell
+   actentra export-log receipts.db --out receipts.jsonl
+   actentra lifecycle show <crossing_id> --db receipts.db
    ```
 2. Inspect the resource state and relevant evidence logs.
 3. Once the actual state is determined, reconcile the outcome:

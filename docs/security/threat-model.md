@@ -1,6 +1,6 @@
 # Actentra Threat Model (v1)
 
-This document defines the threats Actentra is designed to mitigate, the corresponding controls, and the residual risks. It is aligned with [PLAN.md](../PLAN.md) Section 8.3 and [PLAN_V3.md](../PLAN_V3.md).
+This document defines the threats Actentra is designed to mitigate, the corresponding controls, and the residual risks.
 
 ## Trust Boundaries
 

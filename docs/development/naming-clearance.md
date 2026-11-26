@@ -2,7 +2,7 @@
 
 **Working name:** `Actentra` (coined working brand; not a claim of legal clearance).
 
-Before commercial launch, paid offerings, or spending money on trademark registration or branding, complete the checklist from [PLAN.md](../PLAN.md) Section 1.2:
+Before commercial launch, paid offerings, or spending money on trademark registration or branding, complete the following checklist:
 
 - [ ] Search **USPTO** Trademark Search (Classes 9 & 42) for "Actentra" and phonetic variants.
 - [ ] Search **Indian Trade Marks Registry** (Classes 9 & 42) for "Actentra" and phonetic variants.

@@ -2,7 +2,7 @@
 
 Each entry in `agent_incidents.jsonl` maps a real-world documented AI agent failure, published vulnerability advisory, or synthetic regression scenario to:
 
-- **Failure class** (`PLAN.md` Section 3): `mistake`, `manipulation`, `over-privilege`, or `runaway`.
+- **Failure class:** `mistake`, `manipulation`, `over-privilege`, or `runaway`.
 - **Control:** the deterministic Actentra mechanism that stops or escalates it.
 - **Expected verdicts:** `deny`, `ask`, or `hold` (verified by `actentra replay` and `tests/replay/test_replay_metrics.py`).
 - **Provenance & Type:** clearly distinguishes published CVEs/advisories from synthetic benchmark test cases.

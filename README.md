@@ -61,7 +61,7 @@
 - [`spec/`](spec/) — Draft 2020-12 JSON Schemas for Envelope, Policy, and Receipt v1
 - [`policies/examples/`](policies/examples/) — Starter policy packs
 - [`corpus/`](corpus/) — Documented real-world agent incident corpus (32 incidents), red-team attacks, and benign actions
-- [`docs/`](docs/) — [Quickstart Guide](docs/quickstart.md), [Architecture & Design](docs/architecture.md), [Threat Model](docs/threat-model.md), [Guarantees & Limits](docs/guarantees-and-limits.md), [Naming Clearance Checklist](docs/naming-clearance.md)
+- [`docs/`](docs/) — [Quickstart Guide](docs/guides/quickstart.md), [Architecture & Design](docs/architecture/architecture.md), [Threat Model](docs/security/threat-model.md), [Guarantees & Limits](docs/security/guarantees-and-limits.md), [Product Status](docs/product-status.md), [Naming Clearance Checklist](docs/development/naming-clearance.md)
 - [`scripts/windows/`](scripts/windows/) — Resilient background runner (`run_gateway.ps1`) for Windows Task Scheduler
 - [`tests/`](tests/) — Complete test suite (unit, golden, chaos, replay, Hypothesis properties, performance)
 
@@ -145,4 +145,4 @@ content = read_workspace_file("C:/work/notes.txt")
 
 ## Guarantees and Limits
 
-Actentra is designed to **fail closed**, bind approvals to exact `sha256` action hashes, and persist durable decision records before execution. See [docs/guarantees-and-limits.md](docs/guarantees-and-limits.md) for explicit architectural boundaries and non-goals.
+Actentra is designed to **fail closed**, bind approvals to exact `sha256` action hashes, and persist durable decision records before execution. See [docs/security/guarantees-and-limits.md](docs/security/guarantees-and-limits.md) for explicit architectural boundaries and non-goals.

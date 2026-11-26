@@ -33,8 +33,8 @@ The most important next action is to accept structured identities only through c
 
 ## Detailed reports
 
-- [Finding 01 second-pass remediation report](REMEDIATION_REPORT_FINDING_01_SECOND_PASS.md)
-- [Finding 03 second-pass remediation report](REMEDIATION_REPORT_FINDING_03_SECOND_PASS.md)
+- [Finding 01 second-pass remediation report](../remediations/REMEDIATION_REPORT_FINDING_01_SECOND_PASS.md)
+- [Finding 03 second-pass remediation report](../remediations/REMEDIATION_REPORT_FINDING_03_SECOND_PASS.md)
 - [Post-remediation security validation](POST_REMEDIATION_SECURITY_VALIDATION.md)
 - [Finding remediation verification](FINDING_REMEDIATION_VERIFICATION.md)
 - [Integrated adversarial test report](INTEGRATED_ADVERSARIAL_TEST_REPORT.md)
