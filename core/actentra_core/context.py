@@ -45,7 +45,7 @@ def _canonicalize_value(val: Any) -> Any:
     if isinstance(val, (list, tuple)):
         return [_canonicalize_value(v) for v in val]
     if isinstance(val, str):
-        return canonicalize_unicode(val)
+        return canonicalize_unicode(val, allow_newlines=True)
     return val
 
 

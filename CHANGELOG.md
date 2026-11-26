@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Developer Usability & SDK Ergonomics
+- Unified public SDK exports in `actentra` (`Boundary`, `ExecutionResult`, `CrossingReceipt`, `path_resource`, `load_policy_file`, `load_policy_yaml`, `ReceiptStore`, `Decision`, `Verdict`, `ProvenanceItem`, `CanonicalizationError`, scoped executors, and `WorkspaceFileVerifier`).
+- Added `Boundary.from_yaml(...)`, `workspace_root=` convenience initialization on `Boundary.from_files(...)` / `Boundary.from_yaml(...)`, executor registration helpers (`register_fs`, `register_sqlite`, `register_http`, `register_executor`), `Boundary.run(...) -> ExecutionResult`, and receipt inspection helpers (`inspect_crossing`, `recent_receipts`, `verify_receipts`).
+- Added optional `--workspace / -w` flag to `actentra init` to generate starter policies scoped to a workspace directory.
+- Aligned `actentra_core.context._canonicalize_value` string newline handling (`allow_newlines=True`) with `actentra_core.envelope._canonicalize_params` so multi-line `fs.write` payloads verify cleanly under `AuthorizedExecutionContext`.
+- Added runnable examples (`examples/minimal_file_write.py`, `examples/minimal_blocked_action.py`, `examples/gateway_http_example.py`, `examples/agent_function_calling.py`), updated [docs/guides/quickstart.md](docs/guides/quickstart.md), and added [docs/guides/developer-usability-report.md](docs/guides/developer-usability-report.md).
+
 ### Documentation
 - Reorganized repository documentation under `docs/architecture/`, `docs/security/` (including `audits/` and `remediations/`), `docs/guides/`, and `docs/development/`.
 - Preserved historical security audit reports and remediation evidence, including `ACTENTRA_POST_REMEDIATION_AUDIT.md`.

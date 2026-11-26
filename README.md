@@ -69,6 +69,8 @@
 
 ## Quick Start (5 Minutes)
 
+> **Installation Note:** Actentra (`0.1.0a0`) is not yet published on PyPI. Install from a local clone (`pip install -e .` or `uv sync`), directly from Git (`pip install "git+https://github.com/SiddardhaShayini/Actentra.git"`), or from a built wheel. See [docs/guides/quickstart.md](docs/guides/quickstart.md).
+
 ### 1. Verification & Test Suite
 
 ```powershell
@@ -121,25 +123,45 @@
 
 ```python
 from pathlib import Path
-from actentra import Boundary, wrap_langchain_tool
-from actentra_core.policy import load_policy_file
-from actentra_core.receipts import ReceiptStore
+from actentra import Boundary, path_resource
 
-policy = load_policy_file("policies/examples/starter.yaml")
-store = ReceiptStore("receipts.db")
-boundary = Boundary(policy=policy, receipt_store=store, session_id="agent-session-01")
+workspace = Path("./workspace").resolve()
+workspace.mkdir(exist_ok=True)
+ws = path_resource(workspace).removeprefix("path:")
 
-@boundary.guard(
+policy_yaml = f"""
+version: 1
+policy_id: local-quickstart
+mode: enforce
+defaults:
+  verdict: deny
+  reason: "Denied by default policy"
+rules:
+  - id: allow-workspace-reads
+    match:
+      tool: fs.read
+      verb: read
+      resource: "path:{ws}/**"
+    verdict: allow
+    reason: "Allow workspace reads"
+"""
+
+boundary = Boundary.from_yaml(
+    policy_yaml=policy_yaml,
+    receipts_db="receipts.db",
+    workspace_root=workspace,
+)
+
+# Evaluate, execute through LocalFSExecutor, and inspect the durable receipt
+res = boundary.run(
     tool="fs.read",
     verb="read",
-    resource_fn=lambda path: f"path:{Path(path).resolve().as_posix()}",
+    resource=path_resource("notes.txt", workspace_root=workspace),
 )
-def read_workspace_file(path: str) -> str:
-    return Path(path).read_text(encoding="utf-8")
-
-# Normal call: evaluated against policy and logged to receipts.db
-content = read_workspace_file("C:/work/notes.txt")
+print(res.verdict.value, res.status, res.result)
 ```
+
+For runnable examples (file writes with postcondition verification, blocked actions, HTTP gateway, and AI-agent function-calling integration), see [`examples/`](examples/).
 
 ---
 

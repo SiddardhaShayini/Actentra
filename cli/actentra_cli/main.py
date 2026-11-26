@@ -12,6 +12,7 @@ import typer
 
 from actentra import ActionBlockedError, Boundary
 from actentra_core.canary import run_policy_canary
+from actentra_core.canonicalize import canonicalize_windows_path
 from actentra_core.causal import (
     CausalLink,
     CycleDetectedError,
@@ -135,11 +136,84 @@ rules:
 """
 
 
+def _build_init_workspace_policy(workspace_root: Path) -> str:
+    canon = canonicalize_windows_path(str(workspace_root.resolve()), resolve_fs=False)
+    return f"""\
+version: 1
+policy_id: local-workspace
+mode: enforce
+
+defaults:
+  verdict: deny
+  reason: "Denied by default policy"
+
+limits:
+  - id: session-rate
+    scope: session
+    max_actions_per_minute: 60
+
+rules:
+  - id: block-privilege-escalation
+    match:
+      risk_any: [privilege-escalation]
+    verdict: deny
+    reason: "Privilege-escalating or sensitive-path actions are blocked"
+
+  - id: block-untrusted-egress
+    match:
+      tool: "http.*"
+      taint: untrusted
+      risk_any: [external-egress]
+    verdict: deny
+    reason: "Untrusted provenance cannot trigger external egress"
+
+  - id: allow-workspace-list
+    match:
+      tool: fs.list
+      verb: read
+      resource: "path:{canon}/**"
+    verdict: allow
+    reason: "Allow workspace directory listings"
+
+  - id: allow-workspace-reads
+    match:
+      tool: fs.read
+      verb: read
+      resource: "path:{canon}/**"
+    verdict: allow
+    reason: "Allow workspace reads"
+
+  - id: ask-workspace-writes
+    match:
+      tool: fs.write
+      verb: write
+      resource: "path:{canon}/**"
+    verdict: ask
+    reason: "Workspace writes require explicit approval"
+
+  - id: ask-workspace-delete
+    match:
+      tool: fs.delete
+      verb: delete
+      resource: "path:{canon}/**"
+    verdict: ask
+    reason: "Workspace deletes require explicit approval"
+"""
+
+
 @app.command()
 def init(
     directory: Annotated[Path, typer.Argument(help="Target directory for starter policy.")] = Path(
         "."
     ),
+    workspace: Annotated[
+        Path | None,
+        typer.Option(
+            "--workspace",
+            "-w",
+            help="Scope starter rules to workspace dir (allows reads, asks on writes/deletes).",
+        ),
+    ] = None,
     force: Annotated[bool, typer.Option("--force", help="Overwrite existing policy file.")] = False,
 ) -> None:
     """Create a starter actentra.policy.yaml in the target directory."""
@@ -148,8 +222,14 @@ def init(
         typer.echo(f"Policy file already exists: {target} (use --force to overwrite)", err=True)
         raise typer.Exit(code=1)
     directory.mkdir(parents=True, exist_ok=True)
-    target.write_text(_DEFAULT_STARTER_POLICY, encoding="utf-8")
+    content = (
+        _build_init_workspace_policy(workspace)
+        if workspace is not None
+        else _DEFAULT_STARTER_POLICY
+    )
+    target.write_text(content, encoding="utf-8")
     typer.echo(f"Created starter policy: {target}")
+    typer.echo(f"Next: actentra policy check {target}")
 
 
 @policy_app.command("check")
