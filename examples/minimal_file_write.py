@@ -14,7 +14,7 @@ from actentra import Boundary, path_resource
 
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="actentra-write-demo-") as tmp:
-        root = Path(tmp)
+        root = Path(tmp).resolve()
         workspace = root / "workspace"
         workspace.mkdir()
         db_path = root / "receipts.db"

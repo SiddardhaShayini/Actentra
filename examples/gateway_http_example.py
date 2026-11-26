@@ -41,7 +41,7 @@ def _http_json(
 
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="actentra-http-example-") as tmp:
-        root = Path(tmp)
+        root = Path(tmp).resolve()
         workspace = root / "workspace"
         workspace.mkdir()
         (workspace / "readme.txt").write_text("Gateway workspace file\n", encoding="utf-8")

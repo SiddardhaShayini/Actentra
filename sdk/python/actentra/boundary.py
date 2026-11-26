@@ -182,7 +182,7 @@ def path_resource(path: str | Path, *, workspace_root: str | Path | None = None)
         raw = raw[5:]
     base: str | None = None
     if workspace_root is not None:
-        base = canonicalize_windows_path(str(Path(workspace_root).resolve()), resolve_fs=False)
+        base = canonicalize_windows_path(str(Path(workspace_root).resolve()), resolve_fs=True)
     else:
         win_slash = raw.replace("/", "\\")
         has_drive = (
@@ -192,8 +192,8 @@ def path_resource(path: str | Path, *, workspace_root: str | Path | None = None)
             and win_slash[1] == ":"
         )
         if not has_drive and not win_slash.startswith("\\\\"):
-            base = canonicalize_windows_path(str(Path.cwd()), resolve_fs=False)
-    canon = canonicalize_windows_path(raw, base_dir=base, resolve_fs=False)
+            base = canonicalize_windows_path(str(Path.cwd()), resolve_fs=True)
+    canon = canonicalize_windows_path(raw, base_dir=base, resolve_fs=True)
     return f"path:{canon}"
 
 

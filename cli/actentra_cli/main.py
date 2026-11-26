@@ -137,7 +137,7 @@ rules:
 
 
 def _build_init_workspace_policy(workspace_root: Path) -> str:
-    canon = canonicalize_windows_path(str(workspace_root.resolve()), resolve_fs=False)
+    canon = canonicalize_windows_path(str(workspace_root.resolve()), resolve_fs=True)
     return f"""\
 version: 1
 policy_id: local-workspace

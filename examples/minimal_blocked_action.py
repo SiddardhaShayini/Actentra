@@ -17,7 +17,7 @@ from actentra import ActionBlockedError, Boundary, CanonicalizationError, path_r
 
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="actentra-blocked-demo-") as tmp:
-        root = Path(tmp)
+        root = Path(tmp).resolve()
         workspace = root / "workspace"
         workspace.mkdir()
         (workspace / ".env").write_text("API_KEY=do_not_read\n", encoding="utf-8")

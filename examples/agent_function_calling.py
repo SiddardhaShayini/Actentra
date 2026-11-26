@@ -16,7 +16,7 @@ from actentra import Boundary, FunctionCallAdapter, ProvenanceItem, path_resourc
 
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="actentra-agent-demo-") as tmp:
-        root = Path(tmp)
+        root = Path(tmp).resolve()
         workspace = root / "workspace"
         workspace.mkdir()
         (workspace / "notes.txt").write_text(
