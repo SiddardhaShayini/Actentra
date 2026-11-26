@@ -69,7 +69,7 @@
 
 ## Quick Start (5 Minutes)
 
-> **Installation Note:** Actentra (`0.1.0a0`) is not yet published on PyPI. Install from a local clone (`pip install -e .` or `uv sync`), directly from Git (`pip install "git+https://github.com/SiddardhaShayini/Actentra.git"`), or from a built wheel. See [docs/guides/quickstart.md](docs/guides/quickstart.md).
+> **Installation:** Install Actentra (`>=3.12`) with `pip install actentra` (or `uv add actentra`). See [docs/guides/quickstart.md](docs/guides/quickstart.md) for source/editable and gateway setup.
 
 ### 1. Verification & Test Suite
 

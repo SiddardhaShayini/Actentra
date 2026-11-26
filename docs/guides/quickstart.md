@@ -6,10 +6,19 @@
 
 ## 1. Installation
 
-Actentra is currently distributed from source / wheel (`0.1.0a0`, **not yet published on PyPI**).
 Requires **Python 3.12+**.
 
-### From a local clone (editable or standard)
+```powershell
+pip install actentra
+```
+
+Or with `uv`:
+
+```powershell
+uv add actentra
+```
+
+### From a local clone (for development)
 
 ```powershell
 git clone https://github.com/SiddardhaShayini/Actentra.git
@@ -22,16 +31,6 @@ uv sync
 python -m venv .venv
 .venv\Scripts\activate
 pip install -e .
-```
-
-### Installing into another Python project (without cloning manually)
-
-```powershell
-# Install directly from GitHub
-pip install "git+https://github.com/SiddardhaShayini/Actentra.git"
-
-# Or install a built wheel (created with `uv build` or `python -m build`)
-pip install dist/actentra-0.1.0a0-py3-none-any.whl
 ```
 
 Verify installation:
