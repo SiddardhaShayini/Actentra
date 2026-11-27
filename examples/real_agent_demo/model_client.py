@@ -10,10 +10,106 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+
+def parse_tool_calls_from_text(raw_text: str) -> tuple[str | None, list[dict[str, Any]]]:
+    """Extract OpenAI-format tool calls from Qwen2.5 JSON, Qwen3.5 XML, or Harmony text."""
+    clean = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.S).strip()
+    tool_calls: list[dict[str, Any]] = []
+
+    # 1. Qwen2.5 / Qwen3 JSON inside <tool_call>{...}</tool_call>
+    for match in re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", clean, flags=re.S):
+        with contextlib.suppress(json.JSONDecodeError, TypeError, KeyError):
+            obj = json.loads(match.group(1))
+            if isinstance(obj, dict) and isinstance(obj.get("name"), str):
+                args = obj.get("arguments", {})
+                tool_calls.append(
+                    {
+                        "id": f"call_parsed_{len(tool_calls) + 1}",
+                        "type": "function",
+                        "function": {
+                            "name": obj["name"],
+                            "arguments": args if isinstance(args, str) else json.dumps(args),
+                        },
+                    }
+                )
+    if tool_calls:
+        return None, tool_calls
+
+    # 2. Qwen3.5 XML format: <tool_call><function=NAME><parameter=KEY>VAL</parameter>...</function>
+    for fn_match in re.finditer(
+        r"<function=([^>\s]+)>\s*(.*?)\s*</function>", clean, flags=re.S
+    ):
+        fn_name = fn_match.group(1).strip()
+        body = fn_match.group(2)
+        params: dict[str, Any] = {}
+        for p_match in re.finditer(
+            r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>", body, flags=re.S
+        ):
+            p_key = p_match.group(1).strip()
+            p_val = p_match.group(2).strip()
+            params[p_key] = p_val
+        tool_calls.append(
+            {
+                "id": f"call_parsed_{len(tool_calls) + 1}",
+                "type": "function",
+                "function": {
+                    "name": fn_name,
+                    "arguments": json.dumps(params),
+                },
+            }
+        )
+    if tool_calls:
+        return None, tool_calls
+
+    # 3. OpenAI Harmony format (gpt-oss): to=functions.NAME ... <|message|>{...}
+    for h_match in re.finditer(
+        r"to=functions\.([A-Za-z0-9_.-]+).*?<\|message\|>\s*(\{.*?\})(?:\s*<\|call\|>|\s*$)",
+        clean,
+        flags=re.S,
+    ):
+        fn_name = h_match.group(1).strip()
+        with contextlib.suppress(json.JSONDecodeError):
+            args_obj = json.loads(h_match.group(2))
+            if isinstance(args_obj, dict):
+                tool_calls.append(
+                    {
+                        "id": f"call_parsed_{len(tool_calls) + 1}",
+                        "type": "function",
+                        "function": {
+                            "name": fn_name,
+                            "arguments": json.dumps(args_obj),
+                        },
+                    }
+                )
+    if tool_calls:
+        return None, tool_calls
+
+    # 4. Bare/fenced JSON fallback: {"name": "...", "arguments": {...}}
+    stripped = re.sub(r"^```(?:json)?\s*|\s*```$", "", clean, flags=re.S).strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        with contextlib.suppress(json.JSONDecodeError, TypeError):
+            obj = json.loads(stripped)
+            if isinstance(obj, dict) and isinstance(obj.get("name"), str):
+                args = obj.get("arguments", {})
+                tool_calls.append(
+                    {
+                        "id": "call_parsed_1",
+                        "type": "function",
+                        "function": {
+                            "name": obj["name"],
+                            "arguments": args if isinstance(args, str) else json.dumps(args),
+                        },
+                    }
+                )
+                return None, tool_calls
+
+    return clean or None, []
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,10 +262,15 @@ class OpenAICompatibleModelClient:
         if not choices:
             raise RuntimeError("Model endpoint returned no choices")
         msg = choices[0].get("message") or {}
-        raw_calls = msg.get("tool_calls") or []
+        raw_calls = list(msg.get("tool_calls") or [])
+        content = msg.get("content")
+        if not raw_calls and isinstance(content, str) and content.strip():
+            parsed_content, parsed_calls = parse_tool_calls_from_text(content)
+            if parsed_calls:
+                return ModelResponse(content=parsed_content, tool_calls=parsed_calls)
         return ModelResponse(
-            content=msg.get("content"),
-            tool_calls=list(raw_calls),
+            content=content,
+            tool_calls=raw_calls,
         )
 
 

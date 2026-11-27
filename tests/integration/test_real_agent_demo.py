@@ -16,6 +16,7 @@ from examples.real_agent_demo.agent import ToolCallingAgent  # noqa: E402
 from examples.real_agent_demo.model_client import (  # noqa: E402
     ScriptedToolProposalModel,
     check_system_resources,
+    parse_tool_calls_from_text,
 )
 from examples.real_agent_demo.policy import build_demo_policy_yaml  # noqa: E402
 from examples.real_agent_demo.run_demo import run_all_scenarios  # noqa: E402
@@ -120,3 +121,34 @@ def test_check_system_resources_returns_safe_recommendation() -> None:
     report = check_system_resources()
     assert report.recommended_ollama_model in {"qwen2.5:1.5b", "qwen2.5:3b", "qwen2.5:7b"}
     assert report.cpu_logical is None or report.cpu_logical >= 1
+
+
+def test_parse_tool_calls_supports_qwen25_qwen35_xml_and_harmony() -> None:
+    """Verify tool-call parser handles JSON, Qwen3.5 XML, Harmony, and <think> tags."""
+    # 1. Qwen2.5 JSON <tool_call>
+    c1, calls1 = parse_tool_calls_from_text(
+        '<think>plan</think>\n<tool_call>{"name": "read_workspace_file", '
+        '"arguments": {"path": "readme.txt"}}</tool_call>'
+    )
+    assert c1 is None
+    assert calls1[0]["function"]["name"] == "read_workspace_file"
+
+    # 2. Qwen3.5 XML <tool_call><function=...><parameter=...>
+    c2, calls2 = parse_tool_calls_from_text(
+        "<tool_call>\n<function=write_workspace_file>\n"
+        "<parameter=path>\ndrafts/summary.txt\n</parameter>\n"
+        "<parameter=content>\nVerified by Actentra.\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    assert c2 is None
+    assert calls2[0]["function"]["name"] == "write_workspace_file"
+    assert '"drafts/summary.txt"' in calls2[0]["function"]["arguments"]
+
+    # 3. gpt-oss Harmony format
+    c3, calls3 = parse_tool_calls_from_text(
+        '<|channel|>commentary to=functions.run_shell_command <|constrain|>json'
+        '<|message|>{"command": "whoami"}<|call|>'
+    )
+    assert c3 is None
+    assert calls3[0]["function"]["name"] == "run_shell_command"
+    assert '"whoami"' in calls3[0]["function"]["arguments"]
