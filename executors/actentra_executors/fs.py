@@ -153,7 +153,9 @@ class LocalFSExecutor:
     ) -> None:
         raw_root = str(Path(workspace_root).resolve())
         self._workspace_root = canonicalize_windows_path(raw_root, resolve_fs=True)
-        self._root_path = Path(self._workspace_root.replace("/", "\\"))
+        self._root_path = Path(
+            self._workspace_root.replace("/", "\\") if os.name == "nt" else self._workspace_root
+        )
         self._default_max_read_bytes = default_max_read_bytes
         self._default_max_write_bytes = default_max_write_bytes
 
@@ -186,7 +188,7 @@ class LocalFSExecutor:
         except CanonicalizationError as exc:
             raise ExecutorError(f"Filesystem path blocked at execution boundary: {exc}") from exc
 
-        target = Path(canon.replace("/", "\\"))
+        target = Path(canon.replace("/", "\\") if os.name == "nt" else canon)
         # Verify containment of all existing ancestor directories down to target.
         curr = target if target.exists() else target.parent
         while curr != self._root_path and curr.parent != curr:

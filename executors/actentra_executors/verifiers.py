@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import time
 from pathlib import Path
 from typing import Literal
@@ -37,7 +38,9 @@ class WorkspaceFileVerifier:
     ) -> None:
         raw_root = str(Path(workspace_root).resolve())
         self._workspace_root = canonicalize_windows_path(raw_root, resolve_fs=True)
-        self._root_path = Path(self._workspace_root.replace("/", "\\"))
+        self._root_path = Path(
+            self._workspace_root.replace("/", "\\") if os.name == "nt" else self._workspace_root
+        )
         self._default_ttl = default_ttl_seconds
 
     @property
@@ -60,7 +63,7 @@ class WorkspaceFileVerifier:
         except CanonicalizationError as exc:
             raise ObservationError(f"Path outside workspace or malformed: {exc}") from exc
 
-        target = Path(canon.replace("/", "\\"))
+        target = Path(canon.replace("/", "\\") if os.name == "nt" else canon)
         try:
             target.relative_to(self._root_path)
         except ValueError as exc:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import inspect
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -191,7 +192,9 @@ def path_resource(path: str | Path, *, workspace_root: str | Path | None = None)
             and win_slash[0].isalpha()
             and win_slash[1] == ":"
         )
-        if not has_drive and not win_slash.startswith("\\\\"):
+        if not has_drive and not win_slash.startswith("\\\\") and (
+            os.name == "nt" or not raw.startswith("/")
+        ):
             base = canonicalize_windows_path(str(Path.cwd()), resolve_fs=True)
     canon = canonicalize_windows_path(raw, base_dir=base, resolve_fs=True)
     return f"path:{canon}"

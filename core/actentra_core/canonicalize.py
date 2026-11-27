@@ -83,6 +83,65 @@ def _resolve_segments(segments: list[str]) -> list[str]:
     return stack
 
 
+def _canonicalize_posix_path(
+    text: str,
+    *,
+    canon_base: str | None,
+    allow_unc: bool,
+    allow_relative: bool,
+    resolve_fs: bool,
+) -> str:
+    """Canonicalize a POSIX filesystem path while preserving case and blocking escapes."""
+    if text.startswith(("\\\\", "//")):
+        if not allow_unc:
+            raise CanonicalizationError("UNC or double-slash network paths are not permitted")
+        raise CanonicalizationError("UNC paths are not supported on POSIX")
+
+    has_drive = (
+        len(text) >= 2 and text[0].isascii() and text[0].isalpha() and text[1] == ":"
+    )
+    if has_drive:
+        raise CanonicalizationError(
+            f"Windows drive-letter paths are not supported on POSIX: {text!r}"
+        )
+
+    if "\\" in text:
+        raise CanonicalizationError(f"Backslashes are not permitted in POSIX paths: {text!r}")
+
+    if text.startswith("/"):
+        raw_segments = [s for s in text[1:].split("/") if s != ""]
+        resolved = _resolve_segments(raw_segments)
+        result = "/" + "/".join(resolved)
+    else:
+        raw_segments = [s for s in text.split("/") if s != ""]
+        if canon_base is not None:
+            base_segs = [s for s in canon_base[1:].split("/") if s]
+            resolved = _resolve_segments(base_segs + raw_segments)
+            result = "/" + "/".join(resolved)
+        elif allow_relative:
+            resolved = _resolve_segments(raw_segments)
+            result = "/".join(resolved) if resolved else "."
+        else:
+            raise CanonicalizationError(
+                "Relative paths are not permitted without base_dir or allow_relative=True"
+            )
+
+    if resolve_fs and result.startswith("/"):
+        real = os.path.realpath(result)
+        result = _canonicalize_posix_path(
+            real,
+            canon_base=None,
+            allow_unc=allow_unc,
+            allow_relative=False,
+            resolve_fs=False,
+        )
+
+    if canon_base is not None:
+        _assert_within_base(result, canon_base)
+
+    return result
+
+
 def canonicalize_windows_path(
     raw_path: str,
     *,
@@ -91,10 +150,11 @@ def canonicalize_windows_path(
     allow_relative: bool = False,
     resolve_fs: bool = False,
 ) -> str:
-    """Canonicalize a Windows filesystem path into lowercase forward-slash form.
+    """Canonicalize a filesystem path into forward-slash form (Windows or POSIX).
 
     Examples:
         ``C:\\Work\\Sub\\..\\file.txt`` -> ``c:/work/file.txt``
+        ``/tmp/work/../file.txt`` (on POSIX) -> ``/tmp/file.txt``
 
     Raises:
         CanonicalizationError: on NUL bytes, control chars, ADS, reserved device
@@ -120,6 +180,15 @@ def canonicalize_windows_path(
             base_dir=None,
             allow_unc=allow_unc,
             allow_relative=False,
+            resolve_fs=resolve_fs,
+        )
+
+    if os.name != "nt":
+        return _canonicalize_posix_path(
+            text,
+            canon_base=canon_base,
+            allow_unc=allow_unc,
+            allow_relative=allow_relative,
             resolve_fs=resolve_fs,
         )
 
@@ -297,6 +366,8 @@ def _normalize_path_pattern(raw_pattern: str) -> str:
         drive = text[0].lower()
         rest = "/".join(seg.lower() for seg in text[3:].split("/") if seg)
         return f"{drive}:/{rest}"
+    if os.name != "nt" and text.startswith("/"):
+        return "/" + "/".join(seg for seg in text[1:].split("/") if seg)
     return text.lower()
 
 
