@@ -152,3 +152,34 @@ def test_parse_tool_calls_supports_qwen25_qwen35_xml_and_harmony() -> None:
     assert c3 is None
     assert calls3[0]["function"]["name"] == "run_shell_command"
     assert '"whoami"' in calls3[0]["function"]["arguments"]
+
+
+def test_agent_handles_missing_file_read_error_gracefully(tmp_path: Path) -> None:
+    """ExecutorError (e.g., reading nonexistent ghost.txt) is returned as tool error, not crash."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bridge = ActentraToolBridge(
+        policy_yaml=build_demo_policy_yaml(workspace),
+        receipts_db=tmp_path / "receipts.db",
+        workspace_root=workspace,
+        model_name="missing-file-test-model",
+    )
+    model = ScriptedToolProposalModel(
+        proposals_by_task={
+            "inspect": [
+                {
+                    "name": "read_workspace_file",
+                    "arguments": {"path": "unreliable/ghost.txt"},
+                }
+            ]
+        }
+    )
+    agent = ToolCallingAgent(model=model, bridge=bridge)
+    report = agent.run("Please inspect unreliable/ghost.txt.")
+
+    assert len(report.mediated_calls) == 1
+    call = report.mediated_calls[0]
+    assert call.execution is None
+    assert call.pre_evaluation_error is not None
+    assert "ExecutorError" in call.pre_evaluation_error
+    assert "ExecutorError" in report.final_answer

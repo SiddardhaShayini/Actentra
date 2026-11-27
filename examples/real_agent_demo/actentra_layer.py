@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from actentra import (
+    ActentraError,
     Boundary,
     CanonicalizationError,
     CrossingReceipt,
     ExecutionResult,
+    ExecutorError,
     VerificationResult,
     path_resource,
 )
@@ -303,15 +305,28 @@ class ActentraToolBridge:
             )
 
         actentra_tool, verb, resource, params = mapped
-        exec_res = self._boundary.run(
-            tool=actentra_tool,
-            verb=verb,
-            resource=resource,
-            params=params,
-            verify_postcondition=True,
-            raise_on_blocked=False,
-            raise_on_postcondition_failure=False,
-        )
+        should_verify = verb in {"write", "delete"}
+        try:
+            exec_res = self._boundary.run(
+                tool=actentra_tool,
+                verb=verb,
+                resource=resource,
+                params=params,
+                verify_postcondition=should_verify,
+                raise_on_blocked=False,
+                raise_on_postcondition_failure=False,
+            )
+        except (ActentraError, ExecutorError) as exc:
+            return MediatedToolCall(
+                tool_call_id=call_id,
+                agent_tool=agent_tool,
+                arguments=args,
+                actentra_tool=actentra_tool,
+                verb=verb,
+                resource=resource,
+                execution=None,
+                pre_evaluation_error=f"{type(exc).__name__}: {exc}",
+            )
         return MediatedToolCall(
             tool_call_id=call_id,
             agent_tool=agent_tool,
@@ -326,20 +341,21 @@ class ActentraToolBridge:
         self, agent_tool: str, args: dict[str, Any]
     ) -> tuple[str, str, str, dict[str, Any]]:
         if agent_tool == "list_workspace_files":
-            rel = str(args.get("path") or ".")
+            rel = str(args.get("path") or ".").strip() or "."
             resource = self._resolve_workspace_resource(rel)
             return "fs.list", "read", resource, {"path": rel}
 
         if agent_tool == "read_workspace_file":
-            rel = str(args.get("path") or "")
+            rel = str(args.get("path") or "").strip()
             if not rel:
                 raise ValueError("Missing required parameter 'path'")
             resource = self._resolve_workspace_resource(rel)
             return "fs.read", "read", resource, {"path": rel}
 
         if agent_tool == "write_workspace_file":
-            rel = str(args.get("path") or "")
-            content = str(args.get("content") or "")
+            rel = str(args.get("path") or "").strip()
+            raw_content = args.get("content")
+            content = "" if raw_content is None else str(raw_content)
             if not rel:
                 raise ValueError("Missing required parameter 'path'")
             resource = self._resolve_workspace_resource(rel)
@@ -351,15 +367,16 @@ class ActentraToolBridge:
             )
 
         if agent_tool == "delete_workspace_file":
-            rel = str(args.get("path") or "")
+            rel = str(args.get("path") or "").strip()
             if not rel:
                 raise ValueError("Missing required parameter 'path'")
             resource = self._resolve_workspace_resource(rel)
             return "fs.delete", "delete", resource, {"path": rel}
 
         if agent_tool == "unreliable_write_file":
-            rel = str(args.get("path") or "")
-            content = str(args.get("content") or "")
+            rel = str(args.get("path") or "").strip()
+            raw_content = args.get("content")
+            content = "" if raw_content is None else str(raw_content)
             if not rel:
                 raise ValueError("Missing required parameter 'path'")
             resource = self._resolve_workspace_resource(rel)

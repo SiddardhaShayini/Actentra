@@ -69,7 +69,8 @@ def parse_tool_calls_from_text(raw_text: str) -> tuple[str | None, list[dict[str
 
     # 3. OpenAI Harmony format (gpt-oss): to=functions.NAME ... <|message|>{...}
     for h_match in re.finditer(
-        r"to=functions\.([A-Za-z0-9_.-]+).*?<\|message\|>\s*(\{.*?\})(?:\s*<\|call\|>|\s*$)",
+        r"to=functions\.([A-Za-z0-9_.-]+).*?<\|message\|>\s*(\{.*?\})"
+        r"(?:\s*<\|(?:call|return)\|>|\s*$)",
         clean,
         flags=re.S,
     ):

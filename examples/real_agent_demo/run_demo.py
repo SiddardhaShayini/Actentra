@@ -173,11 +173,15 @@ def run_all_scenarios(
             "'approved/release_signoff.txt' using write_workspace_file."
         )
         report_d_held = agent.run(task_d)
-        held_exec = (
-            report_d_held.mediated_calls[0].execution if report_d_held.mediated_calls else None
-        )
-        if held_exec is not None and held_exec.canonical_hash:
-            bridge.grant_approval(held_exec.canonical_hash)
+        for call in report_d_held.mediated_calls:
+            ex = call.execution
+            if (
+                ex is not None
+                and ex.verdict.value == "ask"
+                and not ex.allowed
+                and ex.canonical_hash
+            ):
+                bridge.grant_approval(ex.canonical_hash)
         report_d_approved = agent.run(task_d)
 
         # Scenario E: Evidence inspection
