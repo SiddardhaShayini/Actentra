@@ -11,8 +11,8 @@
 ### Direct Answers to Core Adoption Questions
 
 1. **Can it be installed using `pip install actentra`?**
-   - **No.** `actentra` (`0.1.0a0`) is not currently published on PyPI.
-   - Supported installation paths today are:
+   - **Yes.** `actentra==0.1.0a0` is published on PyPI (`pip install actentra` or `uv add actentra`).
+   - Alternative installation paths for source/unreleased changes:
      - Editable or standard install from a clone (`pip install -e .` or `uv sync`)
      - Direct Git install (`pip install "git+https://github.com/SiddardhaShayini/Actentra.git"`)
      - Installing a built wheel (`pip install dist/actentra-0.1.0a0-py3-none-any.whl`)

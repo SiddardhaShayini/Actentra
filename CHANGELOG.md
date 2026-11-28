@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Documentation & Release Readiness
+- Added [ACTENTRA_SECURITY_MODEL.md](ACTENTRA_SECURITY_MODEL.md), [ACTENTRA_RELEASE_READINESS_REPORT.md](ACTENTRA_RELEASE_READINESS_REPORT.md), and the complete documentation hub under [docs/README.md](docs/README.md).
+- Enhanced [README.md](README.md) with verified local CPU (Ollama) and Kaggle 2x T4 GPU multi-model enforcement results, PyPI-safe image URLs, and explicit platform/security scope.
+
+### Examples & Cross-Platform Fixes (Post-`0.1.0a0`)
+- Added real-world AI-agent enforcement demo (`examples/real_agent_demo/`) and Kaggle multi-model notebook (`00f12c1`..`ed230bc`).
+- Fixed POSIX root path handling in `core`, `executors`, and `sdk` (`8aec173`).
+
+## [0.1.0a0] - 2026-11-26
+
+First alpha release published to PyPI (`actentra==0.1.0a0`, commit `2c0357f`) via GitHub Actions Trusted Publishing.
+
 ### Developer Usability & SDK Ergonomics
 - Unified public SDK exports in `actentra` (`Boundary`, `ExecutionResult`, `CrossingReceipt`, `path_resource`, `load_policy_file`, `load_policy_yaml`, `ReceiptStore`, `Decision`, `Verdict`, `ProvenanceItem`, `CanonicalizationError`, scoped executors, and `WorkspaceFileVerifier`).
 - Added `Boundary.from_yaml(...)`, `workspace_root=` convenience initialization on `Boundary.from_files(...)` / `Boundary.from_yaml(...)`, executor registration helpers (`register_fs`, `register_sqlite`, `register_http`, `register_executor`), `Boundary.run(...) -> ExecutionResult`, and receipt inspection helpers (`inspect_crossing`, `recent_receipts`, `verify_receipts`).
