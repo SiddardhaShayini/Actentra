@@ -6,7 +6,14 @@
 
 > *Intelligence proposes. Actentra decides.*
 
-**Actentra** is a lightweight, local-first deterministic execution boundary for AI agents. It sits between any model or agent framework and real-world tools—canonicalizing each tool call, evaluating deterministic YAML policies and risk tags, binding human approvals to an exact action hash, and writing tamper-evident hash-chained receipts.
+**Actentra** is a lightweight, local-first deterministic execution boundary for AI agents. It sits between any model or agent framework and real-world tools—canonicalizing each tool call, evaluating deterministic YAML policies and risk tags, binding human approvals to an exact action hash, verifying postconditions, and writing tamper-evident hash-chained receipts.
+
+> **Documentation:** Start with the **[Documentation Index](docs/README.md)**, **[Quickstart Guide](docs/guides/quickstart.md)**, and **[Formal Security Model](ACTENTRA_SECURITY_MODEL.md)**.
+
+### How Actentra Differs & What It Does Not Solve
+- **Unlike agent frameworks or tool routers:** Actentra puts **zero LLMs** in the enforcement path; every decision is deterministic, canonicalized, and persisted before execution.
+- **Unlike simple permission checks:** Actentra binds approvals to exact `canonical_hash` values, tracks durable principal taint/budgets across restarts, gates success on postcondition verification, and records hash-chained receipts.
+- **Explicit non-goals:** Actentra is an in-process Python execution boundary, **not** an OS-level sandbox or container. It cannot protect unmediated OS/API paths outside Actentra, make an LLM reason correctly within allowed bounds, or defend against a compromised host administrator. See [ACTENTRA_SECURITY_MODEL.md](ACTENTRA_SECURITY_MODEL.md) and [ACTENTRA_POST_REMEDIATION_AUDIT.md](docs/security/audits/ACTENTRA_POST_REMEDIATION_AUDIT.md) (controlled-pilot verdict).
 
 ---
 

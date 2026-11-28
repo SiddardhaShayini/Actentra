@@ -1,5 +1,44 @@
 # Actentra Architecture & System Design
 
+## Request Execution Flow
+
+```mermaid
+flowchart LR
+    Agent["AI Agent / Caller"] -->|"Tool Call + Provenance"| Gateway["SDK / Adapter / Gateway / MCP Proxy"]
+    Gateway -->|"Authenticate"| Identity["CallerContext & DelegationRegistry"]
+    Identity -->|"Canonicalize"| Env["ActionEnvelope & canonical_hash"]
+    Env -->|"Evaluate (Zero-LLM)"| Policy["PolicyEngine, Risk, Taint, Budgets, Warrants"]
+    Policy -->|"Pre-commit Decision (I5)"| Store[("ReceiptStore (SQLite WAL)")]
+    Policy -->|"ALLOW / Approved ASK"| Claim["Atomic Claim & TOCTOU Check (I3)"]
+    Claim --> Exec["Scoped Executor + SecretsBroker"]
+    Exec --> Verifier["Postcondition Verifier (WorkspaceFileVerifier)"]
+    Verifier -->|"ObservationRecord + EvidenceRecord"| Store
+    Store -->|"ExecutionResult / CrossingReceipt"| Agent
+```
+
+## Subsystem Responsibilities
+
+| Subsystem | Module(s) | Responsibility |
+|---|---|---|
+| **Core** | `core/actentra_core/` | Deterministic canonicalization, envelope hashing, policy, risk, identity, warrants, claims, lifecycle, and receipts. |
+| **Gateway** | `gateway/actentra_gateway/` | `AppServices`, `ActentraHTTPServer`/`ActentraHTTPHandler` (`/v1/*`, `/ui`), and `MCPStdioProxy`. |
+| **SDKs** | `sdk/python/actentra/` | In-process `Boundary`, `@guard`, `SecretsBroker`, `FunctionCallAdapter`, and `LangChainToolWrapper`. |
+| **Executors** | `executors/actentra_executors/` | Confined `LocalFSExecutor`, `ScopedSQLiteExecutor`, `ScopedHTTPExecutor`, and `WorkspaceFileVerifier`. |
+| **Identity & Principals** | `core/actentra_core/identity.py` | `CallerContext`, `PrincipalType`, Bearer/`token_principals`, and `MTLSPrincipalRegistry`. |
+| **Delegation** | `core/actentra_core/identity.py` | `DelegationGrant`, `DelegationRegistry`, Ed25519 signed grants, scope attenuation, and cascading revocation. |
+| **Policies** | `core/actentra_core/policy.py`, `budgets.py`, `risk.py` | Deny-overrides YAML evaluation, risk tagging, `RateLimiter`, `principal_taints`, and dual-tier budgets. |
+| **Warrant System** | `core/actentra_core/warrants.py` | Ed25519-signed capability `Warrant` verification and durable `WarrantRegistry` quota tracking. |
+| **Sessions** | `core/actentra_core/receipts.py` | Server-issued `sess-<uuid>` records bound to principal, trust domain, policy version, and TTL. |
+| **Approval Workflows** | `receipts.py`, `boundary.py`, `http_service.py` | Durable `pending_approvals` bound to `(session_id, canonical_hash)` with single-use atomic consumption. |
+| **Execution Claims** | `core/actentra_core/claims.py` | One-time `ExecutionClaim` tokens binding external outcome reporting to crossing, principal, and digest. |
+| **Postconditions** | `core/actentra_core/context.py` | `PostconditionSpec`, `AuthorizedExecutionContext`, and strict semantic validation (`digest_match`, `absent`). |
+| **Observations & Evidence** | `observations.py`, `evidence.py`, `verifiers.py` | `VerificationContext`, `ObservationRecord`, and 5-tier `EvidenceRecord` provenance tracking. |
+| **Receipts** | `core/actentra_core/receipts.py` | Append-only SQLite WAL SHA-256 hash-chained decision and outcome receipts (`verify_log`). |
+| **Lifecycle Management** | `core/actentra_core/lifecycle.py` | Transactional state machine (`action_lifecycle`, `action_transitions`), `IdempotencyRecord`, and `recover_system_state()`. |
+| **Audit Checkpoints** | `core/actentra_core/checkpoints.py` | Chained Ed25519 `SignedCheckpoint`, `CheckpointAnchor`, `KeyRing`, `SecurityProfile`, and `verify_audit_trail()`. |
+
+---
+
 ```
 +-------------------------------------------------------------------------+
 |                              Agent / Model                              |

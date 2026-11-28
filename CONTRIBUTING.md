@@ -62,6 +62,11 @@ uv run pytest -o addopts= -q
 
 Do **not** open public GitHub issues for security vulnerabilities. Follow the private reporting instructions in [SECURITY.md](SECURITY.md).
 
+## Versioning & Release Process
+
+Actentra is currently in **pre-1.0 development** (`0.1.0a0` in [pyproject.toml](pyproject.toml)); see [CHANGELOG.md](CHANGELOG.md) for release history and [docs/README.md](docs/README.md) for the full documentation index.
+- Releases are built with `uv build` and published to PyPI via Trusted Publishing in [`.github/workflows/publish.yml`](.github/workflows/publish.yml) when a release tag is pushed.
+
 ## License
 
 By contributing to Actentra, you agree that your contributions will be licensed under the Apache-2.0 License. See [LICENSE](LICENSE).
